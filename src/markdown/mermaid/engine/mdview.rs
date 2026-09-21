@@ -1125,7 +1125,9 @@ fn arrow_char(a: MArrow, down: bool) -> Option<char> {
         (MArrow::Hollow, false) => '\u{25b3}',      // △
         (MArrow::Diamond, _) => '\u{25c6}',         // ◆
         (MArrow::HollowDiamond, _) => '\u{25c7}',   // ◇
-        (MArrow::Cross, _) => '\u{2715}',           // ✕
+        // U+2715(✕)는 흔한 CJK 모노스페이스 폰트 커버리지 밖이라 폰트 폴백을
+        // 유발한다(dg 엔진의 같은 수정 참고) — U+00D7(×)로.
+        (MArrow::Cross, _) => '\u{d7}',              // ×
     })
 }
 

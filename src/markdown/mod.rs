@@ -310,11 +310,12 @@ mod tests {
 
     #[test]
     fn test_checkbox_symbols() {
-        // 10.2 (요구사항 10.2): 체크박스는 ✓(완료)/☐(미완료) — 이전 ☑ 에서 교체.
+        // 10.2 (요구사항 10.2): 체크박스는 ✓(완료)/□(미완료) — 이전 ☑, 그 다음 ☐(폰트
+        // 폴백 유발로 교체, theme.rs CHECK_TODO 주석 참고) 에서 지금 값으로 교체.
         let rendered = render("- [x] done\n- [ ] todo", 40);
         let text = all_text(&rendered);
         assert!(text.contains('\u{2713}'), "checked box glyph (✓) missing in: {text}");
-        assert!(text.contains('☐'), "unchecked box glyph missing in: {text}");
+        assert!(text.contains('□'), "unchecked box glyph missing in: {text}");
     }
 
     #[test]

@@ -212,7 +212,7 @@ fn feature_smoke_fixture_exercises_checkbox_link_image_footnote_and_tab() {
     let all = rendered.plain.join("\n");
 
     assert!(all.contains('\u{2713}'), "checkbox done glyph (✓) missing: {all}");
-    assert!(all.contains('☐'), "checkbox todo glyph missing: {all}");
+    assert!(all.contains('□'), "checkbox todo glyph missing: {all}");
     assert!(all.contains("(https://example.com)"), "link URL missing: {all}");
     assert!(all.contains("\u{1F5BC} 그림 (./x.png)"), "image label missing: {all}");
     assert_eq!(rendered.footnotes.len(), 1, "footnote not collected: {all}");

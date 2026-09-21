@@ -4,7 +4,7 @@
 //! (heading[6] / heading_rule[6] / emphasis / strong / ... / table_border)을 그대로
 //! 따랐다. 라이선스 고지는 `spec-viewer/THIRD_PARTY.md` 참조.
 //!
-//! 목록 기호(`•` `◦` `▪`)와 체크박스(`✓` `☐`)는 요구사항 10.2 가 고정 문자로 못박은
+//! 목록 기호(`•` `◦` `▪`)와 체크박스(`✓` `□`)는 요구사항 10.2 가 고정 문자로 못박은
 //! 값이라 테마 데이터가 아니라 `block.rs`/`inline.rs` 의 상수로 둔다 — 테마가 바뀌어도
 //! 바뀌지 않는다. `heading_rule` 만 `Option<char>` 인 이유는 레벨별로 밑줄을 그릴지
 //! 말지(H3~H6 는 `None`) 자체가 테마 판단이기 때문이다.
@@ -120,9 +120,13 @@ pub fn list_marker_char(depth: usize) -> char {
     LIST_MARKERS[idx]
 }
 
-/// 체크박스 — 완료/미완료 고정 문자(요구사항 10.2).
+/// 체크박스 — 완료/미완료 고정 문자(요구사항 10.2). 미완료는 원래 U+2610
+/// BALLOT BOX(☐)였는데, 흔한 CJK 모노스페이스 폰트(기본 Noto Sans Mono
+/// CJK 등)의 커버리지 밖이라 터미널이 그 문자에만 다른 폰트로 폴백하는
+/// 비용이 있었다(실측: 체크박스가 있는 줄 스크롤이 눈에 띄게 느려짐) —
+/// 같은 값을 내지만 훨씬 폭넓게 커버되는 U+25A1 WHITE SQUARE(□)로 교체.
 pub const CHECK_DONE: char = '\u{2713}'; // ✓
-pub const CHECK_TODO: char = '\u{2610}'; // ☐
+pub const CHECK_TODO: char = '\u{25A1}'; // □ (이전: ☐ U+2610)
 
 /// 인용 좌측 막대(요구사항 10.3).
 pub const QUOTE_BAR: char = '\u{2502}'; // │

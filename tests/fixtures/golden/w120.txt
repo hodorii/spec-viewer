@@ -56,7 +56,7 @@ Boundary Map (flowchart)
         ╪
         │ places
         ○
-        ⋏
+        ∨
 ┌──────────────┐
 │    ORDER     │
 ├──────────────┤
@@ -102,21 +102,35 @@ Boundary Map (flowchart)
      ◉
 System Flows (sequence)
 ───────────────────────
-  User      App      Loader   Markdown  Watcher  
-    User──SelectNode(id)──►App    │         │    
-    │         App──read_doc(path)──►Loader  │    
-    │         App◄──text | DocError──Loader │    
-    │         App──render(text, width)──►Markdown
-    │         App◄──Rendered──Markdown      │    
-    │         ─┐        │         │         │    
-    │         │ scroll=0, search cleared    │    
-    │         ◄┘        │         │         │    
-    │         App◄──FsEvent(paths)──Watcher │    
-    │         ─┐        │         │         │    
-    │         │ classify(doc | meta | tree) │    
-    │         ◄┘        │         │         │    
-    │         App──reload(affected)──►Loader│    
-    │         App──render──►Markdown        │    
-    │         ─┐        │         │         │    
-    │         │ scroll = min(prev, len-1)   │    
-    │         ◄┘        │         │         │    
+┌──────┐          ┌─────┐                        ┌────────┐   ┌──────────┐    ┌─────────┐
+│ User │          │ App │                        │ Loader │   │ Markdown │    │ Watcher │
+└──────┘          └─────┘                        └────────┘   └──────────┘    └─────────┘
+    │ SelectNode(id) │                                │             │              │
+    ├───────────────▶│                                │             │              │
+    │                │         read_doc(path)         │             │              │
+    │                ├───────────────────────────────▶│             │              │
+    │                │        text | DocError         │             │              │
+    │                │◀╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤             │              │
+    │                │             render(text, width)│             │              │
+    │                ├────────────────────────────────◠────────────▶│              │
+    │                │                   Rendered     │             │              │
+    │                │◀╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌◠╌╌╌╌╌╌╌╌╌╌╌╌╌┤              │
+    │                ├─╮ scroll=0, search cleared     │             │              │
+    │                │ │                              │             │              │
+    │                │◀╯                              │             │              │
+    │                │                       FsEvent(paths)         │              │
+    │                │◀╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌◠╌╌╌╌╌╌╌╌╌╌╌╌╌◠╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+    │                ├─╮ classify(doc | meta | tree)  │             │              │
+    │                │ │                              │             │              │
+    │                │◀╯                              │             │              │
+    │                │        reload(affected)        │             │              │
+    │                ├───────────────────────────────▶│             │              │
+    │                │                    render      │             │              │
+    │                ├────────────────────────────────◠────────────▶│              │
+    │                ├─╮ scroll = min(prev, len-1)    │             │              │
+    │                │ │                              │             │              │
+    │                │◀╯                              │             │              │
+    │                │                                │             │              │
+┌──────┐          ┌─────┐                        ┌────────┐   ┌──────────┐    ┌─────────┐
+│ User │          │ App │                        │ Loader │   │ Markdown │    │ Watcher │
+└──────┘          └─────┘                        └────────┘   └──────────┘    └─────────┘

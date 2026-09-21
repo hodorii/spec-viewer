@@ -459,8 +459,8 @@ dependencies = [
 
 [[package]]
 name = "dg"
-version = "0.2.0"
-source = "git+https://github.com/hodorii/dg.git?branch=main#9388d678bdc02c0eddc2bbc4cc7981fb2318e737"
+version = "0.2.1"
+source = "git+https://github.com/hodorii/dg.git?branch=main#dc28a5231e3065ec8fc2587993a577a2e51a3911"
 dependencies = [
  "pulldown-cmark",
  "unicode-width",
@@ -1663,7 +1663,7 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "spec-viewer"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "crossterm",

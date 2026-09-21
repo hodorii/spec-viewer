@@ -100,7 +100,7 @@ Boundary Map (flowchart)
         ╪
         │ places
         ○
-        ⋏
+        ∨
 ┌──────────────┐
 │    ORDER     │
 ├──────────────┤

@@ -13,6 +13,21 @@
 //! [`render_mermaid`] applies the fallback rule: when the selected engine
 //! does not `supports` a diagram kind, the `builtin` engine renders it
 //! instead.
+//!
+//! **An engine's supported range is that engine's own business, not this
+//! crate's.** `builtin`/`mdview` only ever see this crate's own `Diagram` IR
+//! (produced by `parse::parse`'s four-way flowchart/er/class/state dispatch
+//! plus a generic catch-all), so `sniff_kind`'s vocabulary genuinely *is*
+//! their whole supported range — nothing to improve there. An engine that
+//! wraps an independent diagram library with its own parser (e.g. `dg`)
+//! should instead override [`GraphEngine::classify`] with that library's own
+//! classification and let [`GraphEngine::supports`] reflect what the
+//! library itself just recognized, rather than being hand-limited to a
+//! whitelist copied from this crate's narrower vocabulary. That is how
+//! `dg`'s eleven mermaid kinds (flowchart/sequence/state/er/class/gitGraph/
+//! block-beta/pie/xychart-beta/quadrantChart/gantt) all get a real chance at
+//! `dg`'s own renderer instead of six of them silently landing in this
+//! crate's `"generic"` bucket and never reaching `dg` at all.
 
 use super::parse::Diagram;
 use super::Fallback;
@@ -31,9 +46,27 @@ pub trait GraphEngine: Send + Sync {
     /// the CLI's `--diagram-engine <NAME>` argument.
     fn name(&self) -> &'static str;
 
-    /// Whether this engine can render the given diagram kind ("flowchart",
-    /// "er", "class", "state", "generic").
+    /// Whether this engine can render the given diagram `kind`. `kind`
+    /// normally comes from this crate's own [`classify`](Self::classify)
+    /// default (`"flowchart"`/`"er"`/`"class"`/`"state"`/`"generic"`, or
+    /// `"sequence"`) -- unless this engine overrides `classify` with its
+    /// own broader classification, in which case `kind` is *that engine's
+    /// own* opinion and this should simply say what that engine actually
+    /// knows how to draw.
     fn supports(&self, kind: &str) -> bool;
+
+    /// This engine's own opinion of what kind of diagram `src` is, if it has
+    /// an independent parser broader than this crate's own `sniff_kind`.
+    /// The default (`None`) means "no opinion — use this crate's own
+    /// classification," which is exactly right for `builtin`/`mdview`
+    /// (they only render this crate's own `Diagram` IR, so they have
+    /// nothing more to say). Override this when the engine wraps a real,
+    /// independent diagram library (e.g. `dg`'s `dg::diagram::kind_of`) so
+    /// that library's *actual* supported range — not a hand-maintained
+    /// whitelist here — decides whether it gets a chance to render.
+    fn classify(&self, _src: &str) -> Option<&'static str> {
+        None
+    }
 
     /// Render a parsed graph diagram to terminal lines at `width` columns.
     fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>;

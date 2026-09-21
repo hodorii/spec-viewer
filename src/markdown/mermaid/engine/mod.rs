@@ -20,8 +20,6 @@ use std::sync::{OnceLock, RwLock};
 
 pub mod builtin;
 
-#[cfg(feature = "engine-graphs-tui")]
-pub mod graphs_tui;
 #[cfg(feature = "engine-dg")]
 pub mod dg_engine;
 pub mod mdview;
@@ -57,8 +55,6 @@ fn state() -> &'static RwLock<EngineState> {
     STATE.get_or_init(|| {
         let mut all: Vec<&'static dyn GraphEngine> =
             vec![&builtin::BuiltinEngine as &'static dyn GraphEngine, &mdview::MdviewEngine as &'static dyn GraphEngine];
-        #[cfg(feature = "engine-graphs-tui")]
-        all.push(&graphs_tui::GraphsTuiEngine as &'static dyn GraphEngine);
         #[cfg(feature = "engine-dg")]
         all.push(&dg_engine::DgEngine as &'static dyn GraphEngine);
         let engines: &'static [&'static dyn GraphEngine] = Box::leak(all.into_boxed_slice());

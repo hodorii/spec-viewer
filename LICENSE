@@ -22,7 +22,5 @@ SOFTWARE.
 
 ---
 
-Portions of this software are adapted from third-party projects under their
-own licenses (mdview, MIT; optionally graphs-tui, AGPL-3.0-or-later when the
-non-default `engine-graphs-tui` feature is enabled). See THIRD_PARTY.md for
-details.
+Portions of this software are adapted from mdview (MIT). See THIRD_PARTY.md
+for details.

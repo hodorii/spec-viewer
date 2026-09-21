@@ -48,10 +48,10 @@ Mermaid flowchart/state diagrams in rendered markdown go through a pluggable
 - `dg` (default, feature `engine-dg`) — renders via [dg](https://github.com/hodorii/dg) (MIT).
 - `mdview` — a band-routed layout engine ported from [mdview](https://github.com/hjshim/mdview) (MIT); see `THIRD_PARTY.md`.
 - `builtin` — a simpler shared-vertical-bus layout, no external dependency.
-- `graphs-tui` (feature `engine-graphs-tui`, **not enabled by default**) — routes through the [graphs-tui](https://crates.io/crates/graphs-tui) crate, licensed AGPL-3.0-or-later; a binary built with this feature carries AGPL obligations. See `THIRD_PARTY.md`.
 
 ## License
 
-MIT (`LICENSE`), except the optional `engine-graphs-tui` feature which pulls
-in an AGPL-3.0-or-later dependency — not part of the default build. Third-party
-attributions: `THIRD_PARTY.md`.
+MIT (`LICENSE`). Direct dependencies are MIT or dual MIT/Apache-2.0 (a small
+number of transitive dependencies carry other permissive licenses — ISC,
+Zlib, CC0-1.0, WTFPL, Unicode-3.0/Unicode-DFS-2016 — none copyleft; run
+`cargo metadata` for the full tree). Third-party attribution: `THIRD_PARTY.md` (mdview, MIT).

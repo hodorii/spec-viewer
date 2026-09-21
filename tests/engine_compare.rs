@@ -35,9 +35,9 @@ use spec_viewer::markdown::mermaid::{render_mermaid, Fallback};
 /// The width every fence is rendered at.
 const WIDTH: u16 = 100;
 
-/// A diagram of a kind `graphs-tui` does not support (`supports("er")` is
-/// false), used to drive assertion 2: with `graphs-tui` selected the 5.21
-/// fallback must still yield an `Ok`, non-empty render via the builtin
+/// A diagram of a kind not every engine supports (`supports("er")` can be
+/// false), used to drive assertion 2: even with such an engine selected, the
+/// 5.21 fallback must still yield an `Ok`, non-empty render via the builtin
 /// engine, while `builtin`/`mdview` render it directly.
 const ER_DIAGRAM: &str = "erDiagram\n  CUSTOMER ||--o{ ORDER : places";
 
@@ -193,9 +193,8 @@ fn engine_comparison_snapshots_and_fallback() {
         }
 
         // Assertion 2 (5.21 fallback): a kind the engine does not support
-        // (graphs-tui rejects "er") must still render Ok and non-empty — the
-        // unsupported kind falls back to the builtin engine *inside*
-        // render_mermaid.
+        // (e.g. "er") must still render Ok and non-empty — the unsupported
+        // kind falls back to the builtin engine *inside* render_mermaid.
         let fallback = render_mermaid(ER_DIAGRAM, WIDTH).unwrap_or_else(|f| {
             panic!("engine '{name}' erDiagram render failed: {f:?}")
         });

@@ -65,33 +65,3 @@ engine that renders LR). Rounded corners (`╭╮╰╯`) were dropped in favor 
 square ones — this crate's box-glyph merge table (`canvas.rs`, ported for
 task 9.5) doesn't cover them, and losing the rounding doesn't affect which
 shapes are distinguishable.
-
-## graphs-tui
-
-[graphs-tui](https://crates.io/crates/graphs-tui) 0.4 is an optional
-dependency (cargo feature `engine-graphs-tui`), used to render mermaid
-flowchart/state diagrams from their source text. It is licensed under the
-GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later), and is
-**not** compiled in by default.
-
-```
-GNU AFFERO GENERAL PUBLIC LICENSE
-Version 3, 19 November 2007
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
-```
-
-The full license text: <https://www.gnu.org/licenses/agpl-3.0.html>
-
-feature `engine-graphs-tui` 를 켜서 배포하는 바이너리는 AGPL 의무를 진다.

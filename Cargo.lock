@@ -681,16 +681,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graphs-tui"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b969a3bd73d3863f5f109063d791d1695b1ec1c4384c10840bb8a8cf89918b6"
-dependencies = [
- "unicode-width",
- "winnow",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1678,7 +1668,6 @@ dependencies = [
  "clap",
  "crossterm",
  "dg",
- "graphs-tui",
  "ignore",
  "notify",
  "notify-debouncer-full",
@@ -2280,15 +2269,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.6.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "wit-bindgen"

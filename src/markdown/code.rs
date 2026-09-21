@@ -1,4 +1,5 @@
 use super::{Line, LineStyle, Span, SpanStyle};
+use crate::markdown::mermaid::engine;
 use crate::markdown::mermaid::{render_mermaid, Fallback};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
@@ -22,6 +23,62 @@ fn resolve_lang_alias(lang: &str) -> &str {
     }
 }
 
+/// Push a diagram engine's `Result` as either its rendered lines or, on
+/// `Fallback`, a `"{label} (Empty|Overflow): {kind}"` marker line followed
+/// by the original fence source (width-truncated). Shared by the mermaid
+/// path and every other diagram language an engine delegates to
+/// ([`GraphEngine::render_other_language`]) so both display the same
+/// fallback convention under their own label.
+fn push_diagram_result(
+    result: Result<Vec<String>, Fallback>,
+    label: &str,
+    code: &str,
+    width: u16,
+    out: &mut Vec<Line>,
+    plain: &mut Vec<String>,
+) {
+    match result {
+        Ok(lines) => {
+            for line in lines {
+                out.push(Line {
+                    indent: 0,
+                    spans: vec![Span { text: line.clone(), style: SpanStyle::Plain }],
+                    style: Some(LineStyle::Plain),
+                });
+                plain.push(line);
+            }
+        }
+        Err(fallback) => {
+            let marker = match fallback {
+                Fallback::Empty { kind } => format!("{label} (Empty): {kind}"),
+                Fallback::Overflow { kind } => format!("{label} (Overflow): {kind}"),
+            };
+
+            out.push(Line {
+                indent: 0,
+                spans: vec![Span { text: marker.clone(), style: SpanStyle::Code }],
+                style: Some(LineStyle::Plain),
+            });
+            plain.push(marker);
+
+            for line in code.lines() {
+                let mut text = line.to_string();
+                if line_width(&text) > width as usize {
+                    let limit = width as usize - 1;
+                    let truncated: String = text.chars().take(limit).collect();
+                    text = format!("{}…", truncated);
+                }
+                out.push(Line {
+                    indent: 0,
+                    spans: vec![Span { text: text.clone(), style: SpanStyle::Code }],
+                    style: Some(LineStyle::Plain),
+                });
+                plain.push(text);
+            }
+        }
+    }
+}
+
 pub fn push_code_block(
     lang: &str,
     code: &str,
@@ -30,46 +87,19 @@ pub fn push_code_block(
     plain: &mut Vec<String>,
 ) {
     if lang == "mermaid" {
-        match render_mermaid(code, width) {
-            Ok(lines) => {
-                for line in lines {
-                    out.push(Line {
-                        indent: 0,
-                        spans: vec![Span { text: line.clone(), style: SpanStyle::Plain }],
-                        style: Some(LineStyle::Plain),
-                    });
-                    plain.push(line);
-                }
-            }
-            Err(fallback) => {
-                let label = match fallback {
-                    Fallback::Empty { kind } => format!("Mermaid (Empty): {}", kind),
-                    Fallback::Overflow { kind } => format!("Mermaid (Overflow): {}", kind),
-                };
-                
-                out.push(Line {
-                    indent: 0,
-                    spans: vec![Span { text: label.clone(), style: SpanStyle::Code }],
-                    style: Some(LineStyle::Plain),
-                });
-                plain.push(label);
+        push_diagram_result(render_mermaid(code, width), "Mermaid", code, width, out, plain);
+        return;
+    }
 
-                for line in code.lines() {
-                    let mut text = line.to_string();
-                    if line_width(&text) > width as usize {
-                        let limit = width as usize - 1;
-                        let truncated: String = text.chars().take(limit).collect();
-                        text = format!("{}…", truncated);
-                    }
-                    out.push(Line {
-                        indent: 0,
-                        spans: vec![Span { text: text.clone(), style: SpanStyle::Code }],
-                        style: Some(LineStyle::Plain),
-                    });
-                    plain.push(text);
-                }
-            }
-        }
+    // Diagram languages this crate has no parser/IR of its own for at all
+    // (currently just PlantUML) are entirely delegated to whichever engine
+    // is selected -- `None` means "not a diagram language the selected
+    // engine knows" (falls through to plain syntax highlighting below),
+    // matching `code.rs`'s mermaid path only ever existing because this
+    // crate itself understands mermaid; here it understands nothing, so the
+    // engine either handles the whole thing or it doesn't exist here at all.
+    if let Some(result) = engine::current().render_other_language(lang, code, width) {
+        push_diagram_result(result, "PlantUML", code, width, out, plain);
         return;
     }
 
@@ -158,6 +188,43 @@ mod tests {
         assert_eq!(out[0].spans[0].text, "Mermaid (Empty): flowchart");
         assert_eq!(out[1].spans[0].text, "graph TB");
         assert_eq!(out[2].spans[0].text, "  %% just a comment");
+    }
+
+    #[cfg(feature = "engine-dg")]
+    #[test]
+    fn plantuml_fence_delegates_to_the_selected_engine() {
+        crate::markdown::mermaid::engine::select("dg")
+            .expect("dg engine is registered with the engine-dg feature");
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        let code = "@startuml\nAlice -> Bob: hi\n@enduml\n";
+
+        push_code_block("plantuml", code, 80, &mut out, &mut plain);
+
+        let text = plain.join("\n");
+        assert!(
+            text.contains("Alice") && text.contains("Bob"),
+            "expected dg's real plantuml sequence rendering, got:\n{text}"
+        );
+        assert!(!text.starts_with("PlantUML (Overflow)") && !text.starts_with("PlantUML (Empty)"), "{text}");
+    }
+
+    #[cfg(feature = "engine-dg")]
+    #[test]
+    fn plantuml_fence_falls_back_to_source_when_selected_engine_cannot() {
+        // builtin/mdview have no PlantUML parser at all -- render_other_language
+        // must decline (None) and code.rs must fall through to plain syntax
+        // highlighting, never panicking or silently dropping the fence.
+        crate::markdown::mermaid::engine::select("builtin").expect("builtin is always selectable");
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        let code = "@startuml\nAlice -> Bob: hi\n@enduml\n";
+
+        push_code_block("plantuml", code, 80, &mut out, &mut plain);
+
+        assert!(!plain.is_empty());
+        assert!(plain.iter().any(|l| l.contains("@startuml")), "source must still be shown: {plain:?}");
+        crate::markdown::mermaid::engine::select("dg").expect("dg engine stays selectable");
     }
 
     #[test]

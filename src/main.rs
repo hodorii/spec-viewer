@@ -216,13 +216,47 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         }
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-            let action = match crossterm::event::read()? {
-                crossterm::event::Event::Key(k) => spec_viewer::app::Action::Key(k),
-                crossterm::event::Event::Mouse(m) => spec_viewer::app::Action::Mouse(m),
-                crossterm::event::Event::Resize(w, h) => spec_viewer::app::Action::Resize(w, h),
-                _ => continue,
-            };
-            if step(terminal, state, action)? == spec_viewer::app::Control::Quit {
+            // Apply every already-queued input event (an `update`, no
+            // `terminal.draw`) before rendering once at the end, rather than
+            // `step`-ing (update + draw) per raw event as before. A mouse
+            // wheel/trackpad burst hands crossterm many discrete
+            // ScrollUp/ScrollDown events for what the user feels as one
+            // continuous scroll gesture; a diagram-heavy doc panel makes
+            // each `terminal.draw` comparatively expensive (most of the
+            // panel's cells change every scroll tick, so ratatui's
+            // double-buffer diff has little to skip), so drawing once per
+            // *raw* event falls behind the input rate and the backlog only
+            // grows for as long as the burst continues -- exactly the
+            // "느려짐이 누적되는" symptom this coalescing avoids. Draining
+            // down to "nothing left queued *right now*" (zero-timeout poll)
+            // and rendering once reflects the batch's final state instead.
+            let mut quit = false;
+            let mut applied_any = false;
+            loop {
+                let action = match crossterm::event::read()? {
+                    crossterm::event::Event::Key(k) => spec_viewer::app::Action::Key(k),
+                    crossterm::event::Event::Mouse(m) => spec_viewer::app::Action::Mouse(m),
+                    crossterm::event::Event::Resize(w, h) => spec_viewer::app::Action::Resize(w, h),
+                    _ => {
+                        if !crossterm::event::poll(std::time::Duration::ZERO)? {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                applied_any = true;
+                if spec_viewer::app::update(state, action) == spec_viewer::app::Control::Quit {
+                    quit = true;
+                    break;
+                }
+                if !crossterm::event::poll(std::time::Duration::ZERO)? {
+                    break;
+                }
+            }
+            if applied_any {
+                terminal.draw(|f| spec_viewer::ui::render(f, state))?;
+            }
+            if quit {
                 break;
             }
         } else {

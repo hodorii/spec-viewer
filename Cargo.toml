@@ -32,4 +32,4 @@ serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 ignore = "0.4"
-dg = { git = "https://github.com/hodorii/dg.git", branch = "master", default-features = false, optional = true }
+dg = { git = "https://github.com/hodorii/dg.git", branch = "main", default-features = false, optional = true }

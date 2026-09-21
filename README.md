@@ -46,7 +46,7 @@ contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/si
 Mermaid flowchart/state diagrams in rendered markdown go through a pluggable
 `GraphEngine`:
 - `dg` (default, feature `engine-dg`) — renders via [dg](https://github.com/hodorii/dg) (MIT).
-- `mdview` — a band-routed layout engine ported from [mdview](https://github.com/hjshim/mdview) (MIT); see `THIRD_PARTY.md`.
+- `mdview` — a band-routed layout engine ported from [mdview](https://github.com/aaron-shim/mdview) (MIT); see `THIRD_PARTY.md`.
 - `builtin` — a simpler shared-vertical-bus layout, no external dependency.
 
 ## License

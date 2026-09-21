@@ -4,7 +4,7 @@
 
 Portions of this crate's rendering code (table borders, heading/emphasis
 theme structure, and the box-drawing canvas used for mermaid diagram edges)
-were adapted from [mdview](https://github.com/hjshim/mdview) by hjshim,
+were adapted from [mdview](https://github.com/aaron-shim/mdview) by hjshim,
 used under the MIT License.
 
 ```

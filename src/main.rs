@@ -60,7 +60,7 @@ const DEFAULT_DIAGRAM_ENGINE: &str = "dg";
 const DEFAULT_DIAGRAM_ENGINE: &str = "mdview";
 
 #[derive(Parser, Debug)]
-#[command(name = "m", about = "Spec Viewer CLI")]
+#[command(name = "m", about = "Spec Viewer CLI", version)]
 pub struct Args {
     /// Optional starting path; defaults to the current directory (1.1, 1.2).
     /// Under `--all`, this is the directory to scan instead of a `.kiro`

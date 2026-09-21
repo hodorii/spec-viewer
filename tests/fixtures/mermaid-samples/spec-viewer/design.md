@@ -15,7 +15,7 @@
 ### Out-of-Scope
 - **Schema Definition**: `spec.json` 스키마 및 파일명 규약 정의 (kiro 스킬군 소유).
 - **Spec Mutation**: `spec.json` 승인 상태 변경 및 `.kiro/` 하위 파일 쓰기 일체 — `loader`는 읽기 전용이며 쓰기 경로가 없다.
-- **Complex Rendering**: gantt/pie/mindmap 등 mermaid 비그래프 유형은 전용 레이아웃이 없다 — `parse::generic`이 `:`/`->`/`-->` 패턴만 관계로 인식하고 나머지는 줄 전체를 상자 하나로 뭉뚱그리는 휴리스틱 폴백만 제공한다. 이미지 렌더링·HTML/웹 출력 없음.
+- **Complex Rendering**: spec-viewer 자신은 mermaid `flowchart`/`er`/`class`/`state`(+`sequence`) 외엔 전용 레이아웃이 없다 — `parse::generic`이 `:`/`->`/`-->` 패턴만 관계로 인식하고 나머지는 줄 전체를 상자 하나로 뭉뚱그리는 휴리스틱 폴백만 제공한다. 다만 기본 엔진 `dg`가 선택돼 있으면(기본값) `gitGraph`/`block-beta`/`pie`/`xychart-beta`/`quadrantChart`/`gantt`와 PlantUML 일부(시퀀스·클래스·ER·간트·컴포넌트류)는 dg에게 통째로 위임돼 실제 도표로 그려진다 — 이 out-of-scope 항목은 "spec-viewer가 자체 파서를 안 가진 유형"이지 "절대 그려지지 않는 유형"이 아니다. mermaid `mindmap`·`journey` 등 dg도 모르는 유형과, dg가 아닌 `mdview`/`builtin`을 선택했을 때는 여전히 위 휴리스틱 폴백만 있다. 이미지 렌더링·HTML/웹 출력 없음.
 - **Global Search**: 여러 문서에 걸친 통합 검색 (현재 포커스된 패널 — 문서 또는 트리 — 내부만 검색).
 - **Workspace Integration**: `agw` 류 워크스페이스 `Cargo.toml` 관리 (독립 크레이트, `[[bin]] name = "m"`).
 
@@ -57,7 +57,7 @@ graph LR
 순수 코어(`spec`, `markdown`) + I/O 껍질(`loader`, `watch`) + 단일 리듀서(`app`). 코어는 (입력, 폭) → 출력이 결정적이라 골든 테스트 대상. (이 다이어그램 소스 자체가 `engine/mdview.rs`의 `real_boundary_map_matches_reference_mdview_tb_output_at_100_and_120` 골든 테스트에서 폭 100·120으로 렌더되어 `tests/fixtures/mdview-tb/boundary-map-w{100,120}.txt`와 문자 그대로 비교된다 — 이 펜스를 고치면 그 두 스냅샷도 같이 갱신해야 한다.)
 
 ### Block Diagram (레이어 블록도)
-"Allowed Dependencies"의 내부 의존 방향(`spec`/`markdown`/`watch` → `app` → `ui` → `main`)을 mermaid의 `block-beta` 블록 다이어그램 문법으로 그린 것 — GitHub/mermaid-live 등 mermaid 공식 렌더러에서는 실제 블록도로 그려지지만, **spec-viewer 자신의 `sniff_kind`는 `block-beta`를 인식하는 4종(flowchart/er/class/state)에 넣지 않았으므로 이 펜스는 이 앱 안에서는 `generic` 폴백(줄 단위 상자화)으로 렌더된다** — PlantUML과 마찬가지로 "spec-viewer가 못 그리는 실제 mermaid 문법"의 또 다른 사례.
+"Allowed Dependencies"의 내부 의존 방향(`spec`/`markdown`/`watch` → `app` → `ui` → `main`)을 mermaid의 `block-beta` 블록 다이어그램 문법으로 그린 것. spec-viewer 자신의 `sniff_kind`는 `block-beta`를 인식하는 4종(flowchart/er/class/state)에 넣지 않으므로 **기본 엔진이 `mdview`/`builtin`이면** `generic` 폴백(줄 단위 상자화)으로 렌더되지만, 기본값인 `dg`가 선택돼 있으면 `DgEngine::classify`가 `dg::diagram::kind_of`로 `"block"`을 인식해 dg의 실제 블록 배치(그룹 사각형·화살표)로 그려진다("markdown::mermaid::engine — GraphEngine"의 "엔진이 자기 지원 범위를 스스로 결정한다" 참고 — 실측 확인함).
 ```mermaid
 block-beta
 columns 3
@@ -101,7 +101,7 @@ columns 3
 - **Theme table — 의도된 SSoT이지만 UI까지 관통하지 않음**: `markdown::Theme`(heading[6]/heading_rule[6]/emphasis/strong/strikethrough/code/quote/quote_bar/list_marker/task_done/task_todo/rule/table_header/table_border/text/link, 16필드)은 `markdown` 모듈 내부(`block.rs`/`inline.rs`)에서만 참조되며, 구조에 영향을 주는 건 사실상 `heading_rule` 문자뿐이다(`render`는 `Theme::default()`로 `render_with`를 얇게 감싼 래퍼). `ui::doc_panel`은 `Theme`를 import조차 하지 않고 같은 색 배정을 자기 `span_style`/`line_style`/`heading_style` 함수로 독립적으로 재구현한다. `task_done`/`task_todo` 필드는 정의만 있고 어디서도 읽히지 않는 죽은 코드(체크박스는 `SpanStyle::Plain`으로 삽입됨). 즉 "테마 하나로 렌더러·패널 전체 스타일을 통제"라는 원래 설계 의도는 아직 실현되지 않았다.
 - **Table, GitHub style**: 열 폭은 내용 폭(합계가 페인 폭을 넘을 때만 넓은 열부터 축소, 최후엔 비례 축소 + 셀 줄바꿈). 격자 `┌─┬─┐│├─┼─┤…└─┴─┘`에 헤더 뒤뿐 아니라 모든 본문 행 사이에도 구분선, 헤더 굵게. 페인 폭 채움은 하지 않는다.
 - **Pluggable GraphEngine**: `trait GraphEngine: Send + Sync { fn name(&self) -> &'static str; fn supports(&self, kind: &str) -> bool; fn classify(&self, src: &str) -> Option<&'static str> { None }; fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>; }` — 별도 `dir` 인자는 없고 필요하면 `Diagram::Graph{dir,..}`에서 각 엔진이 스스로 꺼낸다. 레지스트리는 프로세스 전역 `OnceLock<RwLock<EngineState>>`(`register`/`select`/`current`/`engines`), `builtin`+`mdview`가 항상 등록되고 `engine-dg` 피처일 때만 `dg`가 추가된다(현재 최대 3개, `graphs-tui`는 레지스트리 어디에도 없다). 그래프형은 선택된 엔진이 `supports(kind)`가 거짓이면 `builtin`으로 자동 폴백. sequence는 선택된 엔진이 `supports("sequence")`할 때만(현재 `dg`) 먼저 시도하고, 실패·미지원 시 `seq::layout`(전용 압축 렌더러)로 폴백. 기본 엔진은 `engine-dg` 피처가 켜지면 `dg`, 아니면 `mdview`. `dg`는 파싱 결과가 아닌 mermaid 펜스 원문을 그대로 받는다.
-- **엔진이 자기 지원 범위를 스스로 결정한다**: `kind`는 `selected.classify(src)`(기본 `None` = spec-viewer의 `sniff_kind`에 위임)로 정해진다. `builtin`/`mdview`는 이 기본값을 그대로 쓰므로 `supports()`가 flowchart·er·class·state·**generic**(sequence 미지원)인 게 곧 정직한 실제 범위다. `DgEngine`만 `classify`를 `dg::diagram::kind_of`로 오버라이드하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 실제로 인식하는 11종(flowchart·sequence·state·er·class·gitgraph·block·pie·xychart·quadrant·gantt) 전부가 spec-viewer의 손으로 유지되는 화이트리스트 없이 그대로 지원 범위가 된다. 자세한 개선 배경·전후 비교는 "markdown::mermaid::engine — GraphEngine" 절.
+- **엔진이 자기 지원 범위를 스스로 결정한다**: `kind`는 `selected.classify(src)`(기본 `None` = spec-viewer의 `sniff_kind`에 위임)로 정해진다. `builtin`/`mdview`는 이 기본값을 그대로 쓰므로 `supports()`가 flowchart·er·class·state·**generic**(sequence 미지원)인 게 곧 정직한 실제 범위다. `DgEngine`만 `classify`를 `dg::diagram::kind_of`로 오버라이드하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 실제로 인식하는 mermaid 11종(flowchart·sequence·state·er·class·gitgraph·block·pie·xychart·quadrant·gantt) 전부가 spec-viewer의 손으로 유지되는 화이트리스트 없이 그대로 지원 범위가 된다. **PlantUML도 같은 원리로 위임된다**: `GraphEngine::render_other_language(lang, src, width)`(기본 `None`)를 `DgEngine`이 `dg::diagram::language_of_fence`로 오버라이드해, `code.rs`가 `"mermaid"`가 아닌 펜스 언어를 syntect로 넘기기 전에 먼저 선택된 엔진에게 위임 가능한지 물어본다 — `mdview`/`builtin`은 PlantUML 파서 자체가 없어 여전히 무강조 텍스트. 자세한 개선 배경·전후 비교는 "markdown::mermaid::engine — GraphEngine" 절.
 - **Adopt mdview graph engine**: `engine/mdview.rs`는 mdview `render/mermaid/graph.rs`(MIT) 포팅 — subgraph를 클러스터로 묶은 랭킹(`longest_path`), 4패스 barycenter 순서 정렬 + 그룹 응집, 긴 간선의 더미 노드 분할, 랭크 경계마다 구간 스케줄링으로 배정한 밴드 배선(순방향은 세로-가로-세로, 피드백 간선은 몸통 오른쪽 전용 거터로 우회), 자기 루프는 `↺` 글리프+라벨을 노드 옆에 직접 텍스트로. `Dir`는 완전히 무시하고 **항상 TB**로 그린다(`graph LR` 선언도 무시) — 과거 LR 전치 지원을 추가했다가 코너 글리프 겹침·`┼` 크로싱 문제로 제거했고, 이 사실은 이 파일 "Boundary Map" 골든 테스트가 계속 diff 0으로 검증한다. 오버플로 사다리(라벨 축약 → Class/Entity 본문 접기 → `n.header`가 있는 다이어그램에 한해 층 내 행 래핑 → 소스 폴백)는 **이 엔진에만** 구현돼 있다. 캔버스는 `canvas.rs`(방향 비트마스크 박스드로잉 병합, mdview 포팅, `builtin`과 공유)를 사용.
 - **Own mermaid subset (builtin)**: `graph.rs`는 자체 층 배치(간선 relaxation, barycenter 없이 "같은 층은 선언 순")로 LR/TB 양방향을 렌더하며, 오버플로는 라벨 축약(`MIN_BUDGET=3`까지) 한 단계뿐 — mdview의 본문 접기·행 래핑 사다리는 없다. `seq.rs`는 별도의 컴팩트 화살표 리스트 sequence 렌더러(참여자 균등폭 열, self-message 3행 루프, 라벨 축약 후 오버플로). 둘 다 교차 최소화 없음. `mermaid::parse::seq`는 mermaid의 `note`/`loop`/`alt`/`opt`/`par` 구조 키워드를 전혀 인식하지 않는다 — 그런 줄은 participant도 message도 아니므로 조용히 드롭된다.
 - **Watch startup latency (`NoCache`)**: `watch::start`는 `notify_debouncer_full::new_debouncer_opt` + `NoCache::new()`를 명시적으로 쓴다 — 기본 `RecommendedCache`가 등록 시점에 루트 아래를 동기적으로 walk+stat 해서 rename-id 캐시를 시딩하는데, 이 크레이트의 `FsEvent`는 애초에 rename을 delete/create와 구분해 주지 않으므로 그 캐시는 순수 오버헤드였다. 대형 디렉터리에서 `start()`가 첫 프레임을 블로킹하던 회귀를 캐시 없음으로 해결(전용 성능 회귀 테스트로 감시).
@@ -134,7 +134,7 @@ sequenceDiagram
 - **이벤트 분류**: 현재 열려 있는 문서 자신의 경로가 바뀌면 `reload_current_doc`(트리 선택과 무관하게 항상 재로드, 파일 뷰 모드 회귀 수정); `spec.json`/`tasks.md` 변경 → 해당 스펙 메타만 재빌드; 디렉터리·`.md` 추가/삭제/이름변경 → 루트 재스캔(`load_snapshot`) 후 `spec::sort_specs`로 정렬을 다시 적용(`resync`).
 
 ### 문서 선택 → 렌더 → 변경 반영 (PlantUML, 생명선 포함)
-위와 같은 흐름을 PlantUML 시퀀스 다이어그램으로 다시 그린 것 — `activate`/`deactivate`로 각 참여자의 활성 구간(생명선 위 실행 막대)을 명시한다. mermaid판과 마찬가지로 spec-viewer 자신은 이 펜스를 다이어그램으로 그리지 않는다(코드 펜스 언어가 `plantuml`이라 `code.rs`의 일반 하이라이팅 경로로 감 — 위 "다이어그램 유형 커버리지 샘플" 참고). PlantUML 렌더러(plantuml.com/서버, VS Code 확장 등)로 보는 참고 자료다.
+위와 같은 흐름을 PlantUML 시퀀스 다이어그램으로 다시 그린 것 — `activate`/`deactivate`로 각 참여자의 활성 구간(생명선 위 실행 막대)을 명시한다. **spec-viewer 자신도 이제 이 펜스를 실제 박스+생명선 다이어그램으로 그린다**(코드 펜스 언어 `plantuml`을 `GraphEngine::render_other_language`가 받아 `dg::diagram::language_of_fence`로 `Language::PlantUml`을 인식하고 `dg::render_diagram`에 그대로 위임 — "다이어그램 유형 커버리지 샘플"/"markdown::mermaid::engine — GraphEngine" 참고, `push_code_block(..., width=100, ...)`로 직접 실측해 확인함). `mdview`/`builtin`을 선택했을 때만 PlantUML 파서가 없어 무강조 텍스트로 남는다.
 ```plantuml
 @startuml
 actor User
@@ -367,13 +367,14 @@ main  ●3697851───●4ae9936───●86900ce───●df77b3d──�
 ```
 (dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 실제 dg 출력에는 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. "태그가 안 보이는 것"은 회귀가 아니다.)
 
-PlantUML(스펙 외 — spec-viewer가 인식하는 다이어그램이 아니다): `markdown::code::push_code_block`은 언어가 정확히 `"mermaid"`일 때만 `render_mermaid`로 위임한다. 그 외 언어는 syntect 일반 하이라이팅 경로로 가는데, 기본 번들(`SyntaxSet::load_defaults_newlines`)엔 PlantUML 문법이 없어 `find_syntax_by_extension("plantuml")`이 `None`을 반환하고 `find_syntax_plain_text()`로 강등된다 — 즉 아래 펜스는 다이어그램으로 그려지지 않고 무강조 텍스트 코드블록으로 그대로 표시된다(`engine_compare.rs`의 펜스 추출도 `mermaid` 언어 태그만 보므로 이 펜스는 애초에 그 테스트 대상이 아니다):
+**PlantUML — `code.rs`가 `"mermaid"`만 특별 취급하던 시절엔 지원 밖이었지만, 이제는 위임된다 (2026-09-22 개선)**: `markdown::code::push_code_block`은 언어가 정확히 `"mermaid"`가 아니면, 곧장 syntect로 가기 전에 `engine::current().render_other_language(lang, code, width)`를 먼저 물어본다. `builtin`/`mdview`는 이 메서드의 기본 구현(`None`)을 그대로 쓰므로 PlantUML을 여전히 모르지만, `DgEngine`은 `dg::diagram::language_of_fence("plantuml"|"puml"|"uml")`로 `Language::PlantUml`을 인식해 `dg::render_diagram`에 그대로 위임한다 — 이 fence는 이제 dg의 실제 박스+화살표 시퀀스 다이어그램으로 그려진다(기본 엔진이 `dg`이므로 별도 설정 없이도 그렇다; `push_code_block("plantuml", 위 소스, 60, ...)`로 직접 실측 확인함). `engine_compare.rs`의 펜스 추출은 여전히 `mermaid` 언어 태그만 보므로 이 fence는 그 골든/폴백 테스트 대상은 아니고, `code.rs`의 전용 단위 테스트(`plantuml_fence_delegates_to_the_selected_engine`/`plantuml_fence_falls_back_to_source_when_selected_engine_cannot`)가 이 경로를 검증한다:
 ```plantuml
 @startuml
 Alice -> Bob: 인증 요청
 Bob --> Alice: 토큰 발급
 @enduml
 ```
+`mdview`/`builtin`을 선택하면(`render_other_language`가 `None`을 돌려줌) 위 소스가 여전히 무강조 텍스트 코드블록으로 표시된다 — PlantUML 지원은 순전히 "선택된 엔진이 아는가"에 달려 있다.
 
 ### markdown::mermaid::engine — GraphEngine
 Key Decisions의 "Pluggable GraphEngine"/"Adopt mdview graph engine"/"Own mermaid subset"/"엔진이 자기 지원 범위를 스스로 결정" 참고. 등록·선택은 `engine::{register, select, current, engines}`(`OnceLock<RwLock<EngineState>>`).
@@ -385,6 +386,10 @@ pub trait GraphEngine: Send + Sync {
     /// 그대로 쓴다"(builtin/mdview). 독립 파서를 가진 엔진(dg)만 오버라이드.
     fn classify(&self, _src: &str) -> Option<&'static str> { None }
     fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>;
+    /// `"mermaid"`가 아닌 펜스 언어(예: `"plantuml"`)를 이 엔진 자신의 파서에
+    /// 전부 위임. 이 크레이트는 mermaid 말고는 자체 IR이 없어 `classify`처럼
+    /// 물러설 곳도 없다 — 기본값 `None` = "이 언어를 모른다"(builtin/mdview).
+    fn render_other_language(&self, _lang: &str, _src: &str, _width: u16) -> Option<Result<Vec<String>, Fallback>> { None }
 }
 pub fn engines() -> &'static [&'static dyn GraphEngine];
 pub fn register(engine: &'static dyn GraphEngine) -> Result<(), String>;
@@ -393,9 +398,9 @@ pub fn current() -> &'static dyn GraphEngine;
 ```
 - `BuiltinEngine`("builtin"): `graph::layout(diagram, width, sniff_kind(src))`의 얇은 래퍼. `classify`는 오버라이드하지 않음 — spec-viewer 자신의 `Diagram` IR만 렌더하므로 `sniff_kind`의 5갈래(flowchart/er/class/state/generic)가 곧 이 엔진의 진짜 지원 범위다.
 - `MdviewEngine`("mdview"): `engine/mdview.rs` — 클러스터 랭킹 → barycenter 순서 → 더미노드 좌표 배치 → 밴드 배선/피드백 거터 → `Canvas` 합성. TB 고정. `classify`도 builtin과 마찬가지로 기본값(오버라이드 없음).
-- `DgEngine`("dg", `engine-dg` 피처): `dg::render_diagram(src, Some(Language::Mermaid), &RenderOptions{width, diagram_caption:false, ..})`에 원문을 그대로 전달, `None`이면 `Fallback::Overflow`(kind는 `dg::diagram::kind_of`로 판정). **`classify(src)`를 `dg::diagram::kind_of(Language::Mermaid, src)`로 오버라이드**하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 인식한 kind는 spec-viewer의 `sniff_kind`가 절대 만들어내지 않는 문자열("gitgraph"/"block"/"pie"/"xychart"/"quadrant"/"gantt" 등)이므로 이 한 줄이면 "dg가 방금 인식했다"와 "supports"가 정확히 동치가 된다.
+- `DgEngine`("dg", `engine-dg` 피처): `dg::render_diagram(src, Some(Language::Mermaid), &RenderOptions{width, diagram_caption:false, ..})`에 원문을 그대로 전달, `None`이면 `Fallback::Overflow`(kind는 `dg::diagram::kind_of`로 판정). **`classify(src)`를 `dg::diagram::kind_of(Language::Mermaid, src)`로 오버라이드**하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 인식한 kind는 spec-viewer의 `sniff_kind`가 절대 만들어내지 않는 문자열("gitgraph"/"block"/"pie"/"xychart"/"quadrant"/"gantt" 등)이므로 이 한 줄이면 "dg가 방금 인식했다"와 "supports"가 정확히 동치가 된다. **`render_other_language(lang, src, width)`도 오버라이드** — `dg::diagram::language_of_fence(lang)`로 펜스 언어(`"plantuml"`/`"puml"`/`"uml"`)를 `Language::PlantUml`로 인식하면(`"mermaid"`/`"mmd"`로 판정되면 `None` — 그건 `code.rs`의 mermaid 전용 경로 소관) 같은 `dg::render_diagram` 헬퍼(`render_via_dg`)로 위임한다.
 
-**엔진이 자기 지원 범위를 스스로 결정한다 (2026-09-22 개선)** — 이전엔 `render_mermaid`가 spec-viewer 자신의 `sniff_kind`(그래프형 4종 접두어 외엔 전부 `"generic"`)로 먼저 kind를 정하고, 그 kind로 `selected.supports(kind)`를 물었다. `../dg`(`~/tools/dg`, README 기준)는 자체 파서로 mermaid 11종(flowchart/sequence/state/er/class/gitGraph/block-beta/pie/xychart-beta/quadrantChart/gantt)을 전부 실제 도표로 그리는데, `DgEngine::supports`가 `flowchart|er|class|state|sequence` 5종짜리 하드코딩 화이트리스트였던 탓에 나머지 6종은 `sniff_kind`가 붙인 `"generic"` 딱지에 막혀 `--diagram-engine dg`를 선택해도 dg의 진짜 렌더러에 한 번도 도달하지 못하고 매번 `BuiltinEngine`의 조잡한 줄 단위 상자화로 대체되고 있었다. 고친 뒤에는 `render_mermaid`가 kind를 정할 때 **선택된 엔진 자신에게 먼저 물어본다**(`selected.classify(code)`, 기본은 spec-viewer의 `sniff_kind`로 위임) — `dg`가 선택돼 있으면 `dg::diagram::kind_of`가 반환하는 kind를 그대로 쓰므로, 이제 dg가 인식하는 6종 모두 `--diagram-engine dg`(기본값)에서 실제로 dg의 렌더러까지 도달한다. PlantUML은 여전히 한 층 더 앞에서 막힌다 — `code.rs::push_code_block`이 펜스 언어가 정확히 `"mermaid"`일 때만 다이어그램 경로로 보내므로, dg가 `Language::PlantUml`을 직접 지원해도 그 펜스는 애초에 `render_mermaid` 근처에도 못 간다(이건 이번 개선 범위 밖).
+**엔진이 자기 지원 범위를 스스로 결정한다 (2026-09-22 개선, mermaid → PlantUML 순으로 두 단계)** — 1단계(mermaid): 이전엔 `render_mermaid`가 spec-viewer 자신의 `sniff_kind`(그래프형 4종 접두어 외엔 전부 `"generic"`)로 먼저 kind를 정하고, 그 kind로 `selected.supports(kind)`를 물었다. `../dg`(`~/tools/dg`, README 기준)는 자체 파서로 mermaid 11종을 전부 실제 도표로 그리는데, `DgEngine::supports`가 5종짜리 하드코딩 화이트리스트였던 탓에 나머지 6종은 `"generic"` 딱지에 막혀 dg의 진짜 렌더러에 한 번도 도달하지 못했다. 고친 뒤에는 `render_mermaid`가 kind를 정할 때 **선택된 엔진 자신에게 먼저 물어본다**(`selected.classify(code)`) — `dg`가 선택돼 있으면 이제 6종 모두 dg의 렌더러까지 도달한다. 2단계(PlantUML): mermaid를 고치고 나서도 `code.rs::push_code_block`이 펜스 언어가 정확히 `"mermaid"`일 때만 다이어그램 경로로 보냈으므로, dg가 `Language::PlantUml`을 직접 지원해도 PlantUML 펜스는 `render_mermaid` 근처에도 못 갔다 — `GraphEngine::render_other_language`를 추가해 이 마지막 문도 열었다: `code.rs`가 `"mermaid"`가 아닌 언어를 만나면 syntect로 가기 전에 먼저 선택된 엔진에게 이 언어를 아는지 물어보고(`dg`만 안다), 알면 그대로 위임한다.
 
 **개선 전후 비교** (같은 소스, 기본 엔진 `dg`, 폭 70 — spec-viewer 자신의 `render_mermaid`를 그대로 호출한 결과이지 `dg::render_diagram`을 게이트 없이 따로 부른 게 아니다):
 ```mermaid
@@ -551,7 +556,7 @@ pub fn step<B: Backend>(terminal, state, action) -> Result<Control, B::Error>;  
 도메인 타입은 위 `spec`·`markdown`·`app` 인터페이스가 전부다. 영속 저장 없음 — `DirSnapshot`은 테스트에서만 인메모리로 구현.
 
 ### Entity-Relationship (PlantUML)
-`spec` 모듈의 실제 관계(§Components and Interfaces "spec — SpecModel"의 구조체 필드 그대로). `Spec.meta`는 `Result<SpecMeta, MetaError>`라 항상 존재하되 내용이 성공/실패로 갈리므로 `|o--o|`(0..1)로 표시했다. spec-viewer는 이 펜스도 다이어그램으로 그리지 않는다(PlantUML 미지원, 위 참고).
+`spec` 모듈의 실제 관계(§Components and Interfaces "spec — SpecModel"의 구조체 필드 그대로). `Spec.meta`는 `Result<SpecMeta, MetaError>`라 항상 존재하되 내용이 성공/실패로 갈리므로 `|o--o|`(0..1)로 표시했다. 기본 엔진 `dg`에서는 이 펜스도 실제 ER 다이어그램(엔티티 상자 + 카디널리티)으로 그려진다(`GraphEngine::render_other_language` 위임, 위 "다이어그램 유형 커버리지 샘플" 참고) — `mdview`/`builtin`을 선택했을 때만 무강조 텍스트로 남는다.
 ```plantuml
 @startuml
 entity SpecRoot {
@@ -598,7 +603,7 @@ SpecMeta ||--o{ Approval : "approvals (DocKind별)"
 ```
 
 ### Class Diagram (PlantUML)
-같은 도메인을 UML 클래스 다이어그램으로 — Rust `enum`은 `<<enumeration>>` 스테레오타입으로 표시했다.
+같은 도메인을 UML 클래스 다이어그램으로 — Rust `enum`은 `<<enumeration>>` 스테레오타입으로 표시했다. ERD와 마찬가지로 `dg`가 선택돼 있으면 실제 클래스 박스+관계선으로 그려진다.
 ```plantuml
 @startuml
 enum DocKind {
@@ -681,7 +686,7 @@ SteeringDoc --> Inclusion
 - **기능 강등**: syntect 실패 → 무강조 코드블록; watcher 등록 실패 → `Watch::Manual`; 마우스 캡처 실패 → 로컬 플래그만 기록하고 키보드로 계속(상태 필드 없음); OSC 52 미지원 → 복사 무시; 각 GraphEngine이 폭에 못 맞추면(`dg`는 내부 재시도까지 마친 뒤) `Fallback::Overflow` → `code.rs`가 소스 박스 폴백.
 
 ## Testing Strategy
-- **Unit** (각 모듈 `#[cfg(test)]`): `spec::meta` 스키마 관대함·MissingName·InvalidJson · `spec::progress` 체크박스 혼합/없음/전부완료 · `spec::mod::build_tests` 문서 순서·누락·steering 분리·exists/status 불일치 · `spec::sort` 4키 순환·2차 정렬·파싱실패 안전성 · `find_root` 우선순위 · `markdown::wrap` CJK·스타일별 단어분리 · `table` 폭 배분 · `code` 가로 잘림·언어 별칭·mermaid 폴백 라벨 · `mermaid::parse::{flow,er,class,state,seq,generic}` 각 문법 부분집합(class.rs의 따옴표 다중성/인라인 주석 리그레션 포함) · `mermaid::graph`(builtin) TB/LR·라벨축약 · `mermaid::engine::mdview` 랭킹/순서/배치/밴드배선/오버플로 사다리 각 단계 + Boundary Map 골든(§Architecture) · `mermaid::engine::dg_engine` 화살표 렌더 스모크 · `mermaid::engine::mod` 레지스트리/폴백 · `app::search` 문서·트리 검색 분리 동작 · `app::mod` 리듀서(`reducer_tests`, 2998줄 파일의 절반 가량) · `keymap` 키→액션 매핑 · `main` `resolve_startup`/`resolve_source` 경로 검증.
+- **Unit** (각 모듈 `#[cfg(test)]`): `spec::meta` 스키마 관대함·MissingName·InvalidJson · `spec::progress` 체크박스 혼합/없음/전부완료 · `spec::mod::build_tests` 문서 순서·누락·steering 분리·exists/status 불일치 · `spec::sort` 4키 순환·2차 정렬·파싱실패 안전성 · `find_root` 우선순위 · `markdown::wrap` CJK·스타일별 단어분리 · `table` 폭 배분 · `code` 가로 잘림·언어 별칭·mermaid 폴백 라벨·PlantUML 위임/폴백(`plantuml_fence_delegates_to_the_selected_engine`/`plantuml_fence_falls_back_to_source_when_selected_engine_cannot`) · `mermaid::parse::{flow,er,class,state,seq,generic}` 각 문법 부분집합(class.rs의 따옴표 다중성/인라인 주석 리그레션 포함) · `mermaid::graph`(builtin) TB/LR·라벨축약 · `mermaid::engine::mdview` 랭킹/순서/배치/밴드배선/오버플로 사다리 각 단계 + Boundary Map 골든(§Architecture) · `mermaid::engine::dg_engine` 화살표 렌더 스모크 + PlantUML `render_other_language`(시퀀스 인식·`puml`/`uml` 별칭·mermaid/미지원 언어 거부) · `mermaid::engine::mod` 레지스트리/폴백 · `mermaid::mod` `classify` 기반 엔진 자기결정(`generic_bucket_kind_reaches_dg_when_dg_recognizes_it`/`unclassifiable_source_still_falls_back_to_builtin`) · `app::search` 문서·트리 검색 분리 동작 · `app::mod` 리듀서(`reducer_tests`, 2998줄 파일의 절반 가량) · `keymap` 키→액션 매핑 · `main` `resolve_startup`/`resolve_source` 경로 검증.
 - **Integration** (`tests/integration.rs`, 실제 `tests/fixtures/kiro` + 진짜 파일워처): 루트 로드, 비UTF-8 표시, 실제 변경 → `FsEvent`, 삭제 → `Deleted`, `--no-watch`/등록 실패 → Manual. 각 테스트가 픽스처 트리를 임시 디렉터리로 복사해 격리.
 - **E2E** (`tests/app_flow.rs`, `TestBackend`): `.kiro/specs/spec-viewer/biz-process.md`의 L2 활동(`BP-SPEC-VIEW.L2-A1~A6`)별 실행→펼침→선택→탐색→변경반영→종료 시나리오.
 - **Mouse/Visual** (`tests/visual_defects.rs`, `TestBackend` 실버퍼 검사): 클릭/드래그/스크롤이 실제 렌더 셀에 반영되는지. `tests/table_overflow.rs`는 이 저장소가 아니라 상위 `../.kiro/specs/spec-viewer/design.md`(실제 프로젝트 사양 디렉터리)에 대해 표 오버플로 회귀를 검증하므로, 이 크레이트가 그 상위 디렉터리 밖에 단독 체크아웃되면 해당 3개 테스트는 `DocView::Missing`으로 실패한다(환경 전제 문제이며 이 fixture 파일과는 무관).

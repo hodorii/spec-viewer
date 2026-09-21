@@ -70,6 +70,21 @@ pub trait GraphEngine: Send + Sync {
 
     /// Render a parsed graph diagram to terminal lines at `width` columns.
     fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>;
+
+    /// Render a fenced code block whose language is *not* `"mermaid"`
+    /// (`lang` is the fence's own language tag, e.g. `"plantuml"`/`"puml"`),
+    /// entirely delegated to this engine's own parser -- this crate has no
+    /// IR of its own for anything but mermaid, so there is no `sniff_kind`
+    /// fallback to defer to here the way [`classify`](Self::classify) can.
+    /// `None` means "not a diagram language I know, or not a diagram at
+    /// all" (the caller falls back to plain syntax highlighting); `Some`
+    /// carries this engine's real render attempt. Default: `None` for every
+    /// engine (`builtin`/`mdview` have no non-mermaid parser at all); `dg`
+    /// overrides it for PlantUML via `dg::diagram::language_of_fence` +
+    /// `dg::render_diagram`.
+    fn render_other_language(&self, _lang: &str, _src: &str, _width: u16) -> Option<Result<Vec<String>, Fallback>> {
+        None
+    }
 }
 
 /// Process-global registry plus selection state.

@@ -43,11 +43,15 @@ contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/si
 
 ## Diagram engines
 
-Mermaid flowchart/state diagrams in rendered markdown go through a pluggable
-`GraphEngine`:
-- `dg` (default, feature `engine-dg`) — renders via [dg](https://github.com/hodorii/dg) (MIT).
-- `mdview` — a band-routed layout engine ported from [mdview](https://github.com/aaron-shim/mdview) (MIT); see `THIRD_PARTY.md`.
-- `builtin` — a simpler shared-vertical-bus layout, no external dependency.
+Mermaid diagrams in rendered markdown go through a pluggable `GraphEngine`:
+- `dg` (default, feature `engine-dg`) — renders via [dg](https://github.com/hodorii/dg) (MIT). `dg` decides its own supported mermaid kinds itself (flowchart, sequence, state, er, class, gitGraph, block-beta, pie, xychart-beta, quadrantChart, gantt) rather than being limited to a fixed list here.
+- `mdview` — a band-routed layout engine ported from [mdview](https://github.com/aaron-shim/mdview) (MIT); see `THIRD_PARTY.md`. Renders flowchart/er/class/state/generic.
+- `builtin` — a simpler shared-vertical-bus layout, no external dependency. Same coverage as `mdview`.
+
+PlantUML fences (` ```plantuml `/` ```puml `/` ```uml `) are also delegated to
+the selected engine when it supports PlantUML — currently only `dg` does;
+`mdview`/`builtin` have no PlantUML parser, so a PlantUML fence falls back to
+plain syntax-highlighted text when either of those is selected.
 
 ## License
 

@@ -11,12 +11,36 @@
 //! xychart-beta/quadrantChart/gantt, none of which this crate's own
 //! `sniff_kind` tells apart from plain prose) gets a real chance at `dg`'s
 //! renderer instead of silently landing in this crate's `"generic"` bucket.
+//!
+//! The same delegation covers PlantUML via
+//! [`render_other_language`](GraphEngine::render_other_language): this
+//! crate has no PlantUML parser or IR of its own at all (unlike mermaid,
+//! where `builtin`/`mdview` at least have this crate's own `Diagram`), so
+//! whether a `plantuml`/`puml`/`uml` fence becomes a real diagram is
+//! entirely up to whichever engine is selected -- currently only `dg`
+//! answers at all (`dg::diagram::language_of_fence` decides which fence
+//! languages count).
 
 use super::super::parse::Diagram;
 use super::super::Fallback;
 use super::GraphEngine;
 
 pub struct DgEngine;
+
+/// Call `dg::render_diagram` for `language` and turn its `Option<Vec<Line>>`
+/// into this crate's `Result<Vec<String>, Fallback>` — shared by mermaid
+/// (`render`) and every other diagram language `dg` knows
+/// (`render_other_language`).
+fn render_via_dg(language: ::dg::Language, src: &str, width: u16) -> Result<Vec<String>, Fallback> {
+    let kind = ::dg::diagram::kind_of(language, src).unwrap_or("flowchart").to_string();
+    // Plain text only: color is applied later by code.rs, as with the other engines.
+    let options = ::dg::RenderOptions { width: usize::from(width), diagram_caption: false, ..::dg::RenderOptions::default() };
+    match ::dg::render_diagram(src, Some(language), &options) {
+        Some(lines) => Ok(lines.iter().map(|line| line.text().to_string()).collect()),
+        // dg gives up only when nothing fits the width (it already retried LR/TB and folding).
+        None => Err(Fallback::Overflow { kind }),
+    }
+}
 
 impl GraphEngine for DgEngine {
     fn name(&self) -> &'static str {
@@ -40,14 +64,23 @@ impl GraphEngine for DgEngine {
     }
 
     fn render(&self, src: &str, _diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback> {
-        let kind = ::dg::diagram::kind_of(::dg::Language::Mermaid, src).unwrap_or("flowchart").to_string();
-        // Plain text only: color is applied later by code.rs, as with the other engines.
-        let options = ::dg::RenderOptions { width: usize::from(width), diagram_caption: false, ..::dg::RenderOptions::default() };
-        match ::dg::render_diagram(src, Some(::dg::Language::Mermaid), &options) {
-            Some(lines) => Ok(lines.iter().map(|line| line.text().to_string()).collect()),
-            // dg gives up only when nothing fits the width (it already retried LR/TB and folding).
-            None => Err(Fallback::Overflow { kind }),
+        render_via_dg(::dg::Language::Mermaid, src, width)
+    }
+
+    fn render_other_language(&self, lang: &str, src: &str, width: u16) -> Option<Result<Vec<String>, Fallback>> {
+        // `dg`'s own fence-language mapping decides eligibility, not a
+        // hand-copied list here -- mirrors how `classify` defers to
+        // `dg::diagram::kind_of` for mermaid's own diagram-kind detection.
+        let language = ::dg::diagram::language_of_fence(lang)?;
+        if language == ::dg::Language::Mermaid {
+            // The `"mermaid"`/`"mmd"` fence tags are already handled by
+            // `code.rs`'s dedicated mermaid path (`render_mermaid`), which
+            // also covers `sniff_kind`'s own vocabulary for `builtin`/
+            // `mdview` -- this hook only needs to add languages this crate
+            // has no IR of its own for at all.
+            return None;
         }
+        Some(render_via_dg(language, src, width))
     }
 }
 
@@ -64,5 +97,31 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("▶") || joined.contains("▼"), "{joined}");
         assert!(!joined.contains("◈"), "caption must not leak into engine output: {joined}");
+    }
+
+    #[test]
+    fn render_other_language_renders_plantuml_sequence() {
+        let src = "@startuml\nAlice -> Bob: hi\n@enduml\n";
+        let lines = DgEngine
+            .render_other_language("plantuml", src, 80)
+            .expect("dg must recognize a plantuml fence")
+            .expect("plantuml sequence should fit at width 80");
+        let joined = lines.join("\n");
+        assert!(joined.contains("Alice") && joined.contains("Bob"), "{joined}");
+    }
+
+    #[test]
+    fn render_other_language_recognizes_puml_and_uml_aliases_too() {
+        let src = "@startuml\nAlice -> Bob: hi\n@enduml\n";
+        assert!(DgEngine.render_other_language("puml", src, 80).is_some());
+        assert!(DgEngine.render_other_language("uml", src, 80).is_some());
+    }
+
+    #[test]
+    fn render_other_language_declines_mermaid_and_unknown_languages() {
+        // "mermaid" is code.rs's own dedicated path; render_other_language
+        // must not double-handle it.
+        assert!(DgEngine.render_other_language("mermaid", "graph LR\n  A --> B", 80).is_none());
+        assert!(DgEngine.render_other_language("rust", "fn main() {}", 80).is_none());
     }
 }

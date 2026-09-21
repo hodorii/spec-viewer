@@ -100,7 +100,8 @@ columns 3
 - **Selection copy via OSC 52**: 클립보드 크레이트 대신 터미널 OSC 52 시퀀스로 복사, base64 인코더도 자체 구현(`Clipboard` 트레이트 뒤에 두어 테스트는 `TestSink`로 대체). 지원 안 하는 터미널은 조용히 무시.
 - **Theme table — 의도된 SSoT이지만 UI까지 관통하지 않음**: `markdown::Theme`(heading[6]/heading_rule[6]/emphasis/strong/strikethrough/code/quote/quote_bar/list_marker/task_done/task_todo/rule/table_header/table_border/text/link, 16필드)은 `markdown` 모듈 내부(`block.rs`/`inline.rs`)에서만 참조되며, 구조에 영향을 주는 건 사실상 `heading_rule` 문자뿐이다(`render`는 `Theme::default()`로 `render_with`를 얇게 감싼 래퍼). `ui::doc_panel`은 `Theme`를 import조차 하지 않고 같은 색 배정을 자기 `span_style`/`line_style`/`heading_style` 함수로 독립적으로 재구현한다. `task_done`/`task_todo` 필드는 정의만 있고 어디서도 읽히지 않는 죽은 코드(체크박스는 `SpanStyle::Plain`으로 삽입됨). 즉 "테마 하나로 렌더러·패널 전체 스타일을 통제"라는 원래 설계 의도는 아직 실현되지 않았다.
 - **Table, GitHub style**: 열 폭은 내용 폭(합계가 페인 폭을 넘을 때만 넓은 열부터 축소, 최후엔 비례 축소 + 셀 줄바꿈). 격자 `┌─┬─┐│├─┼─┤…└─┴─┘`에 헤더 뒤뿐 아니라 모든 본문 행 사이에도 구분선, 헤더 굵게. 페인 폭 채움은 하지 않는다.
-- **Pluggable GraphEngine**: `trait GraphEngine: Send + Sync { fn name(&self) -> &'static str; fn supports(&self, kind: &str) -> bool; fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>; }` — 별도 `dir` 인자는 없고 필요하면 `Diagram::Graph{dir,..}`에서 각 엔진이 스스로 꺼낸다. 레지스트리는 프로세스 전역 `OnceLock<RwLock<EngineState>>`(`register`/`select`/`current`/`engines`), `builtin`+`mdview`가 항상 등록되고 `engine-dg` 피처일 때만 `dg`가 추가된다(현재 최대 3개, `graphs-tui`는 레지스트리 어디에도 없다). 세 엔진의 `supports()` 커버리지가 서로 다르다: `builtin`/`mdview`는 flowchart·er·class·state·**generic**(sequence 미지원), `dg`는 flowchart·er·class·state·**sequence**(generic 미지원). 그래프형은 선택된 엔진이 `supports(kind)`가 거짓이면 `builtin`으로 자동 폴백. sequence는 선택된 엔진이 `supports("sequence")`할 때만(현재 `dg`) 먼저 시도하고, 실패·미지원 시 `seq::layout`(전용 압축 렌더러)로 폴백. 기본 엔진은 `engine-dg` 피처가 켜지면 `dg`, 아니면 `mdview`. `dg`는 파싱 결과가 아닌 mermaid 펜스 원문을 그대로 받는다.
+- **Pluggable GraphEngine**: `trait GraphEngine: Send + Sync { fn name(&self) -> &'static str; fn supports(&self, kind: &str) -> bool; fn classify(&self, src: &str) -> Option<&'static str> { None }; fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>; }` — 별도 `dir` 인자는 없고 필요하면 `Diagram::Graph{dir,..}`에서 각 엔진이 스스로 꺼낸다. 레지스트리는 프로세스 전역 `OnceLock<RwLock<EngineState>>`(`register`/`select`/`current`/`engines`), `builtin`+`mdview`가 항상 등록되고 `engine-dg` 피처일 때만 `dg`가 추가된다(현재 최대 3개, `graphs-tui`는 레지스트리 어디에도 없다). 그래프형은 선택된 엔진이 `supports(kind)`가 거짓이면 `builtin`으로 자동 폴백. sequence는 선택된 엔진이 `supports("sequence")`할 때만(현재 `dg`) 먼저 시도하고, 실패·미지원 시 `seq::layout`(전용 압축 렌더러)로 폴백. 기본 엔진은 `engine-dg` 피처가 켜지면 `dg`, 아니면 `mdview`. `dg`는 파싱 결과가 아닌 mermaid 펜스 원문을 그대로 받는다.
+- **엔진이 자기 지원 범위를 스스로 결정한다**: `kind`는 `selected.classify(src)`(기본 `None` = spec-viewer의 `sniff_kind`에 위임)로 정해진다. `builtin`/`mdview`는 이 기본값을 그대로 쓰므로 `supports()`가 flowchart·er·class·state·**generic**(sequence 미지원)인 게 곧 정직한 실제 범위다. `DgEngine`만 `classify`를 `dg::diagram::kind_of`로 오버라이드하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 실제로 인식하는 11종(flowchart·sequence·state·er·class·gitgraph·block·pie·xychart·quadrant·gantt) 전부가 spec-viewer의 손으로 유지되는 화이트리스트 없이 그대로 지원 범위가 된다. 자세한 개선 배경·전후 비교는 "markdown::mermaid::engine — GraphEngine" 절.
 - **Adopt mdview graph engine**: `engine/mdview.rs`는 mdview `render/mermaid/graph.rs`(MIT) 포팅 — subgraph를 클러스터로 묶은 랭킹(`longest_path`), 4패스 barycenter 순서 정렬 + 그룹 응집, 긴 간선의 더미 노드 분할, 랭크 경계마다 구간 스케줄링으로 배정한 밴드 배선(순방향은 세로-가로-세로, 피드백 간선은 몸통 오른쪽 전용 거터로 우회), 자기 루프는 `↺` 글리프+라벨을 노드 옆에 직접 텍스트로. `Dir`는 완전히 무시하고 **항상 TB**로 그린다(`graph LR` 선언도 무시) — 과거 LR 전치 지원을 추가했다가 코너 글리프 겹침·`┼` 크로싱 문제로 제거했고, 이 사실은 이 파일 "Boundary Map" 골든 테스트가 계속 diff 0으로 검증한다. 오버플로 사다리(라벨 축약 → Class/Entity 본문 접기 → `n.header`가 있는 다이어그램에 한해 층 내 행 래핑 → 소스 폴백)는 **이 엔진에만** 구현돼 있다. 캔버스는 `canvas.rs`(방향 비트마스크 박스드로잉 병합, mdview 포팅, `builtin`과 공유)를 사용.
 - **Own mermaid subset (builtin)**: `graph.rs`는 자체 층 배치(간선 relaxation, barycenter 없이 "같은 층은 선언 순")로 LR/TB 양방향을 렌더하며, 오버플로는 라벨 축약(`MIN_BUDGET=3`까지) 한 단계뿐 — mdview의 본문 접기·행 래핑 사다리는 없다. `seq.rs`는 별도의 컴팩트 화살표 리스트 sequence 렌더러(참여자 균등폭 열, self-message 3행 루프, 라벨 축약 후 오버플로). 둘 다 교차 최소화 없음. `mermaid::parse::seq`는 mermaid의 `note`/`loop`/`alt`/`opt`/`par` 구조 키워드를 전혀 인식하지 않는다 — 그런 줄은 participant도 message도 아니므로 조용히 드롭된다.
 - **Watch startup latency (`NoCache`)**: `watch::start`는 `notify_debouncer_full::new_debouncer_opt` + `NoCache::new()`를 명시적으로 쓴다 — 기본 `RecommendedCache`가 등록 시점에 루트 아래를 동기적으로 walk+stat 해서 rename-id 캐시를 시딩하는데, 이 크레이트의 `FsEvent`는 애초에 rename을 delete/create와 구분해 주지 않으므로 그 캐시는 순수 오버헤드였다. 대형 디렉터리에서 `start()`가 첫 프레임을 블로킹하던 회귀를 캐시 없음으로 해결(전용 성능 회귀 테스트로 감시).
@@ -346,7 +347,7 @@ gantt
     font-fallback-fix :milestone, id10, after id9, 0m
 ```
 
-**gitGraph — 같은 커밋 이력을 계보로**(`git log --oneline --all --decorate`, 짧은 해시 + 실제 태그 4개, 단일 브랜치라 `branch`/`merge` 없이 `main` 한 줄): 향후 spec-viewer의 `sniff_kind`/`DgEngine::supports`가 고쳐져 `gitGraph`가 `generic`이 아니라 dg로 실제로 라우팅되는지 **회귀 검증용으로 쓸 목적**으로 실제 프로젝트 데이터를 그대로 담아 둔다. 지금은(수정 전) spec-viewer 파이프라인에서 `commit id: "..."` 줄이 전부 첫 토큰 `commit`으로 시작해 `generic::ensure_box`의 id 중복 제거에 걸리므로, 10개 커밋 중 맨 처음 한 줄만 상자로 남고 나머지 9개·태그 4개는 전부 사라진다(직접 렌더해 확인함):
+**gitGraph — 같은 커밋 이력을 계보로**(`git log --oneline --all --decorate`, 짧은 해시 + 실제 태그 4개, 단일 브랜치라 `branch`/`merge` 없이 `main` 한 줄). 이 fence는 원래 `sniff_kind`/`DgEngine::supports`의 화이트리스트 게이트를 회귀 검증할 목적으로(개선 전엔 첫 커밋 하나만 살아남는 걸 직접 확인해 실어 뒀었다) 실제 프로젝트 데이터를 그대로 담은 것인데, 바로 위 "엔진이 자기 지원 범위를 스스로 결정한다" 개선이 그 검증 대상 자체를 고쳐 버렸다 — 그래서 이제는 **개선이 실제로 작동함을 보여주는 산 증거**로 기능이 바뀌었다:
 ```mermaid
 gitGraph
    commit id: "3697851" tag: "init"
@@ -360,11 +361,11 @@ gitGraph
    commit id: "cdf1fdb" tag: "v0.2.1"
    commit id: "0564b3c" tag: "v0.2.2"
 ```
-`dg::render_diagram`을 spec-viewer의 게이트 없이 이 소스로 직접 호출해 실측한 결과(**폭에 민감** — 짧은 해시 10개도 폭 100에서는 dg가 `None`을 돌려준다, 즉 라우팅이 고쳐진 뒤에도 이 문서를 폭 100으로 볼 땐 `Fallback::Overflow: gitGraph`로 소스 폴백이 나오는 게 정상이다; 폭 150 이상에서만 한 줄로 다 들어간다):
+`render_mermaid(위 소스, width)`를 spec-viewer의 실제 기본 엔진(`dg`)으로 다시 실측: `DgEngine::classify`가 `dg::diagram::kind_of`로 `"gitgraph"`를 반환하고 `supports("gitgraph")`(`!= "generic"`)가 참이라 이제 dg의 진짜 렌더러까지 도달한다. **다만 폭에는 여전히 민감하다** — 짧은 해시 10개짜리 이 소스도 폭 100에서는 `Err(Fallback::Overflow{kind:"gitgraph"})`로 소스 폴백이 나온다(라우팅이 고쳐졌다고 dg 내부의 폭 맞추기까지 면제되는 건 아니라는 뜻, 이 문서 자체를 폭 100 근방으로 볼 때 정상 동작), 폭 150 이상에서만 한 줄로 다 들어간다:
 ```text
 main  ●3697851───●4ae9936───●86900ce───●df77b3d───●a0afce4───●8e4e382───●c1bb9f9───●b6421fd───●cdf1fdb───●0564b3c
 ```
-(dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 실제 dg 출력에는 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. 그러니 이 fence로 향후 라우팅 수정을 검증할 때는 "태그가 안 보이는 것"을 회귀로 오인하지 않아야 한다.)
+(dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 실제 dg 출력에는 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. "태그가 안 보이는 것"은 회귀가 아니다.)
 
 PlantUML(스펙 외 — spec-viewer가 인식하는 다이어그램이 아니다): `markdown::code::push_code_block`은 언어가 정확히 `"mermaid"`일 때만 `render_mermaid`로 위임한다. 그 외 언어는 syntect 일반 하이라이팅 경로로 가는데, 기본 번들(`SyntaxSet::load_defaults_newlines`)엔 PlantUML 문법이 없어 `find_syntax_by_extension("plantuml")`이 `None`을 반환하고 `find_syntax_plain_text()`로 강등된다 — 즉 아래 펜스는 다이어그램으로 그려지지 않고 무강조 텍스트 코드블록으로 그대로 표시된다(`engine_compare.rs`의 펜스 추출도 `mermaid` 언어 태그만 보므로 이 펜스는 애초에 그 테스트 대상이 아니다):
 ```plantuml
@@ -375,11 +376,14 @@ Bob --> Alice: 토큰 발급
 ```
 
 ### markdown::mermaid::engine — GraphEngine
-Key Decisions의 "Pluggable GraphEngine"/"Adopt mdview graph engine"/"Own mermaid subset" 참고. 등록·선택은 `engine::{register, select, current, engines}`(`OnceLock<RwLock<EngineState>>`).
+Key Decisions의 "Pluggable GraphEngine"/"Adopt mdview graph engine"/"Own mermaid subset"/"엔진이 자기 지원 범위를 스스로 결정" 참고. 등록·선택은 `engine::{register, select, current, engines}`(`OnceLock<RwLock<EngineState>>`).
 ```rust
 pub trait GraphEngine: Send + Sync {
     fn name(&self) -> &'static str;
     fn supports(&self, kind: &str) -> bool;
+    /// 이 엔진 자신의 kind 판정. 기본값 `None` = "spec-viewer의 sniff_kind를
+    /// 그대로 쓴다"(builtin/mdview). 독립 파서를 가진 엔진(dg)만 오버라이드.
+    fn classify(&self, _src: &str) -> Option<&'static str> { None }
     fn render(&self, src: &str, diagram: &Diagram, width: u16) -> Result<Vec<String>, Fallback>;
 }
 pub fn engines() -> &'static [&'static dyn GraphEngine];
@@ -387,20 +391,20 @@ pub fn register(engine: &'static dyn GraphEngine) -> Result<(), String>;
 pub fn select(name: &str) -> Result<(), String>;
 pub fn current() -> &'static dyn GraphEngine;
 ```
-- `BuiltinEngine`("builtin"): `graph::layout(diagram, width, sniff_kind(src))`의 얇은 래퍼.
-- `MdviewEngine`("mdview"): `engine/mdview.rs` — 클러스터 랭킹 → barycenter 순서 → 더미노드 좌표 배치 → 밴드 배선/피드백 거터 → `Canvas` 합성. TB 고정.
-- `DgEngine`("dg", `engine-dg` 피처): `dg::render_diagram(src, Some(Language::Mermaid), &RenderOptions{width, diagram_caption:false, ..})`에 원문을 그대로 전달, `None`이면 `Fallback::Overflow`(kind는 `dg::diagram::kind_of`로 판정).
+- `BuiltinEngine`("builtin"): `graph::layout(diagram, width, sniff_kind(src))`의 얇은 래퍼. `classify`는 오버라이드하지 않음 — spec-viewer 자신의 `Diagram` IR만 렌더하므로 `sniff_kind`의 5갈래(flowchart/er/class/state/generic)가 곧 이 엔진의 진짜 지원 범위다.
+- `MdviewEngine`("mdview"): `engine/mdview.rs` — 클러스터 랭킹 → barycenter 순서 → 더미노드 좌표 배치 → 밴드 배선/피드백 거터 → `Canvas` 합성. TB 고정. `classify`도 builtin과 마찬가지로 기본값(오버라이드 없음).
+- `DgEngine`("dg", `engine-dg` 피처): `dg::render_diagram(src, Some(Language::Mermaid), &RenderOptions{width, diagram_caption:false, ..})`에 원문을 그대로 전달, `None`이면 `Fallback::Overflow`(kind는 `dg::diagram::kind_of`로 판정). **`classify(src)`를 `dg::diagram::kind_of(Language::Mermaid, src)`로 오버라이드**하고 `supports(kind)`는 `kind != "generic"`만 본다 — dg 자신의 파서가 인식한 kind는 spec-viewer의 `sniff_kind`가 절대 만들어내지 않는 문자열("gitgraph"/"block"/"pie"/"xychart"/"quadrant"/"gantt" 등)이므로 이 한 줄이면 "dg가 방금 인식했다"와 "supports"가 정확히 동치가 된다.
 
-**dg가 실제로 지원하는 다이어그램 중 spec-viewer 파이프라인에는 닿지 않는 것들** — `../dg`(`~/tools/dg`, README 기준)는 자체 파서로 mermaid `flowchart`/`graph`·`sequenceDiagram`·`classDiagram`·`erDiagram`·`stateDiagram(-v2)`·`block-beta`·`gitGraph`·`pie`·`xychart-beta`/`xychart`·`quadrantChart`·`gantt` 11종과, PlantUML 시퀀스·클래스·ER·간트(`@startgantt`)·컴포넌트/배치/유스케이스까지 전부 실제 도표(막대·사분면·좌표축 등)로 그려낸다. 그런데 `DgEngine::supports`는 `flowchart|er|class|state|sequence` 5종만 선언하고, 애초에 `render_mermaid`(mermaid/mod.rs)가 넘기는 `kind` 자체가 dg가 아니라 spec-viewer 자신의 `parse::parse`/`sniff_kind`(그래프형 4종 접두어 외엔 전부 `"generic"`)로 먼저 정해진다 — 그 결과 `block-beta`/`gitGraph`/`pie`/`xychart-beta`/`quadrantChart`/`gantt`는 `--diagram-engine dg`를 선택해도 `selected.supports("generic") == false`에 막혀 **dg의 진짜 렌더러에 한 번도 도달하지 못하고** 매번 `BuiltinEngine`의 조잡한 줄 단위 상자화로 대체된다. PlantUML은 한 층 더 앞에서 막힌다 — `code.rs::push_code_block`이 펜스 언어가 정확히 `"mermaid"`일 때만 다이어그램 경로로 보내므로, dg가 `Language::PlantUml`을 직접 지원해도 어떤 엔진을 고르든 그 펜스는 애초에 `render_mermaid` 근처에도 못 간다.
+**엔진이 자기 지원 범위를 스스로 결정한다 (2026-09-22 개선)** — 이전엔 `render_mermaid`가 spec-viewer 자신의 `sniff_kind`(그래프형 4종 접두어 외엔 전부 `"generic"`)로 먼저 kind를 정하고, 그 kind로 `selected.supports(kind)`를 물었다. `../dg`(`~/tools/dg`, README 기준)는 자체 파서로 mermaid 11종(flowchart/sequence/state/er/class/gitGraph/block-beta/pie/xychart-beta/quadrantChart/gantt)을 전부 실제 도표로 그리는데, `DgEngine::supports`가 `flowchart|er|class|state|sequence` 5종짜리 하드코딩 화이트리스트였던 탓에 나머지 6종은 `sniff_kind`가 붙인 `"generic"` 딱지에 막혀 `--diagram-engine dg`를 선택해도 dg의 진짜 렌더러에 한 번도 도달하지 못하고 매번 `BuiltinEngine`의 조잡한 줄 단위 상자화로 대체되고 있었다. 고친 뒤에는 `render_mermaid`가 kind를 정할 때 **선택된 엔진 자신에게 먼저 물어본다**(`selected.classify(code)`, 기본은 spec-viewer의 `sniff_kind`로 위임) — `dg`가 선택돼 있으면 `dg::diagram::kind_of`가 반환하는 kind를 그대로 쓰므로, 이제 dg가 인식하는 6종 모두 `--diagram-engine dg`(기본값)에서 실제로 dg의 렌더러까지 도달한다. PlantUML은 여전히 한 층 더 앞에서 막힌다 — `code.rs::push_code_block`이 펜스 언어가 정확히 `"mermaid"`일 때만 다이어그램 경로로 보내므로, dg가 `Language::PlantUml`을 직접 지원해도 그 펜스는 애초에 `render_mermaid` 근처에도 못 간다(이건 이번 개선 범위 밖).
 
-직접 검증(spec-viewer의 실제 파이프라인 대 `dg::render_diagram`을 그 게이트 없이 바로 호출한 결과, 둘 다 폭 70):
+**개선 전후 비교** (같은 소스, 기본 엔진 `dg`, 폭 70 — spec-viewer 자신의 `render_mermaid`를 그대로 호출한 결과이지 `dg::render_diagram`을 게이트 없이 따로 부른 게 아니다):
 ```mermaid
 pie title 문서 상태
   "Approved" : 40
   "Missing" : 20
 ```
-- spec-viewer 파이프라인(`--diagram-engine dg` 선택 상태에서도): `sniff_kind`가 `"generic"`으로 판정 → `DgEngine::supports("generic")==false` → `BuiltinEngine`이 `"Approved"`/`"Missing"`을 각각 독립된 상자로(호 안 원문이 그대로 상자 본문에 남음) 나란히 그린다.
-- `dg::render_diagram`을 게이트 없이 직접 호출하면:
+- 개선 전: `sniff_kind`가 `"generic"` → `DgEngine::supports("generic")==false`(구 화이트리스트) → `BuiltinEngine`이 `"Approved"`/`"Missing"`을 각각 독립 상자로.
+- 개선 후(현재 동작): `DgEngine::classify`가 `dg::diagram::kind_of`로 `"pie"`를 반환 → `supports("pie")==true`(`!= "generic"`) → `render_mermaid(위 소스, 70)`이 그대로:
 ```text
 문서 상태
 Approved ██████████████████████████████                66.7%
@@ -414,8 +418,8 @@ xychart-beta
     y-axis "ms" 0 --> 50
     bar [12, 18, 25]
 ```
-- spec-viewer 파이프라인: 마찬가지로 `"generic"`으로 막혀 `title`/`x-axis`/`y-axis`/`bar` 네 줄이 각각 상자 하나씩으로.
-- `dg::render_diagram` 직접 호출:
+- 개선 전: `"generic"`으로 막혀 `title`/`x-axis`/`y-axis`/`bar` 네 줄이 각각 상자 하나씩으로.
+- 개선 후: `classify`가 `"xychart"`를 반환해 dg의 실제 좌표축 막대그래프로 그려진다:
 ```text
                               렌더 성능
 ↑ ms
@@ -426,7 +430,6 @@ xychart-beta
    └──────────┴─────────────────────┴─────────────────────┴───────
              40                    80                    120
 ```
-(전체 축·눈금 포함 원본은 위 소스를 `dg -d -l mermaid`로 직접 렌더하면 재현된다.)
 
 ```mermaid
 quadrantChart
@@ -441,10 +444,10 @@ quadrantChart
     mdview: [0.5, 0.6]
     dg: [0.6, 0.9]
 ```
-- spec-viewer 파이프라인: 10줄이 각각 독립 상자로 흩어짐(사분면·점 배치 정보는 전혀 반영되지 않음).
-- `dg::render_diagram` 직접 호출은 실제로 `builtin`/`mdview`/`dg` 세 점을 사분면 좌표에 정확히 찍는다(`● dg`가 "이상적" 사분면, `● builtin`이 "빠르지만 단순" 사분면 등) — 이 저장소가 위에서 줄곧 이야기해 온 3-엔진 비교(`Own mermaid subset`/`Adopt mdview graph engine`/`Pluggable GraphEngine` 참고)를 dg 자신의 quadrantChart로 그린 것이기도 하다.
+- 개선 전: 10줄이 각각 독립 상자로 흩어짐(사분면·점 배치 정보는 전혀 반영되지 않음).
+- 개선 후: `classify`가 `"quadrant"`를 반환해 `builtin`/`mdview`/`dg` 세 점이 실제 사분면 좌표에 찍힌다(`● dg`가 "이상적" 사분면, `● builtin`이 "빠르지만 단순" 사분면 등) — 이 저장소가 위에서 줄곧 이야기해 온 3-엔진 비교(`Own mermaid subset`/`Adopt mdview graph engine`/`Pluggable GraphEngine` 참고)를 dg 자신의 quadrantChart로 그린 것이기도 하다.
 
-(`gitGraph`도 dg가 지원하는 12번째 mermaid 종류지만, 이 문서에는 실제 git 이력을 gantt 하나로만 담기로 했으므로 별도 예시는 싣지 않는다 — 위 "generic 폴백" gantt 항목 참고.)
+`gitGraph`(dg의 12번째 mermaid 종류)도 같은 원리로 이제 실제 계보로 그려지지만, **폭에는 여전히 민감하다** — 자세한 실측(폭 100에서 `Fallback::Overflow`, 폭 150 이상에서 성공)은 아래 "다이어그램 유형 커버리지 샘플"의 gitGraph 항목 참고. 이 개선을 뒷받침하는 회귀 테스트는 `mermaid/mod.rs`의 `generic_bucket_kind_reaches_dg_when_dg_recognizes_it`(pie가 실제로 dg까지 도달하는지)와 `unclassifiable_source_still_falls_back_to_builtin`(dg도 sniff_kind도 못 알아보는 소스는 여전히 안전하게 builtin으로 떨어지는지) 두 개.
 
 ### watch — FsWatcher
 - Intent: 루트 아래 파일시스템 변경을 디바운스된 절대경로 집합(`FsEvent`)으로 전달.

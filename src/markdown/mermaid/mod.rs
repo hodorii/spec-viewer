@@ -25,12 +25,17 @@ fn sniff_kind(code: &str) -> &'static str {
 
 pub fn render_mermaid(code: &str, width: u16) -> Result<Vec<String>, Fallback> {
     let diagram = parse::parse(code)?;
+    let selected = engine::current();
     match diagram {
         Diagram::Graph { .. } => {
             // Fallback rule (design.md "Pluggable GraphEngine"): unsupported
-            // kinds render via the builtin engine.
-            let kind = sniff_kind(code);
-            let selected = engine::current();
+            // kinds render via the builtin engine. `kind` is the *selected
+            // engine's own* classification when it has an independent
+            // parser to offer one (e.g. `dg`'s eleven mermaid kinds); only
+            // when it declines to classify (`None`, the default for
+            // `builtin`/`mdview`) do we fall back to this crate's own
+            // narrower `sniff_kind`.
+            let kind = selected.classify(code).unwrap_or_else(|| sniff_kind(code));
             let renderer = if selected.supports(kind) {
                 selected
             } else {
@@ -43,8 +48,8 @@ pub fn render_mermaid(code: &str, width: u16) -> Result<Vec<String>, Fallback> {
             // box+lifeline renderer) is tried first; if it errors (e.g. the
             // diagram overflows `width`) or isn't selected/compiled in, we
             // fall back to the dedicated compact `seq::layout` arrow list.
-            let selected = engine::current();
-            if selected.supports("sequence") {
+            let kind = selected.classify(code).unwrap_or("sequence");
+            if selected.supports(kind) {
                 if let Ok(lines) = selected.render(code, &diagram, width) {
                     return Ok(lines);
                 }
@@ -57,6 +62,8 @@ pub fn render_mermaid(code: &str, width: u16) -> Result<Vec<String>, Fallback> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "engine-dg")]
+    use engine::GraphEngine;
 
     const SEQUENCE_SRC: &str =
         "sequenceDiagram\n    participant A\n    participant B\n    A->>B: hello\n    B-->>A: hi";
@@ -93,5 +100,41 @@ mod tests {
         assert!(!text.contains('┌'), "must not use dg's box rendering at this width:\n{text}");
         assert!(text.contains('►'), "expected seq::layout's compact arrow rendering:\n{text}");
         engine::select("dg").expect("dg engine stays selectable");
+    }
+
+    /// `dg` owns its own supported range (`GraphEngine::classify`): a kind
+    /// this crate's own `sniff_kind` cannot tell apart from prose (bucketed
+    /// as `"generic"`) must still reach `dg`'s real renderer when `dg` is
+    /// selected and `dg::diagram::kind_of` recognizes it -- instead of
+    /// always landing in `BuiltinEngine`'s crude per-line boxing the way it
+    /// did before `classify` existed.
+    #[cfg(feature = "engine-dg")]
+    #[test]
+    fn generic_bucket_kind_reaches_dg_when_dg_recognizes_it() {
+        engine::select("dg").expect("dg engine is registered with the engine-dg feature");
+        let pie = "pie title status\n  \"Approved\" : 40\n  \"Missing\" : 20\n";
+        assert_eq!(sniff_kind(pie), "generic", "precondition: this crate's own sniff_kind can't tell pie apart");
+        let lines = render_mermaid(pie, 60).expect("dg renders pie natively");
+        let text = lines.join("\n");
+        assert!(text.contains('█'), "expected dg's real pie bar chart, got builtin's boxed fallback:\n{text}");
+        engine::select("builtin").expect("builtin stays selectable");
+    }
+
+    /// A source neither `dg` nor this crate's own `sniff_kind` can classify
+    /// at all must still fall back to `BuiltinEngine` (never propagate as an
+    /// error, and never be handed to `dg` on the strength of a `"generic"`
+    /// label it did not itself assign).
+    #[cfg(feature = "engine-dg")]
+    #[test]
+    fn unclassifiable_source_still_falls_back_to_builtin() {
+        engine::select("dg").expect("dg engine is registered with the engine-dg feature");
+        let prose = "not a diagram at all\njust some lines\nof plain text\n";
+        assert!(
+            crate::markdown::mermaid::engine::dg_engine::DgEngine.classify(prose).is_none(),
+            "precondition: dg must not recognize plain prose either"
+        );
+        let lines = render_mermaid(prose, 60).expect("builtin fallback must still succeed");
+        assert!(!lines.is_empty());
+        engine::select("builtin").expect("builtin stays selectable");
     }
 }

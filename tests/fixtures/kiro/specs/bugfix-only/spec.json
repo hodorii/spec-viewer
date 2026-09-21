@@ -1,0 +1,9 @@
+{
+  "feature_name": "bugfix-only",
+  "phase": "implementation",
+  "approvals": {
+    "bugfix": { "generated": true, "approved": true },
+    "design": { "generated": true, "approved": false },
+    "tasks": { "generated": false, "approved": false }
+  }
+}

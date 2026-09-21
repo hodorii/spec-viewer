@@ -1,0 +1,39 @@
+[package]
+name = "spec-viewer"
+version = "0.1.0"
+edition = "2021"
+default-run = "m"
+
+[lib]
+name = "spec_viewer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "m"
+path = "src/main.rs"
+
+[features]
+default = ["engine-dg"]
+engine-graphs-tui = ["dep:graphs-tui"]
+# MIT — github.com/hodorii/dg 의 다이어그램 렌더러를 GraphEngine 으로 끼운다.
+engine-dg = ["dep:dg"]
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+tui-tree-widget = "0.24"
+pulldown-cmark = "0.13"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+notify = "8.2"
+notify-debouncer-full = "0.6"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+ignore = "0.4"
+# AGPL-3.0-or-later — only compiled when `engine-graphs-tui` is enabled
+# (see THIRD_PARTY.md); not part of the default build.
+graphs-tui = { version = "0.4", optional = true }
+dg = { git = "https://github.com/hodorii/dg.git", branch = "master", default-features = false, optional = true }

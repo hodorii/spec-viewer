@@ -259,10 +259,16 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             if quit {
                 break;
             }
-        } else {
+        } else if state.auto_scroll.is_some() {
             // Poll timed out with no input at all -- deliver a Tick so
             // time-driven behavior (task 12.5's drag auto-scroll) can
-            // progress even without a fresh key/mouse event.
+            // progress even without a fresh key/mouse event. `Action::Tick`
+            // (see `update`) is a no-op unless `auto_scroll` is armed, so
+            // skip both the update *and* the draw otherwise -- redrawing on
+            // a bare poll-timeout with nothing to show for it just makes
+            // the terminal repaint on a ~100ms heartbeat forever while
+            // idle, for no reason (unlike e.g. mdview's pager loop, which
+            // only ever draws in response to a real event).
             if step(terminal, state, spec_viewer::app::Action::Tick)?
                 == spec_viewer::app::Control::Quit
             {

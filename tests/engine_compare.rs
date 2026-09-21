@@ -1,8 +1,9 @@
 //! Engine comparison snapshots (requirement 5.22 / design.md "Engine
 //! comparison", task 14.4).
 //!
-//! Extracts every ```mermaid fence from this repository's
-//! `.kiro/specs/<spec>/design.md` files, renders each fence at width 100
+//! Extracts every ```mermaid fence from the sample spec dir(s) under
+//! `tests/fixtures/mermaid-samples/<spec>/design.md` (currently this crate's
+//! own real design doc, copied in), renders each fence at width 100
 //! with every registered engine in turn
 //! (`spec_viewer::markdown::mermaid::engine::engines()` — engines compiled
 //! out by cargo features drop out of the iteration naturally), and writes
@@ -140,9 +141,9 @@ fn snapshot_path(fence: &Fence, engine: &dyn GraphEngine) -> PathBuf {
 #[test]
 fn engine_comparison_snapshots_and_fallback() {
     let specs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(".kiro")
-        .join("specs");
+        .join("tests")
+        .join("fixtures")
+        .join("mermaid-samples");
     assert!(specs_dir.is_dir(), "no specs dir at {}", specs_dir.display());
 
     let fences = extract_mermaid_fences(&specs_dir);

@@ -1400,7 +1400,7 @@ mod tests {
         // 되어 없었음), 이번에 실제로 그 바이너리를 실행해 만들어 둔
         // 스냅샷(tests/fixtures/mdview-tb/boundary-map-w{100,120}.txt)과
         // 비교한다 — 바이너리가 있으면 그 자리에서 다시 만들어 우선 사용한다.
-        let design_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../.kiro/specs/spec-viewer/design.md");
+        let design_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mermaid-samples/spec-viewer/design.md");
         let design_md = std::fs::read_to_string(design_path).expect("this repo's own design.md must exist for this check");
         let mermaid_src = extract_boundary_map_fence(&design_md);
         let diagram = parse::parse(&mermaid_src).expect("Boundary Map source must parse as a flowchart");
@@ -1474,7 +1474,7 @@ mod tests {
         // 재현을 고정한다. '본문 접기'(속성/메서드를 버리고 이름만 남긴
         // 상자로 재시도)와 '층 내 행 래핑'(한 층이 그래도 넘치면 그 층의
         // 노드를 여러 시각적 줄로 나눠 쌓기)을 추가해야 통과한다.
-        let schema_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../.kiro/specs/spec-viewer/gitea-github-schema.md");
+        let schema_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mermaid-samples/spec-viewer/gitea-github-schema.md");
         let schema_md = std::fs::read_to_string(schema_path).expect("this repo's own gitea-github-schema.md fixture must exist");
         let fence_start = schema_md.find("```mermaid\n").expect("fixture must have a mermaid fence") + "```mermaid\n".len();
         let fence_end = schema_md[fence_start..].find("```").expect("mermaid fence must be closed");
@@ -1498,7 +1498,7 @@ mod tests {
         // 통로보다 먼저 그리든 나중에 그리든, 라벨 텍스트 칸은 순수
         // 연결선(┌┐└┘─│├┤┬┴┼) 이 대신 차지해선 안 된다 — 카디널리티
         // 태그·화살촉·박스 테두리 보호(기존 리뷰 수정)는 그대로 유지한다.
-        let schema_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../.kiro/specs/spec-viewer/gitea-github-schema.md");
+        let schema_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mermaid-samples/spec-viewer/gitea-github-schema.md");
         let schema_md = std::fs::read_to_string(schema_path).expect("this repo's own gitea-github-schema.md fixture must exist");
         let fence_start = schema_md.find("```mermaid\n").expect("fixture must have a mermaid fence") + "```mermaid\n".len();
         let fence_end = schema_md[fence_start..].find("```").expect("mermaid fence must be closed");

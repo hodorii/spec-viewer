@@ -1,0 +1,396 @@
+# Implementation Plan — spec-viewer
+
+## 정의
+spec-viewer 구현자를 위해 design.md 모듈 경계를 따라 관찰 가능한 DONE 상태 단위로 분해한 구현 계획이다.
+
+- [x] 1. 기반: 크레이트 스캐폴딩과 테스트 픽스처
+- [x] 1.1 독립 크레이트 생성과 의존성 고정
+  - DONE: `cargo build` 성공, `m --help` 옵션 출력, design.md Allowed Dependencies 의 크레이트·버전 고정(syntect 는 순수 Rust 백엔드만), `cargo tree`에 C 빌드 의존성 없음.
+  - _Requirements: 1.2, 8.2_
+- [x] 1.2 테스트 픽스처 `.kiro` 트리
+  - DONE: 픽스처 디렉터리가 두 `spec.json` 스키마, 문서 누락 스펙, 깨진 JSON 스펙, 승인 항목 없는 스펙, 추가 `.md` 가 있는 스펙, `bugfix.md` 기반 스펙, `## 정의` 없는 스펙, 비UTF-8 바이트 문서, 체크박스 없는 tasks.md, steering 파일 3개(`inclusion` always/manual/부재)를 각각 별도 스펙/파일로 담고 있다.
+  - _Requirements: 2.3, 2.8, 3.3, 3.4, 3.5, 3.7, 4.3, 8.4_
+
+- [x] 2. 마크다운 렌더러 (순수 코어)
+- [x] 2.1 (P) 폭 인식 래핑 기반 및 블록 디스패처
+  - DONE: 폭 40에서 한글/영문 혼합 및 3단 중첩 리스트가 폭을 넘지 않고 들여쓰기가 유지된 채 렌더되는 테스트 통과.
+  - _Requirements: 5.1, 5.2, 5.9_
+  - _Boundary: Renderer/wrap+block_
+- [x] 2.2 블록/인라인 요소 및 헤딩 앵커
+  - DONE: 스타일 요소, 앵커 목록, YAML 제거 등이 적용된 렌더 결과가 기대 스냅샷과 일치하는 테스트 통과.
+  - _Requirements: 5.3, 5.5, 5.8, 5.10, 5.11, 5.12_
+  - _Boundary: Renderer/inline+block_
+- [x] 2.3 표 렌더링
+  - DONE: 5열 표가 폭 40/80에서 열 폭 배분 및 셀 내 줄바꿈이 적용되어 폭을 넘지 않는 테스트 통과.
+  - _Requirements: 5.4_
+  - _Boundary: Renderer/table_
+- [x] 2.4 (P) 코드 펜스 (강조/잘림) 및 mermaid 폴백 박스
+  - DONE: Rust 구문 강조, mermaid `Fallback`(노드 0개·폭 초과) 시 소스 박스 + 유형명 라벨, 200자 코드 줄의 `…` 처리가 적용된 렌더 결과 확인.
+  - _Requirements: 5.6, 5.15_
+  - _Depends: 2.1_
+  - _Boundary: Renderer/code_
+- [x] 2.5 (P) mermaid 서브셋 파서
+  - DONE: flowchart/graph TB·LR(노드·라벨·간선·간선 라벨·subgraph), erDiagram(엔티티 속성·카디널리티), classDiagram(구획·관계 종류), stateDiagram(`[*]`·전이), sequenceDiagram(참여자·메시지)이 `Diagram`으로 파싱되고, 미지원 유형(gantt 픽스처)은 generic 파서가 행 단위 Class 박스 그래프로, 박스 0개 입력은 `Fallback::Empty`로 반환되는 테스트 통과.
+  - _Requirements: 5.7, 5.14, 5.15, 5.17, 5.18, 5.19_
+  - _Depends: 2.1_
+  - _Boundary: Renderer/mermaid/parse_
+- [x] 2.6 그래프 레이아웃 (flowchart·er·class·state, TB/LR)
+  - DONE: 이 저장소 design.md의 Boundary Map(`graph LR`)이 폭 80/120에서 방향 유지·박스·화살표·라벨로 렌더되고, er(속성 구획·카디널리티 기호)·class(3구획·상속 `─▷`)·state(`[*]` 표식·전이 라벨)·generic(gantt 텍스트 → class 스타일 박스 그래프) 픽스처가 각각 렌더되며, 폭 40에서는 라벨 축약 후에도 초과하여 소스 박스로 대체되는 테스트 통과.
+  - _Requirements: 5.7, 5.16, 5.17, 5.18, 5.19_
+  - _Depends: 2.5_
+  - _Boundary: Renderer/mermaid/graph_
+- [x] 2.7 sequence 레이아웃
+  - DONE: 이 저장소 design.md의 System Flows `sequenceDiagram`이 참여자 열·생명선·메시지 순서·자기 메시지 루프로 렌더되는 테스트 통과.
+  - _Requirements: 5.14_
+  - _Depends: 2.5_
+  - _Boundary: Renderer/mermaid/seq_
+- [x] 2.8 렌더 골든 테스트
+  - DONE: 폭 40/80/120 스냅샷(mermaid 5종 포함) 파일 커밋 및 `cargo test` 비교 통과.
+  - _Requirements: 5.1~5.12, 5.14~5.19_
+  - _Depends: 2.6, 2.7_
+- [x]* 2.9 렌더 성능 회귀 검사 (선택 — 회귀 감시용)
+  - DONE: 500행 문서 렌더가 50ms 미만임을 확인하는 회귀 테스트 통과, 초과 시 실패로 드러남 (design.md Testing Strategy 대응).
+  - _Requirements: 5.1_
+
+- [x] 3. 스펙 모델 (순수 코어)
+- [x] 3.1 (P) `.kiro` 루트 탐지
+  - DONE: 상위 디렉터리 탐색 및 명시 경로 처리가 `None` 또는 `Some(PathBuf)`로 정확히 반환되는 테스트 통과.
+  - _Requirements: 1.1, 1.2, 1.3_
+  - _Boundary: SpecModel/find_root_
+- [x] 3.2 (P) `spec.json` 정규화
+  - DONE: 두 스키마 및 예외 케이스가 `SpecMeta`로 정규화되고 `approvals` 5키(requirements/bugfix/bizProcess/design/tasks)가 `DocKind`에 매핑되며, 파싱 실패 시 오류 메시지가 반환되는 테스트 통과.
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+  - _Boundary: SpecModel/meta_
+- [x] 3.3 (P) tasks.md 진행률 집계
+  - DONE: `[x]`, `[X]`, `[ ]`, `[ ]*` 혼합 표기 및 체크박스 없음 케이스가 정확한 `Progress` 값으로 반환되는 테스트 통과.
+  - _Requirements: 4.1, 4.2, 4.3, 4.4_
+  - _Boundary: SpecModel/progress_
+- [x] 3.4 스펙 트리 모델 조립
+  - DONE: 픽스처 전체를 입력했을 때 표준 문서 순서(requirements|bugfix → biz-process → design → tasks → research), 누락 처리, `## 정의` 추출, steering 그룹과 `inclusion` 값, 진행률이 모두 포함된 `SpecRoot` 모델 생성 테스트 통과.
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.8, 3.7_
+  - _BizProcess: BP-SPEC-VIEW.L4_
+
+- [x] 4. 파일 변경 감시
+- [x] 4.1 (P) FsWatcher 구현
+  - DONE: 파일 수정 후 2초 이내 이벤트 수신 및 감시 실패 시 Manual 모드 반환 테스트 통과.
+  - _Requirements: 7.1, 7.6_
+  - _Boundary: FsWatcher_
+
+- [x] 5. 앱 상태와 리듀서
+- [x] 5.1 로더 및 뷰 상태
+  - DONE: 미생성/삭제/읽기실패/메타실패/스펙 정의 각 변형이 `DocView`로 정확히 매핑되어 패널에 표시되는 테스트 통과.
+  - _Requirements: 2.4, 2.6, 3.6, 3.7, 8.1, 8.3, 8.4_
+  - _Depends: 3.4_
+  - _Boundary: App/loader_
+- [x] 5.2 키맵 및 내비게이션
+  - DONE: 각 키 입력이 기대되는 `AppState` 전이를 일으키고 도움말 목록이 정확히 생성되는 리듀서 테스트 통과.
+  - _Requirements: 1.5, 2.2, 2.6, 2.7, 6.1, 6.2, 6.11_
+  - _Boundary: App/keymap+reducer_
+- [x] 5.3 문서 내 검색
+  - DONE: 대소문자 무시 검색, 순환 이동, 일치 없음 메시지 처리 리듀서 테스트 통과.
+  - _Requirements: 6.5, 6.6, 6.7, 6.8, 6.9_
+  - _Boundary: App/search_
+- [x] 5.4 변경 이벤트 처리
+  - DONE: 파일 변경 이벤트 주입 시 스크롤 위치/배지/선택 상태가 기대대로 유지·갱신되는 리듀서 테스트 통과.
+  - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6_
+  - _Depends: 4.1_
+  - _Boundary: App/reducer_
+- [x] 5.5 리사이즈 위치 복원
+  - DONE: 폭 120 → 60 → 120 변경 후에도 동일한 헤딩 앵커가 상단에 위치하는 리듀서 테스트 통과.
+  - _Requirements: 5.13_
+  - _Depends: 2.2_
+  - _Boundary: App/reducer_
+- [x] 5.6 팝업 상태 전이
+  - DONE: TOC/검색/도움말 팝업의 열기/이동/확정/취소 전이가 리듀서 테스트로 통과.
+  - _Requirements: 6.3, 6.4, 6.5, 6.11_
+  - _Depends: 5.3_
+  - _Boundary: App/reducer_
+
+- [x] 6. UI 패널
+- [x] 6.1 (P) 트리 패널
+  - DONE: 픽스처 모델 기반 프레임에서 `[phase]` 배지, 상태 기호, steering `[inclusion]` 배지, 진행률 문자열이 기대 위치에 렌더되는 테스트 통과.
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.8, 3.1, 3.2, 3.4, 3.5, 4.1, 4.3, 4.4_
+  - _Depends: 3.4_
+  - _Boundary: UI/tree_panel_
+- [x] 6.2 (P) 문서 패널 및 상태 표시줄
+  - DONE: 스크롤 뷰, 검색 강조, `watch off` 상태 표시가 프레임 버퍼에 정확히 나타나는 테스트 통과.
+  - _Requirements: 2.4, 3.6, 6.10, 7.6, 8.3_
+  - _Depends: 2.2, 4.1, 5.1, 5.3_
+  - _Boundary: UI/doc_panel+status_bar_
+- [x] 6.3 (P) 팝업 렌더링
+  - DONE: TOC/도움말/검색 팝업이 화면 중앙에 불투명하게 그려지는 테스트 통과.
+  - _Requirements: 6.3, 6.4, 6.11_
+  - _Depends: 2.2, 5.2, 5.6_
+  - _Boundary: UI/popup_
+- [x] 6.4 레이아웃 및 폭 전환
+  - DONE: 폭 120(2패널) → 60(1패널) 전환 시 레이아웃이 기대대로 변경되는 프레임 테스트 통과.
+  - _Requirements: 1.4, 2.7, 8.5_
+  - _Boundary: UI/layout_
+
+- [x] 7. 통합 및 배선
+- [x] 7.1 이벤트 루프 및 진입점
+  - DONE: `m` 실행 → 트리 표시 → `q` 종료 후 터미널 복원 확인. 루트 없는 경로 실행 시 종료 코드 2, `--log` 경로가 `.kiro/` 아래면 거부(종료 코드 2) 확인.
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 8.1, 8.2, 8.6_
+  - _Depends: 4.1, 5.5, 5.6, 6.4_
+  - _BizProcess: BP-SPEC-VIEW.L2_
+- [x] 7.2 팝업/검색/TOC 배선
+  - DONE: 실제 키 시퀀스 (`t` → 선택, `/` → 입력 → Enter) 시 프레임과 스크롤이 기대대로 동기화되는 테스트 통과.
+  - _Requirements: 6.3, 6.4, 6.5, 6.11_
+  - _Depends: 5.6, 6.2, 6.3_
+
+- [x] 8. 최종 검증
+- [x] 8.1 통합 테스트
+  - DONE: 루트 로드, 비UTF-8 표시, 파일 변경 2초 내 반영, 삭제 처리, 수동 모드 등 5개 시나리오 `cargo test` 통과.
+  - _Requirements: 3.5, 7.1, 7.5, 7.6, 8.4_
+- [x] 8.2 E2E 사용자 흐름
+  - DONE: `BP-SPEC-VIEW.L2` 기반 6개 흐름(실행 → 펼침 → 선택 → 탐색 → 변경반영 → 종료)이 각각 독립 테스트로 통과.
+  - _Requirements: 1.1, 1.4, 1.5, 2.2, 2.6, 6.1, 7.1_
+  - _BizProcess: BP-SPEC-VIEW.L2_
+
+
+- [x] 9. 재작업 — validate-impl NO-GO (실물 화면 검증 실패: 스타일·커서·표·다이어그램)
+- [x] 9.1 프레임 버퍼 시각 검증 기반
+  - DONE: TestBackend 로 렌더한 `Buffer` 의 셀 문자·`Style`(fg/modifier)을 단정하는 헬퍼가 tests/ 에 있고, 9.2~9.5 의 결함을 수정 전에는 실패로 드러내는 테스트가 각 1개 이상 존재.
+  - _Requirements: 2.7, 5.3, 5.4, 5.7, 5.12_
+- [x] 9.2 트리 커서·활성 패널 표시
+  - DONE: 트리 선택 행이 반전/배경색으로 강조되고(`highlight_style`+기호), 활성 패널 테두리 색이 비활성과 다르게 렌더됨 — 버퍼 단정 + `tmux capture-pane -e` 실물 확인.
+  - _Requirements: 2.7_
+  - _Boundary: UI/tree_panel+layout_
+- [x] 9.3 헤딩 단계·강조 스타일
+  - DONE: H1~H3 이 서로 다른 스타일(색·굵기·접두 기호)로, 굵게/기울임/취소선/인라인 코드/링크가 각각 구분되어 버퍼에 나타남. 참조: ~/dev/tools/mdview/src/theme.rs (MIT) 의 테마 구조 채택.
+  - _Requirements: 5.3, 5.12_
+  - _Boundary: Renderer/inline+block, UI/doc_panel_
+- [x] 9.4 표 테두리
+  - DONE: 표가 `┌─┬─┐ │ ├─┼─┤ └─┴─┘` 격자와 헤더 구분선으로 렌더되고 폭 40/80 에서 폭을 넘지 않음. 참조: mdview src/render/table.rs.
+  - _Requirements: 5.4_
+  - _Boundary: Renderer/table_
+- [x] 9.5 다이어그램 연결선
+  - DONE: 그래프형 mermaid 의 간선이 라벨 텍스트가 아니라 박스 사이를 실제로 잇는 선(`─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼`, 화살촉 `► ▼`)으로 그려지고 교차부가 합성됨 — design.md Boundary Map 실물 확인. 참조: mdview src/render/canvas.rs 의 방향 비트마스크 캔버스 채택.
+  - _Requirements: 5.7, 5.16, 5.17, 5.18, 5.19_
+  - _Boundary: Renderer/mermaid/graph_
+- [x] 9.6 간선 라벨 정리
+  - DONE: 그래프 간선 위 텍스트는 mermaid 에 명시된 라벨(`-->|x|`, `-- x -->`, er 카디널리티, class 관계명, state 전이 라벨)만 표시하고 출발 노드 이름은 표시하지 않음 — design.md Boundary Map 실물에서 `Watcher►`·`FS──►` 같은 노드명 오버레이가 사라짐. 라벨 없는 간선은 선+화살촉만.
+  - _Requirements: 5.7, 5.17, 5.18, 5.19_
+  - _Boundary: Renderer/mermaid/graph_
+
+- [x] 10. 렌더 품질 — glow 3.0 기준선
+- [x] 10.1 테마 모듈
+  - DONE: `markdown/theme.rs`(mdview 구조 채택, THIRD_PARTY.md 고지)가 렌더러·패널의 유일한 스타일 원천이 되고, H1 `━`/H2 `─` 밑줄·H3~H6 색/굵기·목록 기호 `• ◦ ▪`·체크박스 `✓ ☐`·인용 `│`가 프레임 버퍼 단정으로 확인됨.
+  - _Requirements: 10.1, 10.2, 10.3, 5.3, 5.12_
+  - _Difficulty: mid_
+  - _Boundary: Renderer/theme_
+- [x] 10.2 링크·이미지·각주·코드 별칭
+  - DONE: 링크 `텍스트 (URL)`, 이미지 `🖼 대체텍스트 (URL)`, 각주가 문서 끝에 번호와 함께, 코드 펜스 `rs/py/sh/js/ts` 별칭 강조·탭 4칸 — 골든 스냅샷 갱신 통과.
+  - _Requirements: 10.4, 10.5, 10.7_
+  - _Difficulty: mid_
+  - _Boundary: Renderer/inline+block+footnote_
+- [x] 10.3 한글 줄바꿈·NFC
+  - DONE: 어절 단위 줄바꿈이 폭 40 한글 문단 골든으로, NFD 파일명/본문이 `hangul::compose`로 합쳐져 표시됨이 테스트로 확인.
+  - _Requirements: 10.6, 5.9_
+  - _Difficulty: mid_
+  - _Boundary: Renderer/wrap+hangul_
+- [x] 10.4 표 페인 폭 채움
+  - DONE: 3열 짧은 표가 폭 80 패널에서 오른쪽 테두리까지 확장되고, 넓은 표는 넓은 열부터 축소·줄바꿈되어 폭을 넘지 않음 — 버퍼 단정.
+  - _Requirements: 5.4_
+  - _Difficulty: low_
+  - _Boundary: Renderer/table_
+- [x] 10.5 glow 대비 스냅샷
+  - DONE: `glow` 설치 시 이 저장소 design.md 집합을 `glow -s dark -w 100`과 `m` 렌더로 `tests/snapshots/glow-vs-m/`에 나란히 저장하는 테스트(미설치 시 skip), 자동 단정은 10.1~10.7 기호·밑줄·각주 존재; 실물 캡처 1회 첨부.
+  - _Requirements: 10.8_
+  - _Difficulty: mid_
+
+- [x] 11. 파일 뷰·트리 표시 모드
+- [x] 11.1 CLI 인자·옵션
+  - DONE: `m path/to/x.md`가 트리 없이 파일을 전체 폭으로 열고(루트는 파일 위치에서 탐지), `--tree always|auto|hidden`이 파싱되어 `TreeMode`로 전달됨 — `m --help`와 리듀서 테스트.
+  - _Requirements: 1.6, 1.7_
+  - _Difficulty: low_
+  - _Boundary: App/cli_
+- [x] 11.2 트리 표시 상태·토글·레이아웃
+  - DONE: `tree_visible` 전이(always 고정·auto 규칙·hidden·토글 키)와 문서 전체 폭 레이아웃이 프레임 테스트로 확인되고, 도움말에 토글 키가 표시됨.
+  - _Requirements: 1.7, 8.5_
+  - _Difficulty: mid_
+  - _Depends: 11.1_
+  - _Boundary: App/reducer, UI/layout_
+
+- [x] 12. 마우스
+- [x] 12.1 마우스 캡처·이벤트·hit-test 기반
+  - DONE: `EnableMouseCapture`(실패 시 조용히 키보드만), `Action::Mouse`/`Action::Tick`, 매 프레임 `PanelLayout` 보관, 좌표→패널/트리 행/문서 (line,col) 변환 함수가 단위 테스트로 확인.
+  - _Requirements: 9.1, 9.8_
+  - _Difficulty: mid_
+  - _Boundary: App/mouse, UI/layout_
+- [x] 12.2 클릭 포커스·휠·화살표
+  - DONE: 패널 클릭 → 포커스 전환 프레임 단정, 휠 → 마우스 아래 패널 3행(트리 선택/문서 스크롤), ↑↓ → 포커스 패널 1행 — 리듀서 테스트.
+  - _Requirements: 9.1, 9.2, 9.3_
+  - _Difficulty: low_
+  - _Depends: 12.1_
+- [x] 12.3 트리 클릭 선택·토글
+  - DONE: 문서 노드 클릭 → 선택+로드, 폴더/▶▼ 클릭 → 접힘/펼침 — `TreeState` 오프셋 포함 hit-test 테스트.
+  - _Requirements: 9.4, 9.5_
+  - _Difficulty: mid_
+  - _Depends: 12.1_
+- [x] 12.4 경계 드래그 폭 조절
+  - DONE: sep 열 Down→Drag→Up 으로 split 이 바뀌고 최소 20열이 지켜지는 프레임 테스트 + 실물 캡처.
+  - _Requirements: 9.6_
+  - _Difficulty: mid_
+  - _Depends: 12.1_
+- [x] 12.5 텍스트 선택 드래그·자동 스크롤
+  - DONE: 문서 패널 드래그 범위가 `REVERSED`로 표시되고, 포인터가 상/하 경계에 있을 때 `Tick`마다 1행 스크롤하며 선택이 확장되는 리듀서+프레임 테스트.
+  - _Requirements: 9.7_
+  - _Difficulty: high_
+  - _Depends: 12.1_
+  - _Boundary: App/reducer, UI/doc_panel_
+- [x] 12.6 선택 복사·해제
+  - DONE: Up 시 `Clipboard` 싱크에 선택 텍스트(줄바꿈 포함)의 OSC 52 페이로드가 기록되고, 다른 곳 클릭/Esc 로 선택이 해제됨 — 테스트 + 실물(터미널 클립보드) 확인.
+  - _Requirements: 9.9_
+  - _Difficulty: mid_
+  - _Depends: 12.5_
+  - _Boundary: App/clipboard_
+
+- [x] 13. 검증 v2
+- [x] 13.1 마우스·파일 뷰 E2E
+  - DONE: 클릭 포커스 → 휠 → 트리 클릭 열기 → 드래그 선택 → 복사, 그리고 `m design.md` 파일 뷰 흐름이 TestBackend 프레임 단정으로 각각 통과하고, 실물 `m` 실행 캡처(tmux 마우스 이벤트)가 첨부됨.
+  - _Requirements: 1.6, 9.1, 9.2, 9.4, 9.7, 9.9_
+  - _Difficulty: high_
+  - _Depends: 11.2, 12.6_
+  - _BizProcess: BP-SPEC-VIEW.L2_
+
+- [x] 14. 다이어그램 배선
+- [x] 14.1 GraphEngine 트레이트·기본 엔진·CLI 옵션
+  - DONE: `mermaid/engine/` 에 `GraphEngine` 트레이트와 레지스트리가 있고 현 graph.rs 가 `builtin` 으로 감싸져 기존 골든이 그대로 통과; `--diagram-engine` 이 `m --help` 에 보이고 미지원 유형은 기본 엔진으로 폴백하는 테스트 통과.
+  - _Requirements: 5.21_
+  - _Difficulty: mid_
+  - _Depends: 10.5_
+  - _Boundary: Renderer/mermaid/engine_
+- [x] 14.2 mdview 엔진 + LR 전치
+  - DONE: `engine/mdview.rs`(MIT 고지)가 서브그래프 블록 층 배치·barycenter·띠 배선·가상 노드·되돌아가는 간선 통로를 제공하고 LR 은 전치로 좌→우 유지; design.md Boundary Map 에서 간선이 겹치지 않고 `┼` 교차·우회 경로로 출발·도착이 추적되는 프레임 단정 + 실물 캡처; 기본 엔진으로 지정.
+  - _Requirements: 5.7, 5.16, 5.17, 5.18, 5.19, 5.20_
+  - _Difficulty: high_
+  - _Depends: 14.1_
+  - _Boundary: Renderer/mermaid/engine_
+- [x] 14.3 graphs-tui 엔진 (feature, AGPL)
+  - DONE: cargo feature `engine-graphs-tui`(기본 off)로 graphs-tui 0.4 를 붙여 flowchart(LR/RL/TB/BT)·state 를 원문 어댑터로 렌더, er/class/sequence 는 기본 엔진 폴백; THIRD_PARTY.md 에 AGPL-3.0 고지와 "기능 활성 배포 시 의무" 문구; `cargo test --features engine-graphs-tui` 통과.
+  - _Requirements: 5.21_
+  - _Difficulty: mid_
+  - _Depends: 14.1_
+- [x] 14.4 엔진 비교 스냅샷
+  - DONE: `tests/snapshots/engines/` 에 design.md 집합 × 활성 엔진 스냅샷이 생성되고, 실물 `m --diagram-engine <각>` 캡처 3장(builtin/mdview/graphs-tui)이 보고에 첨부.
+  - _Requirements: 5.22_
+  - _Difficulty: mid_
+  - _Depends: 14.2, 14.3_
+
+- [x] 15. 재작업 v2 — validate-impl 실물 검증
+- [x] 15.1 파일 뷰 리사이즈 시 문서 소실
+  - DONE: `m path/x.md` 로 연 뒤 터미널 크기를 바꾸면 문서가 "문서를 선택하세요"로 사라지는 결함이 재현 테스트(수정 전 실패)로 잡히고, 수정 후 리사이즈에도 문서·위치가 유지됨(5.13, 1.6) — 리듀서 테스트 + 실물 `tmux resize-window` 캡처.
+  - _Requirements: 1.6, 5.13_
+  - _Difficulty: mid_
+  - _Boundary: App/reducer_
+- [x] 14.5 폭 초과 시 방향 전환 재시도
+  - DONE: mdview 엔진이 LR 배치에서 폭을 넘기면 TB 로 재배치해 렌더하고, 그래도 넘칠 때만 소스 박스로 폴백 — 100열 페인에서 design.md Boundary Map 이 TB 다이어그램으로 보이는 프레임 단정 + 실물 캡처, 120열에서는 여전히 LR.
+  - _Requirements: 5.16, 5.7_
+  - _Difficulty: mid_
+  - _Depends: 14.2_
+  - _Boundary: Renderer/mermaid/engine_
+
+- [x] 16. 재작업 v3 — 대형 클래스 다이어그램
+- [x] 16.1 폭 초과 사다리 확장: 본문 접기·행 래핑
+  - DONE: `.kiro/specs/spec-viewer/gitea-github-schema.md`(classDiagram 15클래스·20관계)가 120열·100열 페인에서 소스 폴백 없이 다이어그램으로 렌더됨 — 재현 테스트(수정 전 Overflow) 실패 확인 → 본문 접기·행 래핑 구현 → 통과, 실물 캡처 2장. 기존 Boundary Map 은 120열 LR 그대로.
+  - _Requirements: 5.16, 5.18, 5.7_
+  - _Difficulty: high_
+  - _Depends: 14.5_
+  - _Boundary: Renderer/mermaid/engine_
+- [x] 16.2 폴백 라벨 유형명
+  - DONE: engine/mdview.rs 의 하드코딩 "flowchart" 가 제거되고 Fallback 의 kind 가 파서 판정 종류를 전달 — classDiagram 소스 폴백 라벨이 `Mermaid (Overflow): classDiagram` 인 테스트 통과.
+  - _Requirements: 5.23, 5.15_
+  - _Difficulty: low_
+  - _Boundary: Renderer/mermaid/engine_
+
+- [x] 17. 독립 뷰어 모드 (--all)
+- [x] 17.1 TreeSource·FsTree 모델
+  - DONE: `TreeSource::{Kiro, Files}` 가 도입되어 트리 패널·리듀서·감시가 TreeSource 만 의존하고(기존 테스트 전부 통과), `FsTree::scan(root)` 가 ignore 크레이트로 .gitignore·숨김 제외·깊이 6·이름순 목록을 만들며 픽스처(무시 파일·숨김 파일·중첩 7단계) 테스트 통과.
+  - _Requirements: 1.8_
+  - _Difficulty: mid_
+  - _Boundary: SpecModel/fs_tree, App/reducer_
+- [x] 17.2 `--all` CLI·트리 렌더·E2E
+  - DONE: `m --all [DIR]` 이 .kiro 없이 실행되어 폴더 접힘/펼침·파일 선택 렌더가 되고 배지·진행률·정의는 표시되지 않음, 파일 변경이 트리에 반영됨 — 프레임 단정 E2E + 실물 캡처(`m --all ~/dev/tools/mdview/docs`).
+  - _Requirements: 1.8, 1.9, 7.4_
+  - _Difficulty: mid_
+  - _Depends: 17.1_
+  - _BizProcess: BP-SPEC-VIEW.L2_
+
+- [x] 18. 재작업 v4 — 표 형태
+- [x] 18.1 GitHub 형태 표
+  - DONE: 표가 내용 폭으로 그려지고(페인 폭 채움 제거), 모든 행 사이에 `├─┼─┤` 구분선이 있으며 헤더가 굵게·구분선으로 강조됨 — 재현 테스트(수정 전: 폭 채움·행 구분선 없음) 실패 확인 → 수정 → 버퍼 단정 통과, 골든 갱신, design.md Technology Stack 표 실물 캡처.
+  - _Requirements: 5.4_
+  - _Difficulty: low_
+  - _Boundary: Renderer/table_
+- [x] 16.3 mdview 엔진 TB 고정 (LR 전치 제거)
+  - DONE: `engine/mdview.rs` 의 LR 전치·14.5 재시도 코드가 제거되고 원본 배선 그대로 동작하여, design.md Boundary Map 을 120열·100열에서 렌더한 문자열이 참조 바이너리 `~/dev/tools/mdview/target/release/mdview -P -w N` 출력의 다이어그램 부분과 diff 0 — 테스트로 고정(바이너리 없으면 저장된 스냅샷과 비교). `--diagram-engine builtin` 은 여전히 LR.
+  - _Requirements: 5.7, 5.16, 5.20_
+  - _Difficulty: mid_
+  - _Depends: 14.2_
+  - _Boundary: Renderer/mermaid/engine_
+- [x] 17.3 `--all` 대상 디렉터리 검증
+  - DONE: `m --all /없는/경로` 또는 읽을 수 없는 디렉터리는 빈 트리를 띄우지 않고 경로를 포함한 오류를 stderr 에 출력하고 exit 2 (1.3 과 동일 규칙) — 재현 테스트(수정 전: 빈 트리) 실패 확인 → 수정 → 통과, 실물 캡처.
+  - _Requirements: 1.8, 1.3_
+  - _Difficulty: low_
+  - _Boundary: App/cli_
+- [x] 16.4 간선 라벨 보호
+  - DONE: 배선이 간선 라벨 텍스트 셀을 덮어쓰지 않음(라벨을 선보다 나중에 그리거나 통로가 라벨 칸을 피함) — gitea-github-schema.md 의 `access permissions` 라벨이 100·120열에서 온전히 보이는 프레임 단정 + 실물 캡처, Boundary Map 회귀 없음.
+  - _Requirements: 5.7, 5.18, 5.20_
+  - _Difficulty: mid_
+  - _Depends: 16.1_
+  - _Boundary: Renderer/mermaid/engine_
+- [x] 18.2 표 가로 넘침 제거·자동 폭 조정
+  - DONE: 어떤 페인 폭(40/80/100/120)에서도 표의 오른쬭 테두리가 문서 패널 테두리 **안쪽**에 놓이고 한 글자도 잘리지 않음 — 열 폭은 내용 폭에서 시작해 합계가 패널 내부 폭(테두리·패딩 제외)을 넘으면 넓은 열부터 줄여 셀을 개행. 재현 테스트(수정 전: design.md Technology Stack 표가 100열에서 넘침) 실패 확인 → 수정 → 프레임 단정 + 실물 캡처 4폭.
+  - _Requirements: 5.4_
+  - _Difficulty: mid_
+  - _Depends: 18.1_
+  - _Boundary: Renderer/table, UI/doc_panel_
+
+- [x] 19. 레이아웃 모드·정렬·파일 정보
+- [x] 19.1 레이아웃 모드 핫키 (자동/접기/펼치기/단일)
+  - DONE: `TreeMode::Single` 과 `Action::SetTreeMode` 가 추가되어 네 모드가 핫키로 전환되고(도움말 표시), Single 에서 문서 선택 → 문서 전체 폭, Esc → 트리 복귀, Auto 는 폭에 따라 2패널/단일 자동 — 리듀서 테스트 + 프레임 단정 + 실물 캡처(80열·120열).
+  - _Requirements: 1.10, 1.7, 8.5_
+  - _Difficulty: mid_
+  - _Boundary: App/reducer+keymap, UI/layout_
+- [x] 19.2 스펙 트리 정렬
+  - DONE: `SortKey` 4종이 핫키로 순환되고 `--sort` 로 시작값 지정, 트리 제목에 현재 키 표시, 정렬 후 선택 노드 유지 — 픽스처 기반 정렬 결과 테스트 + 프레임 단정.
+  - _Requirements: 2.9_
+  - _Difficulty: low_
+  - _Boundary: SpecModel/sort, UI/tree_panel_
+- [x] 19.3 상태 표시줄 파일 정보
+  - DONE: 문서 표시 중 상태 표시줄에 `수정일 · 크기 · 행수` 가 경로·% 와 함께 보이고 파일 변경 이벤트 후 값이 갱신됨 — 로더 메타 테스트 + 프레임 단정 + 실물 캡처.
+  - _Requirements: 6.12, 7.1_
+  - _Difficulty: low_
+  - _Boundary: App/loader, UI/status_bar_
+- [x] 19.4 트리 패널 검색
+  - DONE: 트리에 포커스가 있을 때 검색 키로 노드 이름 부분 일치(대소문자 무시) 이동·강조, 이전/다음 순환, 접힌 조상 자동 펼침, 일치 없음 표시, Esc 해제 — 리듀서 테스트 + 프레임 단정(강조 셀) + 실물 캡처.
+  - _Requirements: 2.10_
+  - _Difficulty: mid_
+  - _Depends: 19.1_
+  - _Boundary: App/search+reducer, UI/tree_panel_
+- [x] 20. 재작업: 2패널 문서 렌더 폭 (validate-impl NO-GO)
+- [x] 20.1 2패널 레이아웃에서 문서가 패널 안쪽 폭으로 개행되지 않음
+  - 결함: 트리+문서 2패널(120열)에서 단락이 문서 패널 안쪽 폭이 아닌 더 넓은 폭으로 개행되어 오른쪽 테두리에서 잘리고 가운데 줄이 통째로 사라짐(design.md `## 정의` 단락: `…화면의 단│` 다음 줄이 `정의서이다.`). `--tree hidden` 단일 패널에서는 정상. Enter 로드·리사이즈·`r` 재로드·`--tree always FILE` 모두 동일.
+  - DONE: 재현 테스트(TestBackend 120×35 2패널 프레임에서 `## 정의` 단락의 모든 줄이 문서 패널 내부에 있고 원문 어절이 하나도 빠지지 않음)가 먼저 실패 → 수정 → 통과. 40/80/120 2패널과 `--tree hidden` 에서 단락·표 모두 패널 안쪽 폭 — 프레임 단정 + 실물 캡처.
+  - _Requirements: 5.1, 5.4, 5.13, 5.9_
+  - _Difficulty: low_
+  - _Boundary: App/reducer(load width), App/loader, UI/mod_
+- [ ] 21. dg 엔진 (기본 렌더러)
+- [x] 21.1 dg 크레이트 바인딩·기본 엔진
+  - DONE: `engine/dg_engine.rs`(feature `engine-dg`, 기본 활성)가 dg lib(`render_diagram`, 캡션 off)로 flowchart/class/er/state 를 렌더하고 레지스트리·`--diagram-engine` 기본값이 `dg`; 골든 3종 재생성; `cargo test -q` 405 통과; 120열 2패널 design.md Boundary Map 이 dg 출력으로 보이는 실물 캡처.
+  - _Requirements: 5.21, 5.24_
+  - _Difficulty: mid_
+  - _Boundary: Render/mermaid/engine, CLI, Cargo_
+- [ ] 21.2 dg 의존 경로 하드코딩 제거
+  - 결함: Cargo.toml의 `path` 로컬 절대경로 의존은 이 머신에서만 빌드됨(다른 머신에서 `make install-remote` 실패).
+  - DONE: git 의존(`github.com/hodorii/dg`)으로 전환 — 다른 머신에서도 `make install-remote` 성공 + `m --help` 기본값 `dg`.
+  - _Requirements: 5.24_
+  - _Difficulty: low_
+  - _Boundary: Cargo, Makefile_
+- [ ] 21.3 엔진 비교 스냅샷·문서
+  - DONE: `tests/engine_compare.rs` 에 dg 열이 추가되어 `tests/snapshots/engines/*.dg.txt` 생성; README 엔진 절·THIRD_PARTY.md(dg, MIT) 갱신; 다른 머신에서 `m` 이 dg 로 렌더하는 실물 캡처 1장.
+  - _Requirements: 5.22, 5.21_
+  - _Difficulty: low_
+  - _Depends: 21.2_
+  - _Boundary: tests/engine_compare, docs_

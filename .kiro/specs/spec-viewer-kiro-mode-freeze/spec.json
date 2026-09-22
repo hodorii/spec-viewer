@@ -1,0 +1,26 @@
+{
+  "feature_name": "spec-viewer-kiro-mode-freeze",
+  "created_at": "2026-09-18T08:39:33Z",
+  "updated_at": "2026-09-21T00:45:49Z",
+  "language": "ko",
+  "phase": "tasks-generated",
+  "approvals": {
+    "bugfix": {
+      "generated": true,
+      "approved": true
+    },
+    "bizProcess": {
+      "generated": false,
+      "approved": false
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  },
+  "ready_for_implementation": false
+}

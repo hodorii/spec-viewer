@@ -44,7 +44,10 @@ const FEATURE_SMOKE_MD: &str = "\
 ```rust\nfn main() {\n\tprintln!(\"tab\");\n}\n```\n";
 
 fn design_md_files() -> Vec<PathBuf> {
-    let specs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.kiro/specs");
+    // This crate carries its own `.kiro/` specs (moved in from the
+    // archgenworks monorepo, commit 0ab79a3) rather than assuming it's
+    // checked out one level under an external workspace's `.kiro/`.
+    let specs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".kiro/specs");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&specs_dir) {
         for entry in entries.flatten() {

@@ -1,1 +1,6 @@
 /target/
+# Review-only artifacts written by tests/engine_compare.rs and
+# tests/glow_snapshot.rs (design.md "Engine comparison"/"Glow 비교") --
+# regenerated fresh on demand, never asserted against, not meant to be
+# committed.
+/tests/snapshots/

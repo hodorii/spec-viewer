@@ -250,7 +250,10 @@ fn assert_definition_paragraph_wraps_inside_doc_panel(
     tree_mode: spec_viewer::app::TreeMode,
     tree_visible: bool,
 ) {
-    let repo_kiro_root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.kiro"));
+    // This crate carries its own `.kiro/` specs (moved in from the
+    // archgenworks monorepo, commit 0ab79a3) rather than assuming it's
+    // checked out one level under an external workspace's `.kiro/`.
+    let repo_kiro_root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.kiro"));
     let snapshot = app::load_snapshot(&repo_kiro_root);
     let root = spec::build(&snapshot);
     let mut state = AppState::new(

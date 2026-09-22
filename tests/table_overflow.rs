@@ -20,8 +20,11 @@ use spec_viewer::ui;
 use unicode_width::UnicodeWidthStr;
 
 fn design_md_path() -> std::path::PathBuf {
+    // This crate carries its own `.kiro/` specs (moved in from the
+    // archgenworks monorepo, commit 0ab79a3) rather than assuming it's
+    // checked out one level under an external workspace's `.kiro/`.
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../.kiro/specs/spec-viewer/design.md")
+        .join(".kiro/specs/spec-viewer/design.md")
 }
 
 /// Render `design.md` through the full pipeline (load → doc_panel draw) into

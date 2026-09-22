@@ -97,7 +97,6 @@ Boundary Map (flowchart)
 │ id : string   │
 └───────────────┘
         ╪
-        ╪
         │ places
         ○
         ∨

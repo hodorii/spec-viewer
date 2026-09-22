@@ -1,4 +1,5 @@
 pub mod block;
+pub(crate) mod delegated;
 pub mod hangul;
 pub mod inline;
 pub mod table;
@@ -27,7 +28,14 @@ pub struct Span {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SpanStyle { Plain, Bold, Italic, Strikethrough, Code, Link }
+pub enum SpanStyle {
+    Plain, Bold, Italic, Strikethrough, Code, Link,
+    /// A fully-resolved style handed down by a delegated renderer (e.g.
+    /// `dg`'s own `Style`, converted 1:1 — see `mermaid::engine::dg_engine`)
+    /// instead of this crate's own six-way palette. `ui::doc_panel::span_style`
+    /// passes it straight through.
+    Raw(ratatui::style::Style),
+}
 
 #[derive(Clone, Copy)]
 pub enum LineStyle { Heading(u8), Quote, ListItem(u16), Table, Plain }
@@ -209,6 +217,26 @@ pub fn render_with(src: &str, width: u16, theme: &Theme) -> Rendered {
     }
 
     Rendered { lines, plain, headings, footnotes }
+}
+
+/// Render `src` for actual on-screen display: try the currently selected
+/// mermaid [`GraphEngine`](mermaid::engine::GraphEngine)'s own full-document
+/// renderer first (`GraphEngine::render_document`, default `None` — only
+/// `dg` implements it), falling back to this crate's own [`render`] when no
+/// engine offers one (`mdview`/`builtin` selected, or `engine-dg` off).
+///
+/// This is deliberately a *different* entry point from [`render`]/
+/// [`render_with`]: those two stay pure and engine-independent because
+/// dozens of app/ui reducer tests construct fixtures with `render(...)`
+/// as a deterministic building block unrelated to what they're actually
+/// testing — routing them through the global engine selection would make
+/// unrelated tests depend on shared mutable state. `app::loader` (the only
+/// place real, user-visible documents get rendered) calls this one instead.
+pub fn render_for_display(src: &str, width: u16) -> Rendered {
+    if let Some(rendered) = mermaid::engine::current().render_document(src, width) {
+        return rendered;
+    }
+    render(src, width)
 }
 
 #[cfg(test)]

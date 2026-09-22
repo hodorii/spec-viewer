@@ -51,6 +51,9 @@ fn span_style(style: SpanStyle) -> Style {
         SpanStyle::Strikethrough => Style::default().add_modifier(Modifier::CROSSED_OUT),
         SpanStyle::Code => Style::default().fg(Color::Yellow),
         SpanStyle::Link => Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+        // Already a fully-resolved ratatui Style from a delegated renderer
+        // (dg via GraphEngine::render_document) -- pass it straight through.
+        SpanStyle::Raw(style) => style,
     }
 }
 

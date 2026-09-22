@@ -85,6 +85,22 @@ pub trait GraphEngine: Send + Sync {
     fn render_other_language(&self, _lang: &str, _src: &str, _width: u16) -> Option<Result<Vec<String>, Fallback>> {
         None
     }
+
+    /// Render a *whole markdown document* — not just a diagram fence —
+    /// entirely delegated to this engine's own library, for
+    /// [`markdown::render_for_display`](crate::markdown::render_for_display)
+    /// (the entry point real, on-screen documents go through; this crate's
+    /// own [`markdown::render`](crate::markdown::render) stays untouched and
+    /// engine-independent for its many test call sites). `None` means "I
+    /// don't have a full-document renderer" (`builtin`/`mdview` only render
+    /// this crate's own mermaid `Diagram` IR, nothing markdown-shaped) —
+    /// `render_for_display` then falls back to this crate's own renderer.
+    /// `dg` overrides it via `dg::render_markdown`, reconstructing heading/
+    /// footnote metadata separately (see `markdown::delegated`) since `dg`
+    /// only gives back styled lines.
+    fn render_document(&self, _src: &str, _width: u16) -> Option<crate::markdown::Rendered> {
+        None
+    }
 }
 
 /// Process-global registry plus selection state.

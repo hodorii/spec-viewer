@@ -20,10 +20,59 @@
 //! entirely up to whichever engine is selected -- currently only `dg`
 //! answers at all (`dg::diagram::language_of_fence` decides which fence
 //! languages count).
+//!
+//! [`render_document`](GraphEngine::render_document) goes one step further
+//! and hands `dg` the *whole markdown document* (headings, prose, lists,
+//! tables, quotes, code -- diagram fences included, rendered inline by
+//! `dg` itself): `dg::render_markdown` returns `dg::Line`s, whose
+//! `(text, Style)` runs convert 1:1 to this crate's `Span`/
+//! `SpanStyle::Raw` (both `dg::Style` and `ratatui::style::Style` are a
+//! plain fg/bg-color-plus-modifier-flags struct, so no lossy six-way
+//! `SpanStyle` mapping is needed here the way `ui::doc_panel`'s own
+//! hardcoded styling requires for this crate's own renderer). Heading/
+//! footnote metadata, which `dg` doesn't expose, is reconstructed from the
+//! same source via `markdown::delegated`.
 
 use super::super::parse::Diagram;
 use super::super::Fallback;
 use super::GraphEngine;
+use crate::markdown::delegated::{footnotes_in_definition_order, locate_heading_lines, scan_headings_and_footnotes};
+use crate::markdown::{Line, Rendered, Span, SpanStyle};
+
+/// `dg::Style`'s fields map 1:1 onto `ratatui::style::Style`'s (indexed
+/// fg/bg color plus independent bold/dim/italic/underline/strike/reverse
+/// flags) -- this is a direct field-by-field conversion, not a heuristic.
+fn dg_style_to_ratatui(style: ::dg::Style) -> ratatui::style::Style {
+    use ratatui::style::{Color, Modifier, Style as RStyle};
+
+    let mut out = RStyle::default();
+    if let ::dg::style::Color::Indexed(i) = style.fg {
+        out = out.fg(Color::Indexed(i));
+    }
+    if let ::dg::style::Color::Indexed(i) = style.bg {
+        out = out.bg(Color::Indexed(i));
+    }
+    let mut modifier = Modifier::empty();
+    if style.bold {
+        modifier |= Modifier::BOLD;
+    }
+    if style.dim {
+        modifier |= Modifier::DIM;
+    }
+    if style.italic {
+        modifier |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if style.strike {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    if style.reverse {
+        modifier |= Modifier::REVERSED;
+    }
+    out.add_modifier(modifier)
+}
 
 pub struct DgEngine;
 
@@ -81,6 +130,37 @@ impl GraphEngine for DgEngine {
             return None;
         }
         Some(render_via_dg(language, src, width))
+    }
+
+    fn render_document(&self, src: &str, width: u16) -> Option<Rendered> {
+        let options = ::dg::RenderOptions {
+            width: usize::from(width),
+            block_width: None,
+            theme: ::dg::Theme::dark(),
+            diagram: ::dg::DiagramOptions::default(),
+            // No "◈ mermaid · flowchart ───" captions inline in a document
+            // view -- matches how the mermaid/PlantUML fence paths above
+            // already suppress them (code.rs draws its own fence framing).
+            diagram_caption: false,
+        };
+        let dg_lines = ::dg::render_markdown(src, &options);
+
+        let mut lines = Vec::with_capacity(dg_lines.len());
+        let mut plain = Vec::with_capacity(dg_lines.len());
+        for dg_line in &dg_lines {
+            let spans: Vec<Span> = dg_line
+                .runs()
+                .map(|(text, style)| Span { text: text.to_string(), style: SpanStyle::Raw(dg_style_to_ratatui(style)) })
+                .collect();
+            plain.push(dg_line.text().to_string());
+            lines.push(Line { indent: 0, spans, style: None });
+        }
+
+        let (heading_defs, footnote_defs) = scan_headings_and_footnotes(src);
+        let headings = locate_heading_lines(&plain, &heading_defs);
+        let footnotes = footnotes_in_definition_order(footnote_defs);
+
+        Some(Rendered { lines, plain, headings, footnotes })
     }
 }
 

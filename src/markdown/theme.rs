@@ -86,6 +86,9 @@ impl Theme {
             SpanStyle::Strikethrough => self.strikethrough,
             SpanStyle::Code => self.code,
             SpanStyle::Link => self.link,
+            // Already fully resolved by a delegated renderer -- nothing for
+            // this crate's own theme to add.
+            SpanStyle::Raw(style) => style,
         }
     }
 

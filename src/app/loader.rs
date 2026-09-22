@@ -181,7 +181,7 @@ pub fn load_doc(path: &Path, width: u16) -> DocView {
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             DocView::Rendered {
                 path: path.to_path_buf(),
-                r: markdown::render(&content, panel_inner_width(width)),
+                r: markdown::render_for_display(&content, panel_inner_width(width)),
                 meta: FileInfo {
                     modified,
                     size: bytes.len() as u64,
@@ -329,7 +329,7 @@ pub fn load_definition(spec: &Spec, width: u16) -> DocView {
             let text = spec.definition.as_deref().unwrap_or("정의 없음");
             DocView::Definition {
                 spec: spec.name.clone(),
-                text: markdown::render(text, panel_inner_width(width)),
+                text: markdown::render_for_display(text, panel_inner_width(width)),
             }
         }
     }

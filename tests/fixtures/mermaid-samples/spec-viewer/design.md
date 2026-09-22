@@ -25,7 +25,7 @@
 
 ### Revalidation Triggers
 - `spec.json` 스키마(`phase`/`approvals`/`updated_at` 키, `feature_name`/`name`)나 문서 7종(spec.json/requirements/bugfix/biz-process/design/tasks/research) 파일명 규약이 바뀌면 `spec` 모듈 계약 재검토.
-- `dg`가 `branch = "main"`으로 고정돼 있어 `Cargo.lock` 갱신 시 상류가 조용히 바뀔 수 있다 — `dg::render_diagram`/`RenderOptions`/`diagram::kind_of` API가 바뀌면 `dg_engine.rs` 재검토.
+- `dg`가 `branch = "main"`으로 고정돼 있어 `Cargo.lock` 갱신 시 상류가 조용히 바뀔 수 있다 — `dg::render_diagram`/`RenderOptions`/`diagram::kind_of`/`language_of_fence` API가 바뀌면 `dg_engine.rs` 재검토. (실제로 한 번 일어남: `cargo update -p dg`로 `dc28a52`→`2b8cd86`, "gitGraph 브랜치별 색+선패턴 이중 구분" — 폭 초과 시 `None`(→`Fallback::Overflow`) 대신 세로 나열 폴백으로 바뀌어 이 문서의 gitGraph 실측 문구를 다시 검증·수정해야 했다. 이 패턴이 dg 쪽에 반복될 때마다 아래 "다이어그램 유형 커버리지 샘플"의 실측 텍스트도 재확인이 필요하다.)
 - `agw` 워크스페이스로 편입되면 독립 크레이트 전제와 Allowed Dependencies 재검토.
 - ratatui/crossterm 메이저 업그레이드 시 터미널 복원(`ratatui::init`/`restore`)·마우스 캡처 실패 허용 경로 재검증.
 - 문서가 수천 행 규모로 커지면 Synchronous Core 결정(동기 로드/렌더) 재검토.
@@ -76,7 +76,7 @@ columns 3
 | Layer | Choice | Role |
 |-------|--------|------|
 | CLI | clap 4(derive) | `[PATH]`(디렉터리=`.kiro` 트리 탐지, `.md` 파일=파일 뷰), `--all`(`.kiro` 무시하고 지정 디렉터리를 마크다운 트리로, 대상이 없거나 못 읽으면 exit 2), `--tree <auto\|always\|hidden\|single>`, `--sort <name\|phase\|updated\|progress>`, `--diagram-engine <dg\|mdview\|builtin>`(문자열 검증, 기본값은 `engine-dg` 피처 컴파일타임 분기), `--no-watch`, `--log <path>`(`.kiro` 루트 내부면 거부), `--version`/`-V`(clap `version` 속성이 자동 처리) |
-| Diagram | dg 0.2.1 (git dep, lib 타깃, `cli` 기능 off, MIT), `engine-dg` 피처로 켬/끔 | flowchart/er/class/state/sequence 지원(generic 미지원), mermaid 원문을 그대로 받아 내부에서 폭 맞춤 재시도까지 마친 텍스트를 반환 |
+| Diagram | dg 0.2.1 (git dep `branch = "main"`, lib 타깃, `cli` 기능 off, MIT), `engine-dg` 피처로 켬/끔(기본 켜짐) | 지원 범위는 dg 자신이 결정(`GraphEngine::classify`/`render_other_language`) — mermaid 11종 + PlantUML 시퀀스/클래스/ER/간트/컴포넌트류. mermaid·PlantUML 원문을 그대로 받아 내부에서 폭 맞춤 재시도까지 마친 텍스트를 반환 |
 | TUI | ratatui 0.30 + crossterm 0.29 | 프레임 및 입력, `ratatui::init`/`restore`가 raw mode·대체화면·패닉 훅 복원까지 담당 |
 | Tree | tui-tree-widget 0.24 | 트리 상태(`TreeState<NodeId>`)와 렌더링, 행 히트테스트(`rendered_at`) |
 | Parser | pulldown-cmark 0.13 (TASKLISTS·STRIKETHROUGH·TABLES·FOOTNOTES) | 마크다운 이벤트 스트림 |
@@ -361,11 +361,19 @@ gitGraph
    commit id: "cdf1fdb" tag: "v0.2.1"
    commit id: "0564b3c" tag: "v0.2.2"
 ```
-`render_mermaid(위 소스, width)`를 spec-viewer의 실제 기본 엔진(`dg`)으로 다시 실측: `DgEngine::classify`가 `dg::diagram::kind_of`로 `"gitgraph"`를 반환하고 `supports("gitgraph")`(`!= "generic"`)가 참이라 이제 dg의 진짜 렌더러까지 도달한다. **다만 폭에는 여전히 민감하다** — 짧은 해시 10개짜리 이 소스도 폭 100에서는 `Err(Fallback::Overflow{kind:"gitgraph"})`로 소스 폴백이 나온다(라우팅이 고쳐졌다고 dg 내부의 폭 맞추기까지 면제되는 건 아니라는 뜻, 이 문서 자체를 폭 100 근방으로 볼 때 정상 동작), 폭 150 이상에서만 한 줄로 다 들어간다:
+`render_mermaid(위 소스, width)`를 spec-viewer의 실제 기본 엔진(`dg`)으로 다시 실측: `DgEngine::classify`가 `dg::diagram::kind_of`로 `"gitgraph"`를 반환하고 `supports("gitgraph")`(`!= "generic"`)가 참이라 이제 dg의 진짜 렌더러까지 도달한다. **폭 대응은 dg 쪽 업그레이드로 한 번 더 바뀌었다**(`~/tools/dg` 커밋 `2b8cd86`, "gitGraph 브랜치별 색+선패턴 이중 구분" — `Cargo.lock`의 `dg` 핀을 이 커밋으로 `cargo update -p dg` 함): 이전 dg 버전은 짧은 해시 10개짜리 이 소스가 폭 100에서 안 들어가면 그냥 `None`(→`Fallback::Overflow`)을 돌려줬는데, 지금은 **한 줄에 안 들어가면 트랙 이름과 커밋을 세로로 한 줄씩 나열하는 폴백 레이아웃**으로 물러난다 — 실측(폭 30/50/80/100은 세로 11줄, 폭 120부터 가로 한 줄):
+```text
+main
+●3697851
+●4ae9936
+...
+●0564b3c
+```
+폭 120 이상에서만 한 줄로:
 ```text
 main  ●3697851───●4ae9936───●86900ce───●df77b3d───●a0afce4───●8e4e382───●c1bb9f9───●b6421fd───●cdf1fdb───●0564b3c
 ```
-(dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 실제 dg 출력에는 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. "태그가 안 보이는 것"은 회귀가 아니다.)
+(dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 두 레이아웃 모두 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. "태그가 안 보이는 것"은 회귀가 아니다.)
 
 **PlantUML — `code.rs`가 `"mermaid"`만 특별 취급하던 시절엔 지원 밖이었지만, 이제는 위임된다 (2026-09-22 개선)**: `markdown::code::push_code_block`은 언어가 정확히 `"mermaid"`가 아니면, 곧장 syntect로 가기 전에 `engine::current().render_other_language(lang, code, width)`를 먼저 물어본다. `builtin`/`mdview`는 이 메서드의 기본 구현(`None`)을 그대로 쓰므로 PlantUML을 여전히 모르지만, `DgEngine`은 `dg::diagram::language_of_fence("plantuml"|"puml"|"uml")`로 `Language::PlantUml`을 인식해 `dg::render_diagram`에 그대로 위임한다 — 이 fence는 이제 dg의 실제 박스+화살표 시퀀스 다이어그램으로 그려진다(기본 엔진이 `dg`이므로 별도 설정 없이도 그렇다; `push_code_block("plantuml", 위 소스, 60, ...)`로 직접 실측 확인함). `engine_compare.rs`의 펜스 추출은 여전히 `mermaid` 언어 태그만 보므로 이 fence는 그 골든/폴백 테스트 대상은 아니고, `code.rs`의 전용 단위 테스트(`plantuml_fence_delegates_to_the_selected_engine`/`plantuml_fence_falls_back_to_source_when_selected_engine_cannot`)가 이 경로를 검증한다:
 ```plantuml
@@ -412,8 +420,8 @@ pie title 문서 상태
 - 개선 후(현재 동작): `DgEngine::classify`가 `dg::diagram::kind_of`로 `"pie"`를 반환 → `supports("pie")==true`(`!= "generic"`) → `render_mermaid(위 소스, 70)`이 그대로:
 ```text
 문서 상태
-Approved ██████████████████████████████                66.7%
-Missing  ███████████████                               33.3%
+Approved █████████████████████████████████████                   66.7%
+Missing  ██████████████████                                      33.3%
 ```
 
 ```mermaid

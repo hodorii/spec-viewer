@@ -460,7 +460,7 @@ dependencies = [
 [[package]]
 name = "dg"
 version = "0.2.1"
-source = "git+https://github.com/hodorii/dg.git?branch=main#9da40d4bcaa4c2821a746e07ef89f7e72006b019"
+source = "git+https://github.com/hodorii/dg.git?branch=main#a2cb4926191ec753ce58524f6cdf3c15faeb0c3c"
 dependencies = [
  "pulldown-cmark",
  "unicode-width",

@@ -25,7 +25,7 @@
 
 ### Revalidation Triggers
 - `spec.json` 스키마(`phase`/`approvals`/`updated_at` 키, `feature_name`/`name`)나 문서 7종(spec.json/requirements/bugfix/biz-process/design/tasks/research) 파일명 규약이 바뀌면 `spec` 모듈 계약 재검토.
-- `dg`가 `branch = "main"`으로 고정돼 있어 `Cargo.lock` 갱신 시 상류가 조용히 바뀔 수 있다 — `dg::render_diagram`/`RenderOptions`/`diagram::kind_of`/`language_of_fence` API가 바뀌면 `dg_engine.rs` 재검토. (실제로 한 번 일어남: `cargo update -p dg`로 `dc28a52`→`2b8cd86`, "gitGraph 브랜치별 색+선패턴 이중 구분" — 폭 초과 시 `None`(→`Fallback::Overflow`) 대신 세로 나열 폴백으로 바뀌어 이 문서의 gitGraph 실측 문구를 다시 검증·수정해야 했다. 이 패턴이 dg 쪽에 반복될 때마다 아래 "다이어그램 유형 커버리지 샘플"의 실측 텍스트도 재확인이 필요하다.)
+- `dg`가 `branch = "main"`으로 고정돼 있어 `Cargo.lock` 갱신 시 상류가 조용히 바뀔 수 있다 — `dg::render_diagram`/`RenderOptions`/`diagram::kind_of`/`language_of_fence` API가 바뀌면 `dg_engine.rs` 재검토. (실제로 반복 발생 중: `cargo update -p dg`로 `dc28a52`→`2b8cd86`→`9da40d4`→`a2cb492`까지 이 문서를 쓰는 동안만 네 차례 — "gitGraph 브랜치별 색+선패턴 이중 구분"(폭 초과 시 `None` 대신 세로 나열 폴백으로 변경), "시퀀스 프래그먼트 테두리 구분"(이 저장소 픽스처엔 영향 없음), "커밋 점-id 공백 확보"(가로/세로 전환 임계 폭이 밀림) 순. 매번 아래 "다이어그램 유형 커버리지 샘플"의 gitGraph 실측 텍스트·임계 폭을 다시 검증·수정해야 했다 — 이 패턴이 반복되는 한 dg 핀을 올릴 때마다 그 절을 재확인할 것.)
 - `agw` 워크스페이스로 편입되면 독립 크레이트 전제와 Allowed Dependencies 재검토.
 - ratatui/crossterm 메이저 업그레이드 시 터미널 복원(`ratatui::init`/`restore`)·마우스 캡처 실패 허용 경로 재검증.
 - 문서가 수천 행 규모로 커지면 Synchronous Core 결정(동기 로드/렌더) 재검토.
@@ -364,17 +364,17 @@ gitGraph
    commit id: "cdf1fdb" tag: "v0.2.1"
    commit id: "0564b3c" tag: "v0.2.2"
 ```
-`render_mermaid(위 소스, width)`를 spec-viewer의 실제 기본 엔진(`dg`)으로 다시 실측: `DgEngine::classify`가 `dg::diagram::kind_of`로 `"gitgraph"`를 반환하고 `supports("gitgraph")`(`!= "generic"`)가 참이라 이제 dg의 진짜 렌더러까지 도달한다. **폭 대응은 dg 쪽 업그레이드로 한 번 더 바뀌었다**(`~/tools/dg` 커밋 `2b8cd86`, "gitGraph 브랜치별 색+선패턴 이중 구분" — `Cargo.lock`의 `dg` 핀을 이 커밋으로 `cargo update -p dg` 함): 이전 dg 버전은 짧은 해시 10개짜리 이 소스가 폭 100에서 안 들어가면 그냥 `None`(→`Fallback::Overflow`)을 돌려줬는데, 지금은 **한 줄에 안 들어가면 트랙 이름과 커밋을 세로로 한 줄씩 나열하는 폴백 레이아웃**으로 물러난다 — 실측(폭 30/50/80/100은 세로 11줄, 폭 120부터 가로 한 줄):
+`render_mermaid(위 소스, width)`를 spec-viewer의 실제 기본 엔진(`dg`)으로 다시 실측: `DgEngine::classify`가 `dg::diagram::kind_of`로 `"gitgraph"`를 반환하고 `supports("gitgraph")`(`!= "generic"`)가 참이라 이제 dg의 진짜 렌더러까지 도달한다. **폭 대응은 dg 쪽 업그레이드로 두 번 더 바뀌었다**(`~/tools/dg` `2b8cd86`→`9da40d4`→`a2cb492`, "gitGraph 브랜치별 색+선패턴 이중 구분"→"시퀀스 프래그먼트 테두리 구분"→"커밋 점과 id 글자 사이 공백 확보" — `Cargo.lock`의 `dg` 핀을 그때그때 `cargo update -p dg`로 맞춰 왔다): 처음 dg 버전은 짧은 해시 10개짜리 이 소스가 폭 100에서 안 들어가면 그냥 `None`(→`Fallback::Overflow`)을 돌려줬는데, 지금은 **한 줄에 안 들어가면 트랙 이름과 커밋을 세로로 한 줄씩 나열하는 폴백 레이아웃**으로 물러난다 — 실측(폭 30~113은 세로 11줄, 폭 114부터 가로 한 줄; 커밋 점 뒤 공백이 생기면서 가로 전환 임계 폭이 이전 실측(120)보다 살짝 내려왔다 — dg 렌더링 세부는 이렇게 계속 바뀔 수 있으니 이 문서를 다시 볼 때 실측값이 안 맞으면 재확인할 것):
 ```text
 main
-●3697851
-●4ae9936
+● 3697851
+● 4ae9936
 ...
-●0564b3c
+● 0564b3c
 ```
-폭 120 이상에서만 한 줄로:
+폭 114 이상에서만 한 줄로:
 ```text
-main  ●3697851───●4ae9936───●86900ce───●df77b3d───●a0afce4───●8e4e382───●c1bb9f9───●b6421fd───●cdf1fdb───●0564b3c
+main  ● 3697851──● 4ae9936──● 86900ce──● df77b3d──● a0afce4──● 8e4e382──● c1bb9f9──● b6421fd──● cdf1fdb──● 0564b3c
 ```
 (dg는 README에 명시된 대로 `type:`/`tag:` 필드를 렌더링 시 무시하므로, 두 레이아웃 모두 위 소스의 태그 4개가 반영되지 않는다 — 계보 트랙과 커밋 점·id만 그린다. "태그가 안 보이는 것"은 회귀가 아니다.)
 

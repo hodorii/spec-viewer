@@ -1,9 +1,9 @@
 {
   "feature_name": "spec-viewer-editor-mode",
   "created_at": "2026-09-23T23:31:41Z",
-  "updated_at": "2026-09-24T00:49:11Z",
+  "updated_at": "2026-09-24T10:24:00Z",
   "language": "ko",
-  "phase": "tasks-approved",
+  "phase": "completed",
   "approvals": {
     "requirements": {
       "generated": true,

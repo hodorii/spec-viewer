@@ -15,7 +15,7 @@ use crate::markdown::Rendered;
 use crate::spec::{FsEntry, NodeId, SortKey, TreeSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tui_tree_widget::{TreeItem, TreeState};
 
@@ -382,6 +382,12 @@ impl AppState {
 pub enum Control {
     Continue,
     Quit,
+    /// Requirement 1.1: `main` (task 2.x) consumes this to suspend the
+    /// terminal and launch an editor against the given path. The reducer
+    /// itself never touches the terminal or spawns a process -- it only
+    /// decides *whether* an edit should happen (`current_editable_path`)
+    /// and hands the path back for `main` to act on.
+    EditFile(PathBuf),
 }
 
 /// All inputs the reducer can react to.
@@ -400,6 +406,15 @@ pub enum Action {
     /// this action rather than assigning `state.tree_mode` directly.
     SetTreeMode(TreeMode),
     Quit,
+    /// Requirement 1.1: the edit key was pressed. Whether this actually
+    /// starts an edit depends on what the doc panel is currently showing --
+    /// see `current_editable_path`.
+    Edit,
+    /// Requirements 4.1 (editor command could not be launched) and 4.2
+    /// (editor exited with a non-zero status): `main` (task 2.x) reports
+    /// the failure back through this action after the terminal is restored,
+    /// carrying the message to show the user.
+    EditFailed(String),
 }
 
 /// The single state-transition entry point (design.md "app — State &
@@ -440,6 +455,34 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             Control::Continue
         }
         Action::Key(key) => handle_key(state, key),
+        Action::Edit => match current_editable_path(state) {
+            Some(path) => Control::EditFile(path.to_path_buf()),
+            None => {
+                state.popup = Some(Popup::Message("편집할 파일이 없습니다".to_string()));
+                Control::Continue
+            }
+        },
+        Action::EditFailed(msg) => {
+            state.popup = Some(Popup::Message(msg));
+            Control::Continue
+        }
+    }
+}
+
+/// Requirements 1.1, 1.3: the file `Action::Edit` may open, if any. Only
+/// `DocView::Rendered` names a real, currently-displayed file on disk --
+/// every other variant (empty panel, a spec's definition summary, or one of
+/// the four "can't show this doc" error states) has no single editable file
+/// backing it, so `Action::Edit` must decline rather than guess.
+fn current_editable_path(state: &AppState) -> Option<&Path> {
+    match &state.doc {
+        DocView::Rendered { path, .. } => Some(path),
+        DocView::Empty
+        | DocView::Definition { .. }
+        | DocView::Missing(_)
+        | DocView::Deleted(_)
+        | DocView::ReadError { .. }
+        | DocView::MetaError { .. } => None,
     }
 }
 
@@ -893,6 +936,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
             state.popup = Some(Popup::SearchInput(String::new()));
             Control::Continue
         }
+        // The `'e'` binding (requirement 1.1/1.3): route through `update`
+        // itself rather than duplicating `Action::Edit`'s
+        // `current_editable_path`/popup logic here (SSoT) -- this is the
+        // bridge from the keymap's `"edit"` string to that variant that a
+        // real keypress needs; nothing else constructs `Action::Edit`.
+        "edit" => update(state, Action::Edit),
         _ => Control::Continue,
     }
 }
@@ -2994,5 +3043,107 @@ mod reducer_tests {
         assert!(state.tree_search.matches.is_empty());
         assert_eq!(state.tree_search.current, None);
         assert_eq!(state.tree_search.query, "zzz-nonexistent");
+    }
+
+    // --- task 1.1: `Action::Edit` / `current_editable_path` ---------------
+
+    /// Verify-completion regression (requirement 1.1): every other test in
+    /// this section drives `Action::Edit` directly, which never proves the
+    /// real `'e'` keypress -- `Action::Key(KeyCode::Char('e'))`, exactly what
+    /// `run_loop` constructs from a live crossterm event -- actually reaches
+    /// it through `handle_key`'s `keymap::action_for_key` string dispatch.
+    /// It didn't (`"edit"` had no arm there, so it silently fell through to
+    /// the wildcard `Control::Continue`) until this test caught it.
+    #[test]
+    fn e_keypress_reaches_action_edit_through_the_real_key_dispatch_path() {
+        let mut state = test_state();
+        let path = PathBuf::from("/tmp/spec-viewer-edit-test/requirements.md");
+        state.doc = DocView::Rendered {
+            path: path.clone(),
+            r: markdown::render("# hi\n", 80),
+            meta: FileInfo::default(),
+        };
+
+        let control = key_action(&mut state, KeyCode::Char('e'));
+
+        assert_eq!(control, Control::EditFile(path));
+    }
+
+    #[test]
+    fn edit_action_on_rendered_doc_returns_edit_file_control() {
+        let mut state = test_state();
+        let path = PathBuf::from("/tmp/spec-viewer-edit-test/requirements.md");
+        state.doc = DocView::Rendered {
+            path: path.clone(),
+            r: markdown::render("# hi\n", 80),
+            meta: FileInfo::default(),
+        };
+
+        let control = update(&mut state, Action::Edit);
+
+        assert_eq!(control, Control::EditFile(path));
+        assert_eq!(state.popup, None);
+    }
+
+    /// Requirement 1.3: every non-`Rendered` `DocView` state -- the empty
+    /// panel, a spec's definition summary, and the four "can't show this
+    /// doc" error states -- has no single file for `Action::Edit` to open,
+    /// so all six must decline the same way: no `Control::EditFile`, and a
+    /// status-bar message explaining why.
+    #[test]
+    fn edit_action_on_non_editable_doc_views_declines_with_a_status_message() {
+        let doc_views: Vec<(&str, DocView)> = vec![
+            ("Empty", DocView::Empty),
+            (
+                "Definition",
+                DocView::Definition {
+                    spec: "sample-signup".to_string(),
+                    text: markdown::render("# def\n", 80),
+                },
+            ),
+            ("Missing", DocView::Missing(PathBuf::from("missing.md"))),
+            ("Deleted", DocView::Deleted(PathBuf::from("deleted.md"))),
+            (
+                "ReadError",
+                DocView::ReadError {
+                    path: PathBuf::from("unreadable.md"),
+                    msg: "permission denied".to_string(),
+                },
+            ),
+            (
+                "MetaError",
+                DocView::MetaError {
+                    spec: "sample-signup".to_string(),
+                    msg: "malformed spec.json".to_string(),
+                },
+            ),
+        ];
+
+        for (label, doc_view) in doc_views {
+            let mut state = test_state();
+            state.doc = doc_view;
+
+            let control = update(&mut state, Action::Edit);
+
+            assert_eq!(control, Control::Continue, "{label}: expected Continue");
+            assert_eq!(
+                state.popup,
+                Some(Popup::Message("편집할 파일이 없습니다".to_string())),
+                "{label}: expected the no-editable-file status message"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_failed_action_puts_the_message_straight_into_the_popup() {
+        let mut state = test_state();
+
+        let control = update(&mut state, Action::EditFailed("editor exited with error".to_string()));
+
+        assert_eq!(control, Control::Continue);
+        assert_eq!(
+            state.popup,
+            Some(Popup::Message("editor exited with error".to_string()))
+        );
     }
 }

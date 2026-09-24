@@ -18,7 +18,7 @@
 //! terminal, is verified by a separate manual check outside this test suite
 //! (see this task's Status Report CONCERNS).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use clap::{Parser, ValueEnum};
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,11 @@ pub struct Args {
     /// `builtin`'s shared-vertical-bus (requirement 5.20).
     #[arg(long = "diagram-engine", default_value = DEFAULT_DIAGRAM_ENGINE)]
     diagram_engine: String,
+    /// Editor command used for the edit-mode hotkey (`run_loop` ->
+    /// `handle_edit_file`); takes priority over `$VISUAL`/`$EDITOR`/`vi`
+    /// (requirement 2.1, `resolve_editor`).
+    #[arg(long = "editor")]
+    editor: Option<String>,
 }
 
 /// Why [`resolve_startup`] refused to start. Both variants exit with the
@@ -198,6 +203,8 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut spec_viewer::app::AppState,
     rx: &std::sync::mpsc::Receiver<spec_viewer::watch::FsEvent>,
+    mouse_capture_enabled: bool,
+    cli_editor: Option<&str>,
 ) -> std::io::Result<()> {
     // Draw once before waiting on any event: without this, the screen stays
     // blank until the first keypress or fs event arrives, since every draw
@@ -232,6 +239,13 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             // and rendering once reflects the batch's final state instead.
             let mut quit = false;
             let mut applied_any = false;
+            // Set when a raw event's reducer call returns
+            // `Control::EditFile` -- the drain loop stops immediately (any
+            // other raw events still queued in this same batch predate
+            // opening the editor, so they're stale and safe to drop) and the
+            // path is handed to `handle_edit_file` once this batch's own
+            // draw (below) has happened.
+            let mut edit_file: Option<PathBuf> = None;
             loop {
                 let action = match crossterm::event::read()? {
                     crossterm::event::Event::Key(k) => spec_viewer::app::Action::Key(k),
@@ -245,9 +259,16 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                     }
                 };
                 applied_any = true;
-                if spec_viewer::app::update(state, action) == spec_viewer::app::Control::Quit {
-                    quit = true;
-                    break;
+                match spec_viewer::app::update(state, action) {
+                    spec_viewer::app::Control::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    spec_viewer::app::Control::EditFile(path) => {
+                        edit_file = Some(path);
+                        break;
+                    }
+                    spec_viewer::app::Control::Continue => {}
                 }
                 if !crossterm::event::poll(std::time::Duration::ZERO)? {
                     break;
@@ -258,6 +279,13 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             }
             if quit {
                 break;
+            }
+            if let Some(path) = edit_file {
+                let control =
+                    handle_edit_file(terminal, state, path, cli_editor, mouse_capture_enabled)?;
+                if control == spec_viewer::app::Control::Quit {
+                    break;
+                }
             }
         } else if state.auto_scroll.is_some() {
             // Poll timed out with no input at all -- deliver a Tick so
@@ -277,6 +305,153 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         }
     }
     Ok(())
+}
+
+/// Picks the editor command by priority (`--editor` > `$VISUAL` > `$EDITOR`
+/// > `"vi"`, requirements 2.1-2.4) and tokenizes it on whitespace (e.g.
+/// `"code -w"` -> `["code", "-w"]`); `tokens[0]` is the executable,
+/// `tokens[1..]` are fixed arguments the caller passes to `Command` ahead of
+/// the file path (research.md: no shell is involved, so quoted multi-word
+/// arguments are out of scope).
+pub fn resolve_editor(cli_editor: Option<&str>) -> Vec<String> {
+    let chosen = cli_editor
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".to_string());
+
+    chosen.split_whitespace().map(|s| s.to_string()).collect()
+}
+
+/// Outcome of [`run_editor`]: whether the caller ([`handle_edit_file`])
+/// should treat this as a successful edit (reload/redraw path, requirement
+/// 3.1/3.3's territory) or a failure to surface to the user (requirement
+/// 4.1, 4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// The editor process ran and exited with a success status.
+    Reloaded,
+    /// The editor could not be launched, or exited with a failure status;
+    /// the `String` is a user-facing message (requirement 4.1, 4.2).
+    Failed(String),
+}
+
+/// Suspends the terminal (mirrors `main()`'s own mouse-capture/raw-mode/alt-
+/// screen setup and teardown, requirement 1.2, 5.1, 5.2), runs the resolved
+/// editor (requirement 2.1-2.4 via [`resolve_editor`]) against `path`
+/// without a shell (research.md), waits for it to exit, then restores the
+/// terminal and forces a full repaint via `terminal.clear()`.
+///
+/// The terminal-state toggles (`enable_raw_mode`/`disable_raw_mode`,
+/// `EnterAlternateScreen`/`LeaveAlternateScreen`, mouse capture) are
+/// best-effort: like `main()`'s own `mouse_capture_enabled` handling, a
+/// `Result::Err` here (routine outside a real tty, e.g. under `TestBackend`
+/// in this crate's own test suite) is silently ignored rather than
+/// panicking -- this function must keep running the child process and
+/// deciding the `EditOutcome` even when those calls fail.
+fn run_editor<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    path: &Path,
+    cli_editor: Option<&str>,
+    mouse_capture_enabled: bool,
+) -> EditOutcome {
+    let tokens = resolve_editor(cli_editor);
+    let Some(program) = tokens.first() else {
+        return EditOutcome::Failed("resolved editor command is empty".to_string());
+    };
+    let fixed_args = &tokens[1..];
+
+    if mouse_capture_enabled {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    let spawn_status = std::process::Command::new(program)
+        .args(fixed_args)
+        .arg(path)
+        .status();
+
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    if mouse_capture_enabled {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    }
+
+    // Force a full redraw once control returns, regardless of outcome --
+    // whatever the editor drew over the alternate screen must not linger.
+    let _ = terminal.clear();
+
+    match spawn_status {
+        Ok(status) if status.success() => EditOutcome::Reloaded,
+        Ok(status) => EditOutcome::Failed(format!(
+            "editor '{}' exited with {}",
+            tokens.join(" "),
+            status
+        )),
+        Err(e) => EditOutcome::Failed(format!(
+            "failed to launch editor '{}': {}",
+            tokens.join(" "),
+            e
+        )),
+    }
+}
+
+/// Consumes a `Control::EditFile(path)` returned from the reducer
+/// (design.md: "`run_loop` 안에서 `Control::EditFile(path)` 수신 시 ...
+/// `run_editor` 호출 -> `EditOutcome`에 따라 `step()`으로 `Action::EditFailed`
+/// / `Action::Fs` 디스패치"): runs the resolved editor via [`run_editor`],
+/// then dispatches its outcome back into the reducer.
+///
+/// - `EditOutcome::Failed(msg)` -> `Action::EditFailed(msg)` (requirements
+///   4.1, 4.2), which `step` both applies and redraws for.
+/// - `EditOutcome::Reloaded` while `state.watch == WatchStatus::Live` ->
+///   `Action::Fs` for `path` (requirement 3.1), reusing the same full-resync
+///   reducer path a live filesystem-watch event takes -- again via `step`,
+///   which redraws.
+/// - `EditOutcome::Reloaded` while watch is `Manual` -> no further `Action`
+///   at all (requirement 3.2: manual refresh only, no auto-reload), but the
+///   screen must still be redrawn explicitly here: `run_editor` leaves the
+///   terminal's buffer blank (its own `terminal.clear()`, needed regardless
+///   of outcome so nothing the editor drew lingers), and neither `step` nor
+///   any other call in this branch would otherwise paint the viewer's own
+///   frame back over it (requirement 1.2's "화면은 항상 다시 그려진다").
+///
+/// Deliberately factored out of `run_loop` itself: this function never polls
+/// or reads a `crossterm::event`, so unlike `run_loop` (which blocks on the
+/// real tty and has no test in this suite for that reason -- see this file's
+/// module doc comment) it can be driven directly from a `TestBackend` plus a
+/// fake-editor script (the same pattern `run_editor`'s own tests use).
+///
+/// Generic over plain `Backend` (like [`step`], not pinned to
+/// `Backend<Error = std::io::Error>` the way `run_loop` itself is) precisely
+/// so a `TestBackend` (`Error = Infallible`) can drive it directly in tests;
+/// `run_loop`'s own `B::Error = std::io::Error` bound makes its `?` on this
+/// function's result a no-op conversion.
+fn handle_edit_file<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &mut spec_viewer::app::AppState,
+    path: PathBuf,
+    cli_editor: Option<&str>,
+    mouse_capture_enabled: bool,
+) -> Result<spec_viewer::app::Control, B::Error> {
+    match run_editor(terminal, &path, cli_editor, mouse_capture_enabled) {
+        EditOutcome::Failed(msg) => {
+            step(terminal, state, spec_viewer::app::Action::EditFailed(msg))
+        }
+        EditOutcome::Reloaded => {
+            if state.watch == spec_viewer::app::WatchStatus::Live {
+                step(
+                    terminal,
+                    state,
+                    spec_viewer::app::Action::Fs(spec_viewer::watch::FsEvent { paths: vec![path] }),
+                )
+            } else {
+                terminal.draw(|f| spec_viewer::ui::render(f, state))?;
+                Ok(spec_viewer::app::Control::Continue)
+            }
+        }
+    }
 }
 
 /// What kind of tree source startup resolved to, plus everything `main()`
@@ -440,7 +615,13 @@ fn main() {
 
     // `watch` (holding the live Debouncer, if any) must outlive the loop
     // below -- dropping it early silently stops filesystem watching.
-    let run_result = run_loop(&mut terminal, &mut state, &rx);
+    let run_result = run_loop(
+        &mut terminal,
+        &mut state,
+        &rx,
+        mouse_capture_enabled,
+        args.editor.as_deref(),
+    );
 
     drop(watch);
     if mouse_capture_enabled {
@@ -485,6 +666,7 @@ mod tests {
             tree: TreeMode::Auto,
             sort: SortArg::Name,
             diagram_engine: "builtin".to_string(),
+            editor: None,
         }
     }
 
@@ -1271,5 +1453,743 @@ gamma trailing line
         let control = step(&mut terminal, &mut state, spec_viewer::app::Action::Key(key(KeyCode::Char('q'))))
             .expect("step should succeed");
         assert_eq!(control, spec_viewer::app::Control::Quit);
+    }
+
+    // --- task 3.1: resolve_editor priority + tokenization -------------------
+
+    /// Serializes tests that mutate `$VISUAL`/`$EDITOR` -- these are
+    /// process-global, and while the validation command for this file asks
+    /// for `--test-threads=1`, this guard keeps the tests correct even
+    /// without that flag (e.g. under a default parallel `cargo test`).
+    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes every test in this file that can make `run_editor` (or
+    /// `handle_edit_file`, which calls it) write real ANSI escape sequences
+    /// to the process's actual stdout (fd 1) -- `run_editor` does this
+    /// unconditionally (`LeaveAlternateScreen`/`EnterAlternateScreen`, raw
+    /// mode) and conditionally (`EnableMouseCapture`/`DisableMouseCapture`
+    /// when `mouse_capture_enabled`), regardless of the `TestBackend` these
+    /// tests otherwise use. Under a default parallel `cargo test` (this
+    /// repo's `Makefile` `test:` target has no `--test-threads=1`), two such
+    /// tests running concurrently write to the *same* real fd 1 at once;
+    /// task 5.4's own test additionally redirects fd 1 to a scratch file for
+    /// the duration of one `handle_edit_file` call to inspect exactly what
+    /// was written there -- without this lock, another thread's concurrent
+    /// escape-sequence writes could land in that same capture window (or in
+    /// the real terminal instead, if this lock's own critical section from a
+    /// *different* test is what's holding the redirect at that moment),
+    /// producing a flaky false positive/negative unrelated to the behavior
+    /// under test. Held for the *entire* body of every test that touches
+    /// `run_editor`/`handle_edit_file`, task 5.4's redirect-and-restore
+    /// section included, not just that section alone.
+    static STDOUT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard restoring whatever value (or absence) an env var had
+    /// before the test set/unset it, so one test's env mutation never
+    /// leaks into the next.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvVarGuard { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            EnvVarGuard { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_editor_prefers_cli_editor_over_env_vars() {
+        let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _visual = EnvVarGuard::set("VISUAL", "should-not-be-used");
+        let _editor = EnvVarGuard::set("EDITOR", "should-not-be-used-either");
+
+        // Also covers tokenization: "code -w" -> ["code", "-w"] (requirement
+        // 2.1, research.md's whitespace-split rule).
+        assert_eq!(
+            resolve_editor(Some("code -w")),
+            vec!["code".to_string(), "-w".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_editor_uses_visual_when_no_cli_editor_is_given() {
+        let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _visual = EnvVarGuard::set("VISUAL", "nano");
+        let _editor = EnvVarGuard::unset("EDITOR");
+
+        assert_eq!(resolve_editor(None), vec!["nano".to_string()]);
+    }
+
+    #[test]
+    fn resolve_editor_uses_editor_when_no_cli_editor_or_visual_is_given() {
+        let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _visual = EnvVarGuard::unset("VISUAL");
+        let _editor = EnvVarGuard::set("EDITOR", "emacs -nw");
+
+        assert_eq!(
+            resolve_editor(None),
+            vec!["emacs".to_string(), "-nw".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_editor_falls_back_to_vi_when_nothing_is_configured() {
+        let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _visual = EnvVarGuard::unset("VISUAL");
+        let _editor = EnvVarGuard::unset("EDITOR");
+
+        assert_eq!(resolve_editor(None), vec!["vi".to_string()]);
+    }
+
+    // --- task 3.2: --editor CLI option ---------------------------------------
+
+    #[test]
+    fn cli_parses_the_editor_option_into_args_editor() {
+        let args = Args::try_parse_from(["m", "--editor", "code -w"]).expect("should parse");
+        assert_eq!(args.editor.as_deref(), Some("code -w"));
+    }
+
+    #[test]
+    fn cli_editor_option_defaults_to_none_when_not_given() {
+        let args = Args::try_parse_from(["m"]).expect("should parse");
+        assert_eq!(args.editor, None);
+    }
+
+    // --- task 3.3/3.4: run_editor spawns and waits on a real child process --
+
+    /// Writes a "fake editor" shell script to a scratch dir and marks it
+    /// executable, so the test suite exercises `run_editor`'s real
+    /// `Command::spawn`/`wait` path without depending on any real editor
+    /// (`vi`/`code`/...) being installed (3.3's DONE text: "즉시 정상 종료
+    /// 하는 테스트 전용 가짜 에디터 스크립트").
+    fn write_fake_editor(name: &str, script_body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir(&format!("fake_editor_{name}"));
+        let script_path = dir.join("fake-editor.sh");
+        fs::write(&script_path, script_body).expect("write fake editor script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake editor script");
+        script_path
+    }
+
+    #[test]
+    fn run_editor_returns_reloaded_when_the_editor_exits_successfully() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = write_fake_editor("success", "#!/bin/sh\nexit 0\n");
+        let target_dir = scratch_dir("run_editor_success_target");
+        let target = target_dir.join("doc.md");
+        fs::write(&target, "hello").unwrap();
+
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let outcome = run_editor(&mut terminal, &target, Some(script.to_str().unwrap()), true);
+        assert_eq!(outcome, EditOutcome::Reloaded);
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&target_dir).ok();
+    }
+
+    #[test]
+    fn run_editor_completes_without_reenabling_mouse_capture_that_was_already_off() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 3.3's DONE text: "진입 시점에 마우스 캡처가 이미 꺼져 있던 경우
+        // 복귀 후에도 켜지지 않는 것까지 같은 테스트로 확인" -- outside a
+        // real tty there is no process-observable mouse-capture state to
+        // assert on (see this file's module doc comment and this task's
+        // design.md adjustment), so what this test mechanically pins down
+        // is the input/output contract: passing `mouse_capture_enabled =
+        // false` must not panic (i.e. `run_editor` never unconditionally
+        // calls `EnableMouseCapture`) and must still resolve to the correct
+        // `EditOutcome`. `EnableMouseCapture`/`DisableMouseCapture` are
+        // both gated behind `if mouse_capture_enabled` in `run_editor`'s
+        // implementation, mirroring `main()`'s own gating.
+        let script = write_fake_editor("mouse_off", "#!/bin/sh\nexit 0\n");
+        let target_dir = scratch_dir("run_editor_mouse_off_target");
+        let target = target_dir.join("doc.md");
+        fs::write(&target, "hello").unwrap();
+
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let outcome = run_editor(&mut terminal, &target, Some(script.to_str().unwrap()), false);
+        assert_eq!(outcome, EditOutcome::Reloaded);
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&target_dir).ok();
+    }
+
+    #[test]
+    fn run_editor_returns_failed_when_the_command_does_not_exist() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target_dir = scratch_dir("run_editor_missing_target");
+        let target = target_dir.join("doc.md");
+        fs::write(&target, "hello").unwrap();
+
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let outcome = run_editor(
+            &mut terminal,
+            &target,
+            Some("definitely-not-a-real-editor-binary-xyz"),
+            true,
+        );
+
+        match outcome {
+            EditOutcome::Failed(message) => {
+                assert!(
+                    message.contains("definitely-not-a-real-editor-binary-xyz"),
+                    "message should name the failed command: {message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&target_dir).ok();
+    }
+
+    #[test]
+    fn run_editor_returns_failed_with_a_distinct_message_when_the_editor_exits_nonzero() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = write_fake_editor("nonzero", "#!/bin/sh\nexit 7\n");
+        let target_dir = scratch_dir("run_editor_nonzero_target");
+        let target = target_dir.join("doc.md");
+        fs::write(&target, "hello").unwrap();
+
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let outcome = run_editor(&mut terminal, &target, Some(script.to_str().unwrap()), true);
+
+        match outcome {
+            EditOutcome::Failed(message) => {
+                assert!(
+                    message.contains("exited"),
+                    "nonzero-exit message should read differently from a launch failure: {message}"
+                );
+                assert!(
+                    !message.contains("definitely-not-a-real-editor-binary-xyz"),
+                    "message should not be the launch-failure message: {message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&target_dir).ok();
+    }
+
+    // --- task 4: handle_edit_file wires Control::EditFile end to end -------
+
+    #[test]
+    fn handle_edit_file_reloads_doc_via_action_fs_when_watch_is_live() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("edit_live");
+        write_requirements_spec(&root, "demo", "# Before\n\noriginal content\n");
+        let target = root.join("specs/demo/requirements.md");
+
+        let mut state = build_state_from(&root, (120, 40));
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+
+        let script = write_fake_editor(
+            "reload_live",
+            "#!/bin/sh\ncat > \"$1\" <<'EOF'\n# After\n\nupdated content\nEOF\nexit 0\n",
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            target.clone(),
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        match &state.doc {
+            DocView::Rendered { r, .. } => {
+                assert!(
+                    r.plain.iter().any(|l| l.contains("updated content")),
+                    "expected the doc to reload the editor's write, got: {:?}",
+                    r.plain
+                );
+            }
+            other => panic!("expected Rendered doc, got {other:?}"),
+        }
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn handle_edit_file_skips_reload_but_still_redraws_when_watch_is_manual() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("edit_manual");
+        write_requirements_spec(&root, "demo", "# Before\n\noriginal content\n");
+        let target = root.join("specs/demo/requirements.md");
+
+        // Wide enough that the status bar's full "path · file-info · % ·
+        // watch off" line (this scratch path is long) fits without the
+        // trailing "watch off" segment getting clipped by the `Paragraph`'s
+        // own width-based truncation -- narrower widths below made this
+        // test flap on the exact string it's trying to observe.
+        let size = (240, 40);
+        let mut state = build_state_from(&root, size);
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        state.watch = spec_viewer::app::WatchStatus::Manual {
+            reason: "--no-watch".to_string(),
+        };
+
+        let script = write_fake_editor(
+            "reload_manual",
+            "#!/bin/sh\ncat > \"$1\" <<'EOF'\n# After\n\nmanual updated content\nEOF\nexit 0\n",
+        );
+
+        let backend = TestBackend::new(size.0, size.1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            target.clone(),
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        // Requirement 3.2: no auto-reload under Manual watch -- the doc panel
+        // keeps showing the pre-edit content even though the file on disk
+        // changed underneath it.
+        match &state.doc {
+            DocView::Rendered { r, .. } => {
+                assert!(
+                    r.plain.iter().any(|l| l.contains("original content")),
+                    "expected the doc to still show pre-edit content, got: {:?}",
+                    r.plain
+                );
+                assert!(
+                    !r.plain.iter().any(|l| l.contains("manual updated content")),
+                    "expected no auto-reload under Manual watch, got: {:?}",
+                    r.plain
+                );
+            }
+            other => panic!("expected Rendered doc, got {other:?}"),
+        }
+
+        // "화면은 항상 다시 그려진다" (requirement 1.2): `run_editor` leaves the
+        // terminal buffer blank via its own `terminal.clear()`, and the
+        // Manual branch sends no further `step`/`Action` -- so this must
+        // still draw explicitly, or the buffer would stay blank instead of
+        // showing the real frame (e.g. the "watch off" status-bar segment
+        // Manual watch renders).
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            buffer_contains(&buffer, "watch off"),
+            "expected a real redrawn frame (with the Manual watch-off status segment) after handle_edit_file, not a blank post-clear buffer"
+        );
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn handle_edit_file_surfaces_edit_failed_popup_when_the_editor_fails() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("edit_failed");
+        write_requirements_spec(&root, "demo", "# Before\n\noriginal content\n");
+        let target = root.join("specs/demo/requirements.md");
+
+        let mut state = build_state_from(&root, (120, 40));
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            target.clone(),
+            Some("definitely-not-a-real-editor-binary-xyz"),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        match &state.popup {
+            Some(Popup::Message(msg)) => {
+                assert!(
+                    msg.contains("definitely-not-a-real-editor-binary-xyz"),
+                    "expected the EditFailed message to name the failed command: {msg}"
+                );
+            }
+            other => panic!("expected Some(Popup::Message(_)), got {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- task 5: E2E -- Action::Edit through handle_edit_file, full pipeline
+    //
+    // Unlike task 4's tests above (which call `handle_edit_file` directly
+    // with a hand-picked path), each scenario here first drives
+    // `spec_viewer::app::update(&mut state, Action::Edit)` -- the exact call
+    // `run_loop`'s key-read branch makes once the `'e'` keymap binding
+    // decodes to `Action::Edit` -- and only then feeds the `Control::EditFile`
+    // path it returns into `handle_edit_file`, so the whole "키 입력 -> 편집
+    // 대상 판정 -> 에디터 실행 -> 반영" pipeline is exercised end to end, not
+    // just its tail half.
+
+    #[test]
+    fn e2e_live_watch_auto_reflects_saved_edit_through_the_action_edit_pipeline() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Task 5.1 / requirement 3.1: a real temp `.kiro` tree + a fake
+        // editor script that actually rewrites the file on disk, driven
+        // through `Action::Edit` -> `Control::EditFile` -> `handle_edit_file`,
+        // must show the new content on the very next frame with no separate
+        // refresh key.
+        let root = temp_kiro_root("e2e_live_saved");
+        write_requirements_spec(&root, "e2e-demo", "# Doc\n\nORIGINAL_MARKER_TEXT\n");
+        let target = root.join("specs/e2e-demo/requirements.md");
+
+        let mut state = build_state_from(&root, (120, 40)); // WatchStatus::Live
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        // Drive the real entry point: this is what turns the `'e'` keymap
+        // binding into a `Control::EditFile(path)` for `run_loop` to act on.
+        let path = match spec_viewer::app::update(&mut state, Action::Edit) {
+            spec_viewer::app::Control::EditFile(path) => path,
+            other => panic!("expected Control::EditFile from Action::Edit, got {other:?}"),
+        };
+        assert_eq!(path, target);
+
+        let script = write_fake_editor(
+            "e2e_live_saved",
+            "#!/bin/sh\necho 'UPDATED_MARKER_TEXT' > \"$1\"\nexit 0\n",
+        );
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            path,
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        // `handle_edit_file`'s own Live/Reloaded branch already dispatches
+        // `Action::Fs` via `step` (update + draw) internally -- the screen is
+        // already showing the reloaded content by the time this call
+        // returns, with no further key input or explicit draw needed here
+        // (tasks.md 5.1's "별도 새로고침 키 입력 없이").
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            find_text_cell(&buffer, "UPDATED_MARKER_TEXT").is_some(),
+            "expected the auto-reloaded content visible on the very next frame"
+        );
+        assert!(
+            find_text_cell(&buffer, "ORIGINAL_MARKER_TEXT").is_none(),
+            "expected the pre-edit marker to be gone once auto-reload has happened"
+        );
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn e2e_no_watch_manual_status_skips_auto_reload_and_shows_watch_off_guidance() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Task 5.2 / requirement 3.2: same scenario as 5.1, but with
+        // `WatchStatus::Manual` (what `--no-watch` produces at startup) --
+        // the fake editor still rewrites the file on disk, but the doc panel
+        // must keep showing pre-edit content, and the status bar must carry
+        // the manual-refresh guidance (`ui::status_bar`'s "watch off"
+        // segment, the only such guidance requirement 7.6 wires up).
+        //
+        // `AppState::new` is called directly here (not via `build_state_from`,
+        // which hardcodes `WatchStatus::Live`) to get `Manual` instead --
+        // per the brief, that shared helper is left untouched so the other
+        // tests using it keep their existing behavior.
+        //
+        // Width 240 (not the 120 most other scenarios here use): task 4's
+        // review found the status bar's full "path · file-info · % · watch
+        // off" line gets clipped by the `Paragraph`'s width-based truncation
+        // on a narrower terminal, which would make the "watch off" assertion
+        // below flap on terminal width rather than on real behavior.
+        let root = temp_kiro_root("e2e_manual_saved");
+        write_requirements_spec(&root, "e2e-demo", "# Doc\n\nORIGINAL_MARKER_TEXT\n");
+        let target = root.join("specs/e2e-demo/requirements.md");
+
+        let size = (240, 40);
+        let snapshot = spec_viewer::app::load_snapshot(&root);
+        let spec_root = spec_viewer::spec::build(&snapshot);
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Kiro(spec_root),
+            root.clone(),
+            size,
+            spec_viewer::app::WatchStatus::Manual {
+                reason: "--no-watch".to_string(),
+            },
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+
+        let backend = TestBackend::new(size.0, size.1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let path = match spec_viewer::app::update(&mut state, Action::Edit) {
+            spec_viewer::app::Control::EditFile(path) => path,
+            other => panic!("expected Control::EditFile from Action::Edit, got {other:?}"),
+        };
+
+        let script = write_fake_editor(
+            "e2e_manual_saved",
+            "#!/bin/sh\necho 'UPDATED_MARKER_TEXT' > \"$1\"\nexit 0\n",
+        );
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            path,
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            find_text_cell(&buffer, "ORIGINAL_MARKER_TEXT").is_some(),
+            "expected the doc panel to still show pre-edit content under --no-watch"
+        );
+        assert!(
+            find_text_cell(&buffer, "UPDATED_MARKER_TEXT").is_none(),
+            "expected no auto-reload under --no-watch even though the file changed on disk"
+        );
+        assert!(
+            buffer_contains(&buffer, "watch off"),
+            "expected the status bar's manual-refresh guidance ('watch off') to be visible"
+        );
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn e2e_editor_exits_without_saving_leaves_doc_content_unchanged() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Task 5.3 / requirement 3.3: live watch, but the fake editor exits
+        // clean without touching the target file at all -- the doc panel's
+        // content must remain exactly what it was before the edit, whether
+        // or not `Action::Fs` ends up dispatched (it does, on `Reloaded`,
+        // but reloading unchanged content is a no-op the doc panel should
+        // show as unchanged either way).
+        let root = temp_kiro_root("e2e_no_save");
+        write_requirements_spec(&root, "e2e-demo", "# Doc\n\nORIGINAL_MARKER_TEXT\n");
+        let target = root.join("specs/e2e-demo/requirements.md");
+
+        let mut state = build_state_from(&root, (120, 40));
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let path = match spec_viewer::app::update(&mut state, Action::Edit) {
+            spec_viewer::app::Control::EditFile(path) => path,
+            other => panic!("expected Control::EditFile from Action::Edit, got {other:?}"),
+        };
+
+        // Deliberately leaves the target file untouched -- exits clean
+        // without writing anything (task 5.3: "저장하지 않고 종료").
+        let script = write_fake_editor("e2e_no_save", "#!/bin/sh\nexit 0\n");
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            path,
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            find_text_cell(&buffer, "ORIGINAL_MARKER_TEXT").is_some(),
+            "expected the doc content unchanged after exiting the editor without saving"
+        );
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// RAII guard for task 5.4's real-fd-1 redirection below: restores the
+    /// original fd 1 on drop (including on an assertion panic mid-test), so
+    /// a failure here never leaves the rest of the test process's stdout
+    /// pointed at a scratch file.
+    #[cfg(unix)]
+    struct StdoutFdGuard {
+        saved_fd: i32,
+    }
+
+    #[cfg(unix)]
+    impl StdoutFdGuard {
+        fn redirect_to(file: &fs::File) -> Self {
+            use std::os::unix::io::AsRawFd;
+            unsafe extern "C" {
+                fn dup(fd: i32) -> i32;
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+            }
+            let saved_fd = unsafe { dup(1) };
+            assert!(saved_fd >= 0, "failed to dup fd 1");
+            let result = unsafe { dup2(file.as_raw_fd(), 1) };
+            assert!(result >= 0, "failed to dup2 the capture file onto fd 1");
+            StdoutFdGuard { saved_fd }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StdoutFdGuard {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+                fn close(fd: i32) -> i32;
+            }
+            unsafe {
+                dup2(self.saved_fd, 1);
+                close(self.saved_fd);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn e2e_mouse_capture_already_off_before_edit_stays_off_after_returning() {
+        // Task 5.4 / requirement 5.1: a session that entered edit mode with
+        // mouse capture already disabled (e.g. `EnableMouseCapture` failed at
+        // startup, requirement 9.8) must not have it silently re-enabled once
+        // the editor returns.
+        //
+        // `run_editor`'s `EnableMouseCapture`/`DisableMouseCapture` calls
+        // write real ANSI bytes to the process's actual stdout (fd 1) via
+        // `crossterm::execute!(std::io::stdout(), ...)`, not into any
+        // `TestBackend` buffer -- this file's own module doc comment already
+        // establishes that real terminal I/O like this has no
+        // `TestBackend`-buffer equivalent to assert against. The only way to
+        // mechanically observe (or fail to observe) those bytes is to
+        // redirect the real fd 1 to a file for the duration of the call and
+        // inspect it afterward. `dup`/`dup2`/`close` are declared directly
+        // here rather than adding a `libc` Cargo dependency (research.md:
+        // no new external libraries) -- every Rust binary already links
+        // against libc, so this introduces nothing new.
+        //
+        // crossterm 0.29's `EnableMouseCapture::write_ansi` (src/event.rs)
+        // writes `"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h"`;
+        // this test looks for the first of those five sequences.
+        //
+        // Held for this entire test, the fd-1 redirect-and-restore section
+        // (`StdoutFdGuard::redirect_to` through its `Drop`) included: any
+        // other test in this file concurrently writing real ANSI bytes to
+        // fd 1 while it is redirected here would land in this test's own
+        // capture file instead, and any such test running while *this* test
+        // holds the redirect would have its bytes silently swallowed into
+        // that same file rather than reaching the real terminal.
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("e2e_mouse_off");
+        write_requirements_spec(&root, "e2e-demo", "# Doc\n\nORIGINAL_MARKER_TEXT\n");
+        let target = root.join("specs/e2e-demo/requirements.md");
+
+        let mut state = build_state_from(&root, (120, 40));
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let path = match spec_viewer::app::update(&mut state, Action::Edit) {
+            spec_viewer::app::Control::EditFile(path) => path,
+            other => panic!("expected Control::EditFile from Action::Edit, got {other:?}"),
+        };
+
+        let script = write_fake_editor(
+            "e2e_mouse_off",
+            "#!/bin/sh\necho 'UPDATED_MARKER_TEXT' > \"$1\"\nexit 0\n",
+        );
+
+        let capture_path = root.join("stdout-capture.bin");
+        let capture_file = fs::File::create(&capture_path).expect("create capture file");
+        let control_result;
+        {
+            // Scoped so the fd-1 redirection is restored (via `Drop`) before
+            // this test reads the capture file back or makes any assertion.
+            let _fd_guard = StdoutFdGuard::redirect_to(&capture_file);
+            control_result = handle_edit_file(
+                &mut terminal,
+                &mut state,
+                path,
+                Some(script.to_str().unwrap()),
+                false, // mouse capture was already off entering edit mode
+            );
+        }
+
+        let control = control_result.expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        let captured = fs::read(&capture_path).unwrap_or_default();
+        let captured_text = String::from_utf8_lossy(&captured);
+        assert!(
+            !captured_text.contains("\x1b[?1000h"),
+            "expected no mouse-capture-enable escape sequence written to stdout when mouse \
+             capture was already off, got bytes: {captured:?}"
+        );
+
+        // Sanity: the rest of the pipeline still ran normally (doc reloaded,
+        // no panic) even with mouse capture disabled throughout -- without
+        // this, the escape-sequence assertion above could pass vacuously
+        // against a pipeline that silently did nothing at all.
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            find_text_cell(&buffer, "UPDATED_MARKER_TEXT").is_some(),
+            "expected the pipeline to still complete normally with mouse capture disabled"
+        );
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
     }
 }

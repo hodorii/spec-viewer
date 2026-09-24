@@ -936,6 +936,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
             state.popup = Some(Popup::SearchInput(String::new()));
             Control::Continue
         }
+        // The `'e'` binding (requirement 1.1/1.3): route through `update`
+        // itself rather than duplicating `Action::Edit`'s
+        // `current_editable_path`/popup logic here (SSoT) -- this is the
+        // bridge from the keymap's `"edit"` string to that variant that a
+        // real keypress needs; nothing else constructs `Action::Edit`.
+        "edit" => update(state, Action::Edit),
         _ => Control::Continue,
     }
 }
@@ -3040,6 +3046,28 @@ mod reducer_tests {
     }
 
     // --- task 1.1: `Action::Edit` / `current_editable_path` ---------------
+
+    /// Verify-completion regression (requirement 1.1): every other test in
+    /// this section drives `Action::Edit` directly, which never proves the
+    /// real `'e'` keypress -- `Action::Key(KeyCode::Char('e'))`, exactly what
+    /// `run_loop` constructs from a live crossterm event -- actually reaches
+    /// it through `handle_key`'s `keymap::action_for_key` string dispatch.
+    /// It didn't (`"edit"` had no arm there, so it silently fell through to
+    /// the wildcard `Control::Continue`) until this test caught it.
+    #[test]
+    fn e_keypress_reaches_action_edit_through_the_real_key_dispatch_path() {
+        let mut state = test_state();
+        let path = PathBuf::from("/tmp/spec-viewer-edit-test/requirements.md");
+        state.doc = DocView::Rendered {
+            path: path.clone(),
+            r: markdown::render("# hi\n", 80),
+            meta: FileInfo::default(),
+        };
+
+        let control = key_action(&mut state, KeyCode::Char('e'));
+
+        assert_eq!(control, Control::EditFile(path));
+    }
 
     #[test]
     fn edit_action_on_rendered_doc_returns_edit_file_control() {

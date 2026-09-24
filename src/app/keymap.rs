@@ -196,6 +196,11 @@ pub const BINDINGS: &[Binding] = &[
         action: "cycle_sort",
         help: "스펙 트리 정렬 키 순환 (이름 -> phase -> 최근 갱신 -> 진행률)",
     },
+    Binding {
+        keys: &[KeyCode::Char('e')],
+        action: "edit",
+        help: "문서 패널에 표시된 파일을 외부 에디터로 열기",
+    },
 ];
 
 /// Resolve a key event to a [`BINDINGS`] action name, ignoring modifiers —
@@ -267,5 +272,19 @@ mod tests {
         assert!(entries.iter().any(|(_, h)| h.contains("전환")));
         assert!(entries.iter().any(|(k, _)| k == "["));
         assert!(entries.iter().any(|(k, _)| k == "]"));
+    }
+
+    #[test]
+    fn edit_key_resolves_to_edit_action() {
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(action_for_key(key), Some("edit"));
+    }
+
+    #[test]
+    fn help_entries_cover_edit_key_and_its_description() {
+        let entries = help_entries();
+        assert!(entries
+            .iter()
+            .any(|(k, h)| k == "e" && h == "문서 패널에 표시된 파일을 외부 에디터로 열기"));
     }
 }

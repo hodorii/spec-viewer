@@ -34,12 +34,14 @@ Flags:
 - `--no-watch` — disable filesystem watching
 - `--log <path>` — write a log file (rejected if it resolves inside the `.kiro` root)
 - `--diagram-engine <dg|mdview|builtin>` — mermaid graph renderer (see below)
+- `--editor <command>` — external editor for `e` (overrides `$VISUAL`/`$EDITOR`; falls back to `vi`)
 
 Keys: `q` quit · `Tab` switch panel · `j`/`k` line scroll · `d`/`u` half-page ·
 `f`/`PageDown`, `b`/`PageUp` full page · `g`/`Home`, `G`/`End` top/bottom ·
 `[`/`]` prev/next heading · `/` search, `n`/`N` next/prev match · `t` table of
 contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/single) ·
-`s` cycle sort key · `?` help · arrow keys for tree/document navigation.
+`s` cycle sort key · `e` edit the displayed file in an external editor (`--editor` >
+`$VISUAL` > `$EDITOR` > `vi`) · `?` help · arrow keys for tree/document navigation.
 
 ## Diagram engines
 

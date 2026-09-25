@@ -1,13 +1,20 @@
 # spec-viewer
 
-A terminal UI (`m`) for browsing `.kiro/` spec directories: a tree panel of
-specs (with phase/progress badges) next to a rendered-markdown document
-panel, live-updated as files change on disk.
+A terminal UI (`m`) for browsing `.kiro/` or [GitHub spec-kit](https://github.com/github/spec-kit)
+(`.specify/`) spec directories: a tree panel of specs/features (with
+progress badges) next to a rendered-markdown document panel, live-updated
+as files change on disk.
+
+`.specify/` is auto-detected the same way `.kiro/` is (nearer marker wins;
+`.kiro` wins if both sit in the same directory), and both sources share the
+same progress-badge model — an `n/total` count of completed milestones
+(`.kiro`'s approval gates, or spec-kit's `spec.md`/`plan.md`/`tasks.md`
+presence).
 
 Built for the [Kiro-style spec-driven development](https://github.com/hodorii/agentic-psdd)
-workflow, but the `--all` mode drops the `.kiro` requirement entirely and
-browses any directory of markdown files, so it also works as a general
-terminal markdown viewer with mermaid diagram support.
+workflow, but the `--all` mode drops the `.kiro`/spec-kit requirement
+entirely and browses any directory of markdown files, so it also works as a
+general terminal markdown viewer with mermaid diagram support.
 
 ## Install
 

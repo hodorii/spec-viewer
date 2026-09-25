@@ -103,7 +103,10 @@ fn root_load_builds_all_fixture_specs_and_flags_broken_json() {
         .iter()
         .find(|s| s.name == "broken-json")
         .expect("broken-json spec present");
-    assert!(broken.meta.is_err(), "broken-json must have Err meta");
+    assert!(
+        matches!(broken.kiro_meta, Some(Err(_))),
+        "broken-json must have Err kiro_meta"
+    );
     let req = broken
         .docs
         .iter()
@@ -118,7 +121,7 @@ fn root_load_builds_all_fixture_specs_and_flags_broken_json() {
         .iter()
         .find(|s| s.name == "sample-signup")
         .expect("sample-signup spec present");
-    assert!(signup.meta.is_ok());
+    assert!(matches!(signup.kiro_meta, Some(Ok(_))));
 }
 
 // --- 2. non-UTF-8 (8.4) -------------------------------------------------------

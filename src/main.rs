@@ -502,6 +502,50 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
         });
     }
 
+    // Requirement 1.1-1.3: decide between `.kiro` and spec-kit before
+    // falling back to `resolve_startup`'s `.kiro`-only search. `find_root`
+    // and `spec_kit::find_spec_kit_root` are each independently searched
+    // from the same `start`; `find_spec_kit_root` already resolves same-
+    // directory coexistence in `.kiro`'s favor (requirement 1.2) by
+    // returning `None` in that case, so here only the "different levels"
+    // case needs an explicit tie-break.
+    let start = args
+        .path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let kiro_dir = spec_viewer::spec::find_root(&start);
+    let spec_kit_root = spec_viewer::spec::spec_kit::find_spec_kit_root(&start);
+
+    let prefer_spec_kit = match (&kiro_dir, &spec_kit_root) {
+        (None, Some(_)) => true,
+        (Some(kiro_dir), Some(spec_kit_root)) => {
+            // Recover the actual `.specify` marker path so both sides
+            // compare like-for-like (`kiro_dir` is already `.kiro` itself).
+            // Whichever marker sits deeper (more path components, i.e.
+            // closer to `start`) wins; an exact tie favors `.kiro`.
+            let specify_marker = spec_kit_root.join(".specify");
+            specify_marker.components().count() > kiro_dir.components().count()
+        }
+        _ => false,
+    };
+
+    if prefer_spec_kit {
+        let sk_root = spec_kit_root.expect("prefer_spec_kit implies Some(spec_kit_root)");
+        let specs_dir = sk_root.join("specs");
+        let features = spec_viewer::spec::spec_kit::build(&specs_dir);
+        return Ok(Startup {
+            source: spec_viewer::spec::TreeSource::SpecKit(features),
+            // The watch/scan root is `specs/` itself, not the whole
+            // project -- mirrors `.kiro` mode's `root` being the `.kiro`
+            // directory, not its parent.
+            root: specs_dir,
+            is_file: false,
+            // Requirement 1.6's file-view special case is `.kiro`-only
+            // (design.md Out-of-Scope for spec-kit).
+            file_view_path: None,
+        });
+    }
+
     let (root, log) = resolve_startup(args)?;
     // Accepted/validated (requirement 8.2); this task does not otherwise
     // consume the log destination.
@@ -756,7 +800,7 @@ mod tests {
                 // this is not just name order.
                 assert_eq!(names, vec!["z-spec", "a-spec"]);
             }
-            spec_viewer::spec::TreeSource::Files(_) => panic!("expected TreeSource::Kiro"),
+            _ => panic!("expected TreeSource::Kiro"),
         }
 
         fs::remove_dir_all(&root).ok();
@@ -785,9 +829,7 @@ mod tests {
                     tree.entries
                 );
             }
-            spec_viewer::spec::TreeSource::Kiro(_) => {
-                panic!("expected TreeSource::Files under --all")
-            }
+            _ => panic!("expected TreeSource::Files under --all"),
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -905,6 +947,134 @@ mod tests {
         }
 
         fs::remove_dir_all(leaf.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    // --- spec-viewer-spec-kit-support task 4: source priority (1.1-1.3) ---
+
+    /// Creates `.specify/` and `specs/001-demo/spec.md` directly under
+    /// `root`, and returns `root/specs` (the spec-kit watch root).
+    fn init_spec_kit(root: &Path) -> PathBuf {
+        fs::create_dir_all(root.join(".specify")).unwrap();
+        let specs_dir = root.join("specs");
+        fs::create_dir_all(specs_dir.join("001-demo")).unwrap();
+        fs::write(specs_dir.join("001-demo").join("spec.md"), "# Demo\n").unwrap();
+        specs_dir
+    }
+
+    #[test]
+    fn resolve_source_only_kiro_present_uses_kiro_tree_source() {
+        let root = scratch_dir("priority_only_kiro");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        assert!(matches!(startup.source, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(startup.root, root.join(".kiro"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_source_only_spec_kit_present_uses_spec_kit_tree_source() {
+        let root = scratch_dir("priority_only_spec_kit");
+        let specs_dir = init_spec_kit(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        match startup.source {
+            spec_viewer::spec::TreeSource::SpecKit(features) => {
+                assert_eq!(features.len(), 1);
+                assert_eq!(features[0].name, "001-demo");
+            }
+            _ => panic!("expected TreeSource::SpecKit"),
+        }
+        assert_eq!(
+            startup.root, specs_dir,
+            "watch root should be specs/, not the project root"
+        );
+        assert!(!startup.is_file);
+        assert!(startup.file_view_path.is_none());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_source_kiro_and_spec_kit_coexist_in_same_dir_prefers_kiro() {
+        let root = scratch_dir("priority_coexist_same_dir");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+        init_spec_kit(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        assert!(matches!(startup.source, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(startup.root, root.join(".kiro"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_source_prefers_deeper_spec_kit_over_shallower_kiro() {
+        // `.kiro` sits 3 levels above `.specify` -- spec-kit is the closer
+        // (deeper) root relative to `start` and must win even though both
+        // exist (just not in the same directory, so `find_spec_kit_root`'s
+        // own same-dir-coexistence rule does not apply here).
+        let far_root = scratch_dir("priority_far_kiro");
+        fs::create_dir_all(far_root.join(".kiro/specs")).unwrap();
+        let mid = far_root.join("a/b/c");
+        fs::create_dir_all(&mid).unwrap();
+        let specs_dir = init_spec_kit(&mid);
+        let start = mid.join("d/e");
+        fs::create_dir_all(&start).unwrap();
+
+        let args = args_with_path(Some(start.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        match startup.source {
+            spec_viewer::spec::TreeSource::SpecKit(_) => {}
+            _ => panic!("expected TreeSource::SpecKit (closer/deeper than .kiro)"),
+        }
+        assert_eq!(startup.root, specs_dir);
+
+        fs::remove_dir_all(&far_root).ok();
+    }
+
+    #[test]
+    fn resolve_source_neither_kiro_nor_spec_kit_returns_root_not_found() {
+        let leaf = scratch_dir("priority_neither").join("a/b");
+        fs::create_dir_all(&leaf).unwrap();
+
+        let args = args_with_path(Some(leaf.clone()));
+        let result = resolve_source(&args);
+
+        match result {
+            Err(StartupError::RootNotFound(searched)) => assert_eq!(searched, leaf),
+            Err(other) => panic!("expected RootNotFound, got {other:?}"),
+            Ok(_) => panic!("expected RootNotFound, got Ok"),
+        }
+
+        fs::remove_dir_all(leaf.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn resolve_source_all_flag_wins_even_when_spec_kit_present() {
+        // Requirement/regression: `--all` must remain the highest-priority
+        // mode even when a `.specify` marker is also present.
+        let root = scratch_dir("priority_all_wins");
+        init_spec_kit(&root);
+        fs::write(root.join("plain.md"), "# Plain\n").unwrap();
+
+        let args = args_all(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        match startup.source {
+            spec_viewer::spec::TreeSource::Files(_) => {}
+            _ => panic!("expected TreeSource::Files under --all, even with .specify present"),
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2190,6 +2360,453 @@ gamma trailing line
         );
 
         fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- spec-viewer-spec-kit-support task 5: E2E verification (5.1-5.5) --
+    //
+    // Tasks 1-4 of this spec (Milestone/warning/kiro_meta fields,
+    // `spec::spec_kit`, `TreeSource::SpecKit` + shared `milestone_badge_spans`
+    // rendering, `resolve_source`'s `.kiro`/spec-kit priority) are already
+    // implemented and approved. This section only adds verification on top
+    // of that surface, per this task's boundary (no non-test production
+    // code changes anywhere in this file or elsewhere).
+
+    /// Byte-offset-safe cell lookup for task 5's badge style assertions.
+    /// `find_text_cell` above treats a row's byte offset as its column
+    /// directly ("ASCII-only substring" per its own doc comment), which
+    /// silently drifts on any row where a multi-byte glyph -- this tree's
+    /// own box-drawing border characters, or the `▶`/`▼` expand indicator --
+    /// precedes the needle, exactly the class of bug
+    /// `ui::tree_panel::tests::find_cell` documents and fixes for its own
+    /// module's tests via this same `cell_of_byte` byte-to-cell mapping.
+    /// Returns `(x, y)` (unlike `find_text_cell`'s `(y, x)`) to match
+    /// `cell_style`'s own `(x, y)` parameter order directly.
+    fn find_cell_exact(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let area = buffer.area();
+        for y in 0..area.height {
+            let mut row = String::new();
+            let mut cell_of_byte: Vec<u16> = Vec::new();
+            for x in 0..area.width {
+                let symbol = buffer[(x, y)].symbol();
+                cell_of_byte.extend(std::iter::repeat(x).take(symbol.len()));
+                row.push_str(symbol);
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                return (cell_of_byte[byte_idx], y);
+            }
+        }
+        panic!("expected a row containing {needle:?}");
+    }
+
+    /// Writes a `.kiro` spec whose `spec.json` has all four canonical
+    /// approval gates (`requirements`/`bizProcess`/`design`/`tasks`)
+    /// generated+approved, at the given `phase` -- the exact shape
+    /// `src/spec/mod.rs`'s own `ALL_FOUR_GATES_APPROVED` unit tests use, so
+    /// this test exercises the identical fixture shape end to end through
+    /// `resolve_source` + real rendering instead of `build_spec` alone.
+    fn write_kiro_spec_all_gates_approved(root: &Path, name: &str, phase: &str) {
+        let dir = root.join("specs").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let spec_json = format!(
+            "{{\n  \"name\": \"{name}\",\n  \"phase\": \"{phase}\",\n  \"approvals\": {{\n    \"requirements\": {{ \"generated\": true, \"approved\": true }},\n    \"bizProcess\": {{ \"generated\": true, \"approved\": true }},\n    \"design\": {{ \"generated\": true, \"approved\": true }},\n    \"tasks\": {{ \"generated\": true, \"approved\": true }}\n  }}\n}}\n"
+        );
+        fs::write(dir.join("spec.json"), spec_json).unwrap();
+        fs::write(dir.join("requirements.md"), "# demo\n").unwrap();
+    }
+
+    // --- 5.1: `.kiro` non-regression -- all-gates-approved-but-not-completed
+    // (4/4) must render differently from completed (5/5) (requirements
+    // 5.1-5.5 of this spec's own spec.json, exercised through the real
+    // startup + render path rather than `build_spec` alone).
+    #[test]
+    fn task5_1_kiro_all_gates_approved_distinguishes_completed_from_in_progress() {
+        let root = scratch_dir("task5_1_gates");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+        let kiro = root.join(".kiro");
+        write_kiro_spec_all_gates_approved(&kiro, "gates-done-not-completed", "tasks-approved");
+        write_kiro_spec_all_gates_approved(&kiro, "gates-done-completed", "completed");
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+        assert!(matches!(startup.source, spec_viewer::spec::TreeSource::Kiro(_)));
+
+        let mut state = spec_viewer::app::AppState::new(
+            startup.source,
+            startup.root,
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(
+            buffer_contains(&buffer, "gates-done-not-completed 4/4"),
+            "expected the in-progress-but-fully-approved spec to show 4/4 -- got buffer:\n{:?}",
+            (0..buffer.area().height)
+                .map(|y| (0..buffer.area().width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            buffer_contains(&buffer, "gates-done-completed 5/5"),
+            "expected the completed spec to show a distinct 5/5, not collapse to 4/4"
+        );
+
+        let (col_4, row_4) = find_cell_exact(&buffer, "4/4");
+        let (fg_4, _bg_4, mod_4) = cell_style(&buffer, col_4, row_4);
+        assert!(mod_4.contains(ratatui::style::Modifier::BOLD), "4/4 badge should be bold");
+        assert_eq!(fg_4, ratatui::style::Color::Green, "4/4 badge should be green");
+
+        let (col_5, row_5) = find_cell_exact(&buffer, "5/5");
+        let (fg_5, _bg_5, mod_5) = cell_style(&buffer, col_5, row_5);
+        assert!(mod_5.contains(ratatui::style::Modifier::BOLD), "5/5 badge should be bold");
+        assert_eq!(fg_5, ratatui::style::Color::Green, "5/5 badge should be green");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- 5.2: `bugfix-only` fixture's badge tracks its *actual* recorded
+    // gate count, not an inflated/hardcoded one (requirement 5.4). ---------
+    #[test]
+    fn task5_2_bugfix_only_fixture_badge_reflects_actual_recorded_gate_count() {
+        // `tests/fixtures/kiro/specs/bugfix-only/spec.json` records exactly
+        // three approval-gate keys (`bugfix`: approved, `design`: generated
+        // only, `tasks`: neither) -- one of three actually approved, so the
+        // badge must read "1/3", never a fabricated "1/1" (as if only the
+        // single approved gate were ever recorded) nor any other count.
+        let snapshot = spec_viewer::app::load_snapshot(&fixtures_root());
+        let spec_root = spec_viewer::spec::build(&snapshot);
+        let spec = spec_root
+            .specs
+            .iter()
+            .find(|s| s.name == "bugfix-only")
+            .expect("bugfix-only spec present in fixtures/kiro");
+
+        assert_eq!(
+            spec.milestones.len(),
+            3,
+            "expected exactly 3 recorded approval gates: {:?}",
+            spec.milestones
+        );
+        assert_eq!(
+            spec.milestones.iter().filter(|m| m.done).count(),
+            1,
+            "expected exactly 1 of the 3 recorded gates to be approved: {:?}",
+            spec.milestones
+        );
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Kiro(spec_root),
+            fixtures_root(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(
+            buffer_contains(&buffer, "bugfix-only 1/3"),
+            "expected the badge to reflect the real 1-of-3 recorded gates"
+        );
+        assert!(
+            !buffer_contains(&buffer, "bugfix-only 1/1"),
+            "must not report an inflated/fabricated gate total that doesn't match spec.json"
+        );
+    }
+
+    // --- 5.3: spec-kit temporary project E2E (requirements 2.1-2.5, 6.1,
+    // 6.2, 7.1, 7.2) --------------------------------------------------------
+
+    /// Builds a spec-kit project directly under `root`: `.specify/` marker,
+    /// `specs/001-login/{spec,plan,tasks}.md` (tasks.md has 1-of-2 checked
+    /// boxes) and `specs/002-billing/spec.md` only.
+    fn build_spec_kit_project(root: &Path) {
+        fs::create_dir_all(root.join(".specify")).unwrap();
+        let specs_dir = root.join("specs");
+
+        let login = specs_dir.join("001-login");
+        fs::create_dir_all(&login).unwrap();
+        fs::write(login.join("spec.md"), "# Login spec\n\nSome content.\n").unwrap();
+        fs::write(login.join("plan.md"), "# Login plan\n").unwrap();
+        fs::write(login.join("tasks.md"), "- [x] a\n- [ ] b\n").unwrap();
+
+        let billing = specs_dir.join("002-billing");
+        fs::create_dir_all(&billing).unwrap();
+        fs::write(billing.join("spec.md"), "# Billing spec\n").unwrap();
+    }
+
+    #[test]
+    fn task5_3_spec_kit_temp_project_startup_selects_spec_kit_source() {
+        let root = scratch_dir("task5_3_startup");
+        build_spec_kit_project(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        match &startup.source {
+            spec_viewer::spec::TreeSource::SpecKit(features) => {
+                assert_eq!(features.len(), 2);
+                assert!(features.iter().any(|f| f.name == "001-login"));
+                assert!(features.iter().any(|f| f.name == "002-billing"));
+            }
+            _ => panic!("expected TreeSource::SpecKit"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn task5_3_spec_kit_temp_project_tree_shows_badges_order_and_no_steering() {
+        let root = scratch_dir("task5_3_tree");
+        build_spec_kit_project(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        let mut state = spec_viewer::app::AppState::new(
+            startup.source,
+            startup.root,
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        state.tree.open(vec![NodeId::Spec("001-login".to_string())]);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Milestone badges: 001-login has spec.md+plan.md+tasks.md (3/3,
+        // bold+green); 002-billing has only spec.md (1/3, not emphasized).
+        assert!(buffer_contains(&buffer, "001-login 3/3"));
+        assert!(buffer_contains(&buffer, "002-billing 1/3"));
+        let (col_3_3, row_3_3) = find_cell_exact(&buffer, "3/3");
+        let (fg_3_3, _, mod_3_3) = cell_style(&buffer, col_3_3, row_3_3);
+        assert!(mod_3_3.contains(ratatui::style::Modifier::BOLD));
+        assert_eq!(fg_3_3, ratatui::style::Color::Green);
+        let (col_1_3, row_1_3) = find_cell_exact(&buffer, "1/3");
+        let (_, _, mod_1_3) = cell_style(&buffer, col_1_3, row_1_3);
+        assert!(!mod_1_3.contains(ratatui::style::Modifier::BOLD));
+
+        // Canonical child order: spec.md -> plan.md -> tasks.md, all after
+        // the feature's own row.
+        let (row_feature, _) = find_text_cell(&buffer, "001-login 3/3").expect("feature row visible");
+        let (row_spec_md, _) = find_text_cell(&buffer, "spec.md").expect("spec.md row visible");
+        let (row_plan_md, _) = find_text_cell(&buffer, "plan.md").expect("plan.md row visible");
+        let (row_tasks_md, _) = find_text_cell(&buffer, "tasks.md").expect("tasks.md row visible");
+        assert!(row_feature < row_spec_md);
+        assert!(row_spec_md < row_plan_md);
+        assert!(row_plan_md < row_tasks_md);
+
+        // spec-kit has no Steering concept at all (design.md Out-of-Scope).
+        assert!(
+            !buffer_contains(&buffer, "Steering"),
+            "spec-kit tree must never show a Steering group"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    // Fixed: doc_item() now matches on the computed `filename` ("tasks.md")
+    // rather than the `DocKind::Tasks` variant alone, so spec-kit's
+    // `DocKind::Other("tasks.md")` tasks.md slot gets its progress badge too.
+    fn task5_3_spec_kit_tasks_md_shows_checkbox_progress_requirement_6_1() {
+        let root = scratch_dir("task5_3_tasks_progress");
+        build_spec_kit_project(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        let mut state = spec_viewer::app::AppState::new(
+            startup.source,
+            startup.root,
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        state.tree.open(vec![NodeId::Spec("001-login".to_string())]);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(
+            buffer_contains(&buffer, "tasks.md 1/2"),
+            "requirement 6.1: tasks.md's checkbox progress (1 of 2 checked) must show in the tree"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn task5_3_spec_kit_doc_selection_loads_real_file_content() {
+        let root = scratch_dir("task5_3_doc_load");
+        build_spec_kit_project(&root);
+        let spec_md_path = root.join("specs").join("001-login").join("spec.md");
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+
+        let mut state = spec_viewer::app::AppState::new(
+            startup.source,
+            startup.root,
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        state.tree.select(vec![
+            NodeId::Spec("001-login".to_string()),
+            NodeId::Doc("001-login".to_string(), DocKind::Other("spec.md".to_string())),
+        ]);
+        step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)))
+            .expect("step should succeed");
+
+        match &state.doc {
+            DocView::Rendered { path, .. } => assert_eq!(path, &spec_md_path),
+            other => panic!("expected DocView::Rendered for spec.md, got {other:?}"),
+        }
+
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            buffer_contains(&buffer, "Login spec"),
+            "expected the real spec.md heading text rendered in the doc panel"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- 5.4: editor mode applies to a spec-kit doc with no extra wiring
+    // (requirement 9.1) -- same `Action::Edit` -> `Control::EditFile`
+    // pipeline the pre-existing spec-viewer-editor-mode tests above already
+    // exercise for `.kiro` docs, just pointed at a spec-kit fixture. -------
+    #[test]
+    fn task5_4_spec_kit_doc_edit_action_returns_control_edit_file() {
+        let root = scratch_dir("task5_4_edit");
+        build_spec_kit_project(&root);
+        let specs_dir = root.join("specs");
+        let target = specs_dir.join("001-login").join("spec.md");
+
+        let features = spec_viewer::spec::spec_kit::build(&specs_dir);
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::SpecKit(features),
+            specs_dir.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        match &state.doc {
+            DocView::Rendered { .. } => {}
+            other => panic!("expected DocView::Rendered before editing, got {other:?}"),
+        }
+
+        // The exact call `run_loop` makes on the real `e` keypress (via
+        // `handle_key` -> `keymap` -> `Action::Edit`) -- proving the
+        // pre-existing editor-mode pipeline triggers unmodified for a
+        // spec-kit-sourced doc, with no additional wiring from this spec.
+        match spec_viewer::app::update(&mut state, Action::Edit) {
+            spec_viewer::app::Control::EditFile(path) => assert_eq!(path, target),
+            other => panic!(
+                "expected Control::EditFile from Action::Edit for a spec-kit doc, got {other:?}"
+            ),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- 5.5: read-only invariant -- browsing a spec-kit project never
+    // writes to any file under it (requirement 8.1). -----------------------
+
+    fn collect_mtimes(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time::SystemTime> {
+        fn walk(dir: &Path, map: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>) {
+            let Ok(read_dir) = fs::read_dir(dir) else { return };
+            for entry in read_dir.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, map);
+                } else if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+                    map.insert(path, modified);
+                }
+            }
+        }
+        let mut map = std::collections::BTreeMap::new();
+        walk(dir, &mut map);
+        map
+    }
+
+    #[test]
+    fn task5_5_spec_kit_project_files_are_never_modified_by_browsing() {
+        let root = scratch_dir("task5_5_readonly");
+        build_spec_kit_project(&root);
+
+        let before = collect_mtimes(&root);
+
+        let args = args_with_path(Some(root.clone()));
+        let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+        let specs_dir = startup.root.clone();
+
+        // An in-memory sort of a freshly-built `Vec<Spec>` -- spec-kit has
+        // no `--sort` concept at startup (design.md Out-of-Scope), but this
+        // still exercises `sort_specs` against real spec-kit `Spec` values
+        // without touching the filesystem at all.
+        let mut features_for_sort = spec_viewer::spec::spec_kit::build(&specs_dir);
+        spec_viewer::spec::sort_specs(&mut features_for_sort, spec_viewer::spec::SortKey::Name);
+
+        let mut state = spec_viewer::app::AppState::new(
+            startup.source,
+            startup.root,
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        state.tree.open(vec![NodeId::Spec("001-login".to_string())]);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+
+        state.tree.select(vec![
+            NodeId::Spec("001-login".to_string()),
+            NodeId::Doc("001-login".to_string(), DocKind::Other("spec.md".to_string())),
+        ]);
+        step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)))
+            .expect("step should succeed");
+
+        // A manual refresh (the `r`-key / `Action::Refresh` path) forces a
+        // full `spec::spec_kit::build` rescan from disk, same as a live
+        // filesystem-watch event would.
+        assert_eq!(
+            spec_viewer::app::update(&mut state, spec_viewer::app::Action::Refresh),
+            spec_viewer::app::Control::Continue
+        );
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("draw");
+
+        let after = collect_mtimes(&root);
+        assert_eq!(
+            before, after,
+            "expected no file under the spec-kit project to be modified by browsing/refreshing it"
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 }

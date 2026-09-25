@@ -9,7 +9,7 @@
 //! it does not itself bind any keys or drive any popup.
 
 use super::{rendered_of, AppState, SearchState};
-use crate::spec::{FsEntry, FsTree, NodeId, SpecRoot, TreeSource};
+use crate::spec::{FsEntry, FsTree, NodeId, Spec, SpecRoot, TreeSource};
 
 /// Run a plain-text, case-insensitive search for `query` over the current
 /// document's `Rendered.plain` lines (requirements 6.5, 6.8).
@@ -108,6 +108,7 @@ type TreeRow = (Vec<NodeId>, String);
 fn flatten_tree(root: &TreeSource) -> Vec<TreeRow> {
     match root {
         TreeSource::Kiro(root) => flatten_kiro(root),
+        TreeSource::SpecKit(features) => flatten_spec_kit(features),
         TreeSource::Files(tree) => flatten_files(tree),
     }
 }
@@ -139,6 +140,25 @@ fn flatten_kiro(root: &SpecRoot) -> Vec<TreeRow> {
         rows.push((path, doc.name.clone()));
     }
 
+    rows
+}
+
+/// Same flattening as [`flatten_kiro`], minus the steering group -- spec-kit
+/// has no steering concept (requirement 1.9-equivalent for spec-kit; see
+/// `ui::tree_panel`'s own `spec_kit_tree_shows_no_steering_group` test).
+/// `Spec`/`DocEntry` being the shared domain type both sources build is what
+/// makes this a near-verbatim copy of the `.kiro` loop over `root.specs`.
+fn flatten_spec_kit(features: &[Spec]) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for spec in features {
+        let spec_path = vec![NodeId::Spec(spec.name.clone())];
+        rows.push((spec_path.clone(), spec.name.clone()));
+        for doc in &spec.docs {
+            let mut path = spec_path.clone();
+            path.push(NodeId::Doc(spec.name.clone(), doc.kind.clone()));
+            rows.push((path, file_name(&doc.path)));
+        }
+    }
     rows
 }
 
@@ -531,5 +551,45 @@ mod tests {
         assert!(state.tree_matches.is_empty());
         // The selection/expansion the search left behind survives Esc.
         assert_eq!(state.tree.selected(), [NodeId::Spec("no-approvals".to_string())]);
+    }
+
+    // --- spec-viewer-spec-kit-support task 4: tree search over SpecKit ----
+
+    fn temp_spec_kit_specs_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_viewer_search_spec_kit_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tree_search_finds_spec_kit_feature_and_doc_names() {
+        let specs_dir = temp_spec_kit_specs_dir("tree_search");
+        let feature_dir = specs_dir.join("001-login");
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        std::fs::write(feature_dir.join("spec.md"), "# Login\n").unwrap();
+
+        let features = spec::spec_kit::build(&specs_dir);
+        let mut state = AppState::new(
+            TreeSource::SpecKit(features),
+            specs_dir.clone(),
+            (120, 40),
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        );
+
+        tree_search(&mut state, "001-login");
+
+        assert_eq!(
+            state.tree_matches,
+            vec![vec![NodeId::Spec("001-login".to_string())]]
+        );
+        assert_eq!(state.tree.selected(), [NodeId::Spec("001-login".to_string())]);
+
+        std::fs::remove_dir_all(&specs_dir).unwrap();
     }
 }

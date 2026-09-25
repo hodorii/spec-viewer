@@ -65,7 +65,11 @@ fn progress_ratio(spec: &Spec) -> f64 {
 }
 
 fn phase_key(spec: &Spec) -> &str {
-    spec.meta.as_ref().map(|m| m.phase.as_str()).unwrap_or("")
+    spec.kiro_meta
+        .as_ref()
+        .and_then(|m| m.as_ref().ok())
+        .map(|m| m.phase.as_str())
+        .unwrap_or("")
 }
 
 /// `updated_at` as its raw ISO-8601 string (lexicographically sortable);
@@ -73,9 +77,9 @@ fn phase_key(spec: &Spec) -> &str {
 /// before any real date -- last under `SortKey::Updated`'s descending
 /// (most-recent-first) order.
 fn updated_key(spec: &Spec) -> &str {
-    spec.meta
+    spec.kiro_meta
         .as_ref()
-        .ok()
+        .and_then(|m| m.as_ref().ok())
         .and_then(|m| m.updated_at.as_deref())
         .unwrap_or("")
 }
@@ -117,12 +121,16 @@ mod tests {
         Spec {
             name: name.to_string(),
             dir: PathBuf::from(format!("/does/not/matter/{name}")),
-            meta: Ok(SpecMeta {
+            kiro_meta: Some(Ok(SpecMeta {
                 name: name.to_string(),
                 phase: phase.to_string(),
                 approvals: BTreeMap::new(),
                 updated_at: updated_at.map(str::to_string),
-            }),
+            })),
+            // This helper's callers only exercise sort ordering, never the
+            // progress badge, so an empty list is sufficient.
+            milestones: vec![],
+            warning: None,
             docs: vec![DocEntry {
                 kind: DocKind::Tasks,
                 path: PathBuf::from("/does/not/matter/tasks.md"),
@@ -138,7 +146,9 @@ mod tests {
         Spec {
             name: name.to_string(),
             dir: PathBuf::from(format!("/does/not/matter/{name}")),
-            meta: Err(MetaError::InvalidJson("n/a".to_string())),
+            kiro_meta: Some(Err(MetaError::InvalidJson("n/a".to_string()))),
+            milestones: vec![],
+            warning: Some("n/a".to_string()),
             docs: vec![],
             definition: None,
         }

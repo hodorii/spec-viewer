@@ -2,6 +2,7 @@ pub mod fs_tree;
 pub mod meta;
 pub mod progress;
 pub mod sort;
+pub mod spec_kit;
 
 pub use fs_tree::{FsEntry, FsTree};
 pub use meta::{parse_meta, Approval, DocKind, MetaError, SpecMeta};
@@ -97,9 +98,31 @@ pub enum Inclusion {
 pub struct Spec {
     pub name: String,
     pub dir: PathBuf,
-    pub meta: Result<SpecMeta, MetaError>,
+    /// `.kiro`-only: used for `SortKey::Phase`/`SortKey::Updated` sorting.
+    /// Future spec-kit sources have no single meta file, so they leave this
+    /// `None`; the `.kiro` builder always fills it with `Some(...)`.
+    pub kiro_meta: Option<Result<SpecMeta, MetaError>>,
+    /// Source-agnostic progress checkpoints (requirement 3.x/5.x): either
+    /// `.kiro` approval gates, or (future) spec-kit artifact-existence
+    /// checks. Rendering code should only ever look at this list's length
+    /// and each entry's `done` flag, never at which source produced it.
+    pub milestones: Vec<Milestone>,
+    /// Non-fatal warning to surface as a badge (e.g. `spec.json` missing or
+    /// failed to parse); `None` when there is nothing to warn about.
+    pub warning: Option<String>,
     pub docs: Vec<DocEntry>,
     pub definition: Option<String>,
+}
+
+/// A single source-agnostic progress checkpoint: one `.kiro` approval gate,
+/// or (in a future spec-kit source) one artifact's existence. Rendering code
+/// (`tree_panel`'s badge) only ever looks at a spec's `milestones` list
+/// length and each entry's `done` flag -- it never knows or cares which
+/// source produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Milestone {
+    pub name: String,
+    pub done: bool,
 }
 
 /// One document slot within a spec's canonical document order (requirement
@@ -147,6 +170,7 @@ pub enum NodeId {
 /// `Files` has no equivalent concept (requirement 1.9).
 pub enum TreeSource {
     Kiro(SpecRoot),
+    SpecKit(Vec<Spec>),
     Files(FsTree),
 }
 
@@ -157,7 +181,7 @@ impl TreeSource {
     pub fn as_kiro(&self) -> Option<&SpecRoot> {
         match self {
             TreeSource::Kiro(root) => Some(root),
-            TreeSource::Files(_) => None,
+            TreeSource::SpecKit(_) | TreeSource::Files(_) => None,
         }
     }
 }
@@ -295,12 +319,73 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
         });
     }
 
+    let (kiro_meta, milestones, warning) = kiro_milestones(&meta);
+
     Spec {
         name: sd.name.clone(),
         dir: sd.dir.clone(),
-        meta,
+        kiro_meta,
+        milestones,
+        warning,
         docs,
         definition,
+    }
+}
+
+/// Derive a spec's `kiro_meta`/`milestones`/`warning` fields from its parsed
+/// `spec.json` result.
+///
+/// - On parse failure: no milestones at all (unchanged from the prior
+///   "parse-failure shows only a warning" behavior), and `warning` carries
+///   the error's `Display` string.
+/// - On success: one `Milestone` per recorded approval gate, in `approvals`'
+///   `BTreeMap` (i.e. `DocKind` declaration) order, `done` mirroring
+///   `Approval::approved`. When `phase` is exactly `"completed"` (the
+///   post-implementation phase that follows all gates being approved), an
+///   extra always-`done` "구현 완료" milestone is appended -- this is what
+///   lets an "all gates approved but still implementing" spec (`n/4`) read
+///   differently from a "fully completed" spec (`n/5`).
+fn kiro_milestones(
+    meta: &Result<SpecMeta, MetaError>,
+) -> (Option<Result<SpecMeta, MetaError>>, Vec<Milestone>, Option<String>) {
+    match meta {
+        Err(e) => (Some(Err(e.clone())), Vec::new(), Some(e.to_string())),
+        Ok(m) => {
+            let mut milestones: Vec<Milestone> = m
+                .approvals
+                .iter()
+                .map(|(kind, approval)| Milestone {
+                    name: milestone_label(kind),
+                    done: approval.approved,
+                })
+                .collect();
+
+            if m.phase == "completed" {
+                milestones.push(Milestone {
+                    name: "구현 완료".to_string(),
+                    done: true,
+                });
+            }
+
+            (Some(Ok(m.clone())), milestones, None)
+        }
+    }
+}
+
+/// Human-readable milestone label for one `.kiro` approval-gate `DocKind`.
+/// Mirrors the `spec.json` `approvals` object's own key spelling
+/// (`meta::parse_meta`'s reverse mapping) for the five recognized keys;
+/// `Research`/`Other` never appear in `approvals` but are covered for
+/// completeness.
+fn milestone_label(kind: &DocKind) -> String {
+    match kind {
+        DocKind::Requirements => "requirements".to_string(),
+        DocKind::Bugfix => "bugfix".to_string(),
+        DocKind::BizProcess => "bizProcess".to_string(),
+        DocKind::Design => "design".to_string(),
+        DocKind::Tasks => "tasks".to_string(),
+        DocKind::Research => "research".to_string(),
+        DocKind::Other(name) => name.clone(),
     }
 }
 
@@ -651,7 +736,8 @@ mod build_tests {
         let root = build(&snapshot);
         let spec = &root.specs[0];
 
-        assert!(spec.meta.is_ok());
+        assert!(matches!(spec.kiro_meta, Some(Ok(_))));
+        assert!(spec.warning.is_none());
 
         let requirements = doc(spec, &DocKind::Requirements);
         assert!(requirements.exists);
@@ -677,7 +763,9 @@ mod build_tests {
         let root = build(&snapshot);
         let spec = &root.specs[0];
 
-        assert!(spec.meta.is_err());
+        assert!(matches!(spec.kiro_meta, Some(Err(_))));
+        assert!(spec.milestones.is_empty());
+        assert!(spec.warning.is_some());
 
         let requirements = doc(spec, &DocKind::Requirements);
         assert!(requirements.exists);
@@ -750,5 +838,108 @@ Should not be included.
     fn inclusion_with_no_front_matter_defaults_to_always() {
         let steering_md = "# Product\nNo front matter here.\n";
         assert_eq!(inclusion(steering_md), Inclusion::Always);
+    }
+}
+
+#[cfg(test)]
+mod milestone_tests {
+    //! `.kiro` -> `Milestone` derivation (Task 1.1). The two "all four gates
+    //! approved" cases below are the entire reason this refactor exists: an
+    //! in-progress-but-fully-approved spec (`n/4`) must never render the
+    //! same as a genuinely completed one (`n/5`) -- see requirements.md 5.2
+    //! vs 5.3.
+    use super::*;
+
+    fn spec_json_snapshot(json: &str) -> SpecDirSnapshot {
+        SpecDirSnapshot {
+            name: "milestone-test".to_string(),
+            dir: PathBuf::from("/does/not/matter"),
+            files: vec![FileSnapshot {
+                name: "spec.json".to_string(),
+                path: PathBuf::from("/does/not/matter/spec.json"),
+                content: json.to_string(),
+            }],
+        }
+    }
+
+    const ALL_FOUR_GATES_APPROVED: &str = r#"{
+        "feature_name": "x",
+        "approvals": {
+            "requirements": {"generated": true, "approved": true},
+            "bizProcess": {"generated": true, "approved": true},
+            "design": {"generated": true, "approved": true},
+            "tasks": {"generated": true, "approved": true}
+        }
+    }"#;
+
+    #[test]
+    fn all_gates_approved_but_not_completed_phase_yields_four_of_four() {
+        let json = format!(
+            "{{\"phase\": \"implementation\", {}",
+            &ALL_FOUR_GATES_APPROVED[1..]
+        );
+        let spec = build_spec(&spec_json_snapshot(&json));
+
+        assert_eq!(spec.milestones.len(), 4, "milestones: {:?}", spec.milestones);
+        assert!(spec.milestones.iter().all(|m| m.done));
+        assert!(spec.warning.is_none());
+    }
+
+    #[test]
+    fn all_gates_approved_and_completed_phase_yields_five_of_five() {
+        let json = format!(
+            "{{\"phase\": \"completed\", {}",
+            &ALL_FOUR_GATES_APPROVED[1..]
+        );
+        let spec = build_spec(&spec_json_snapshot(&json));
+
+        // The load-bearing assertion: same four approved gates as the
+        // sibling test above, but `phase: "completed"` must add a fifth
+        // milestone -- 4/4 and 5/5 must never collapse to the same length.
+        assert_eq!(spec.milestones.len(), 5, "milestones: {:?}", spec.milestones);
+        assert!(spec.milestones.iter().all(|m| m.done));
+        assert_ne!(
+            spec.milestones.len(),
+            4,
+            "completed-phase spec must not report the same milestone count as a merely-all-approved one"
+        );
+    }
+
+    #[test]
+    fn partial_approvals_yield_only_recorded_gates_as_milestones() {
+        let json = r#"{
+            "feature_name": "x",
+            "phase": "design",
+            "approvals": {
+                "requirements": {"generated": true, "approved": true},
+                "bizProcess": {"generated": true, "approved": false}
+            }
+        }"#;
+        let spec = build_spec(&spec_json_snapshot(json));
+
+        assert_eq!(spec.milestones.len(), 2);
+        assert!(spec.milestones[0].done);
+        assert!(!spec.milestones[1].done);
+        assert!(spec.warning.is_none());
+    }
+
+    #[test]
+    fn no_approvals_yields_empty_milestones_no_warning() {
+        let json = r#"{"feature_name": "x", "phase": "discovery"}"#;
+        let spec = build_spec(&spec_json_snapshot(json));
+
+        assert!(spec.milestones.is_empty());
+        assert!(spec.warning.is_none());
+        assert!(matches!(spec.kiro_meta, Some(Ok(_))));
+    }
+
+    #[test]
+    fn broken_spec_json_yields_empty_milestones_and_warning_message() {
+        let spec = build_spec(&spec_json_snapshot("not valid json"));
+
+        assert!(spec.milestones.is_empty());
+        assert!(matches!(spec.kiro_meta, Some(Err(_))));
+        let warning = spec.warning.expect("expected a warning message");
+        assert!(!warning.is_empty());
     }
 }

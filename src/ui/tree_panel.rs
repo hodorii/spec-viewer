@@ -2,9 +2,9 @@
 //!
 //! Requirements: 2.1 (spec nodes), 2.2/2.3 (canonical doc order), 2.4
 //! (missing-doc dimming), 2.5 (separate Steering group), 2.8 (steering
-//! inclusion badge), 3.1 (phase badge), 3.2/3.4 (approval status symbols),
-//! 3.5 (spec.json parse-failure warning badge), 4.1/4.3/4.4 (tasks
-//! progress). Design.md "ui — Panels" `tree_panel`.
+//! inclusion badge), 3.1 (approval-gate count badge), 3.2/3.4 (approval
+//! status symbols), 3.5 (spec.json parse-failure warning badge), 4.1/4.3/4.4
+//! (tasks progress). Design.md "ui — Panels" `tree_panel`.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -228,13 +228,37 @@ fn file_item(path: &std::path::Path, highlighted: bool) -> TreeItem<'static, Nod
 }
 
 /// Build the `TreeItem` for one spec node and its document children.
+///
+/// Requirement 3.1's phase badge is an approval-gate count (`n/total`, the
+/// same "n/m" shape as `doc_item`'s tasks.md progress suffix below) rather
+/// than the raw `spec.json` phase word -- a name like `implementation`
+/// doesn't say how far along a spec is relative to its own gates, while
+/// `3/4` does, at a glance, in the same vocabulary the tree already uses.
 fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
-    let label = match &spec.meta {
-        Ok(meta) => format!("{} [{}]", spec.name, meta.phase),
-        // No phase is available when spec.json failed to parse (or is
-        // missing) — requirement 3.5's warning badge.
-        Err(_) => format!("{} !", spec.name),
+    let own_path = vec![NodeId::Spec(spec.name.clone())];
+    let highlighted = is_search_match(&own_path, search_matches);
+    let highlight = |style: Style| {
+        if highlighted {
+            style.bg(SEARCH_MATCH_BG)
+        } else {
+            style
+        }
     };
+
+    let mut spans = vec![Span::styled(spec.name.clone(), highlight(Style::new()))];
+    match &spec.meta {
+        Ok(meta) => {
+            let total = meta.approvals.len() as u32;
+            if total > 0 {
+                let done = meta.approvals.values().filter(|a| a.approved).count() as u32;
+                let (suffix, style) = progress_count_suffix(done, total, Style::new());
+                spans.push(Span::styled(suffix, highlight(style)));
+            }
+        }
+        // No approval gates are available when spec.json failed to parse
+        // (or is missing) — requirement 3.5's warning badge.
+        Err(_) => spans.push(Span::styled(" !", highlight(Style::new()))),
+    }
 
     let children: Vec<TreeItem<'static, NodeId>> = spec
         .docs
@@ -242,10 +266,7 @@ fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, N
         .map(|entry| doc_item(&spec.name, entry, search_matches))
         .collect();
 
-    let own_path = vec![NodeId::Spec(spec.name.clone())];
-    let highlighted = is_search_match(&own_path, search_matches);
-
-    TreeItem::new(NodeId::Spec(spec.name.clone()), labeled_line(label, highlighted), children)
+    TreeItem::new(NodeId::Spec(spec.name.clone()), Line::from(spans), children)
         .expect("DocKind is unique within one spec's docs by construction")
 }
 
@@ -272,6 +293,21 @@ fn doc_filename(kind: &DocKind) -> String {
         DocKind::Research => "research.md".to_string(),
         DocKind::Other(name) => name.clone(),
     }
+}
+
+/// Shared "n/total" progress-count badge (requirement 3.1's approval-gate
+/// count on `spec_item` and requirement 4.1/4.4's tasks.md checkbox count on
+/// `doc_item` are the same shape: SSoT for the text and the
+/// complete-vs-incomplete style, so the two call sites can't drift apart).
+/// `incomplete_style` is the caller's own base style to fall back to when
+/// `done < total`; complete (`done == total`) always wins with bold green.
+fn progress_count_suffix(done: u32, total: u32, incomplete_style: Style) -> (String, Style) {
+    let style = if done == total {
+        Style::new().add_modifier(Modifier::BOLD).fg(Color::Green)
+    } else {
+        incomplete_style
+    };
+    (format!(" {done}/{total}"), style)
 }
 
 /// Build the `TreeItem` for one document node.
@@ -307,12 +343,7 @@ fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -
         if let Some(progress) = entry.progress {
             // Requirement 4.1's "n/m" progress suffix; requirement 4.4's
             // completed-highlight style when done == total.
-            let suffix = format!(" {}/{}", progress.done, progress.total);
-            let style = if progress.done == progress.total {
-                Style::new().add_modifier(Modifier::BOLD).fg(Color::Green)
-            } else {
-                base_style
-            };
+            let (suffix, style) = progress_count_suffix(progress.done, progress.total, base_style);
             spans.push(Span::styled(suffix, highlight(style)));
         } else if entry.exists {
             // Requirement 4.3: tasks.md exists but has no checkboxes at all.
@@ -399,31 +430,47 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a row containing {needle:?}, got:\n{rows:?}"))
     }
 
-    /// Locate the first row containing (ASCII) `needle` and return the
-    /// `(modifier, fg)` style of the cell at `needle`'s starting column.
-    fn cell_style_at(buffer: &Buffer, needle: &str) -> (Modifier, Color) {
+    /// Locate `needle`'s starting cell and return that `(x, y)`.
+    ///
+    /// Built by mapping each byte of the reconstructed row string back to
+    /// the buffer cell it came from, rather than using the byte offset
+    /// `row.find` returns directly as an x-coordinate -- box-drawing borders
+    /// and the tree's own expand/collapse arrows (`│`, `▶`, `▼`, `●`, `○`,
+    /// `·`) are all multi-byte-but-single-width, so a row with any of those
+    /// ahead of `needle` has more bytes than columns, and the byte offset
+    /// alone would point several columns too far right (found the hard way:
+    /// `▶ all-approved 2/2` located "2/2" a few cells past where it
+    /// actually starts).
+    fn find_cell(buffer: &Buffer, needle: &str) -> (u16, u16) {
         let area = buffer.area;
         for y in 0..area.height {
-            let row: String = (0..area.width).map(|x| buffer.get(x, y).symbol()).collect();
-            if let Some(idx) = row.find(needle) {
-                let cell = buffer.get(idx as u16, y);
-                return (cell.modifier, cell.fg);
+            let mut row = String::new();
+            let mut cell_of_byte = Vec::with_capacity(row.capacity());
+            for x in 0..area.width {
+                let symbol = buffer.get(x, y).symbol();
+                cell_of_byte.extend(std::iter::repeat(x).take(symbol.len()));
+                row.push_str(symbol);
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                return (cell_of_byte[byte_idx], y);
             }
         }
         panic!("expected a row containing {needle:?}");
     }
 
+    /// Locate the first row containing `needle` and return the
+    /// `(modifier, fg)` style of the cell at `needle`'s starting column.
+    fn cell_style_at(buffer: &Buffer, needle: &str) -> (Modifier, Color) {
+        let (x, y) = find_cell(buffer, needle);
+        let cell = buffer.get(x, y);
+        (cell.modifier, cell.fg)
+    }
+
     /// Same lookup as [`cell_style_at`], but the background color -- what
     /// task 19.4's search-match highlight (requirement 2.10) actually sets.
     fn cell_bg_at(buffer: &Buffer, needle: &str) -> Color {
-        let area = buffer.area;
-        for y in 0..area.height {
-            let row: String = (0..area.width).map(|x| buffer.get(x, y).symbol()).collect();
-            if let Some(idx) = row.find(needle) {
-                return buffer.get(idx as u16, y).bg;
-            }
-        }
-        panic!("expected a row containing {needle:?}");
+        let (x, y) = find_cell(buffer, needle);
+        buffer.get(x, y).bg
     }
 
     /// Takes `SpecRoot` by value (`SpecRoot` has no `Clone`, and `render`
@@ -509,23 +556,24 @@ mod tests {
     }
 
     #[test]
-    fn spec_with_ok_meta_shows_phase_badge() {
+    fn spec_with_ok_meta_shows_approval_gate_count_badge() {
         let root = build_root();
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 
-        // sample-signup/spec.json has "phase": "implementation".
-        assert!(rows.iter().any(|row| row.contains("sample-signup [implementation]")));
+        // sample-signup/spec.json's approvals: requirements approved,
+        // bizProcess/design generated-not-approved, no "tasks" key => 1/3.
+        assert!(rows.iter().any(|row| row.contains("sample-signup 1/3")));
     }
 
     #[test]
-    fn spec_with_err_meta_shows_warning_badge_not_phase() {
+    fn spec_with_err_meta_shows_warning_badge_not_approval_count() {
         let root = build_root();
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 
         let idx = row_index(&rows, "broken-json !");
-        assert!(!rows[idx].contains('['), "broken-json row should show no phase badge");
+        assert!(!rows[idx].contains('/'), "broken-json row should show no approval-gate badge");
     }
 
     #[test]
@@ -537,7 +585,7 @@ mod tests {
         // sample-signup/spec.json approvals: requirements approved,
         // bizProcess generated-not-approved, design generated-not-approved,
         // no "tasks" key at all (=> NoRecord).
-        let spec_row = row_index(&rows, "sample-signup [implementation]");
+        let spec_row = row_index(&rows, "sample-signup 1/3");
         let req_row = row_index(&rows, "● requirements.md");
         let biz_row = row_index(&rows, "○ biz-process.md");
         let design_row = row_index(&rows, "○ design.md");
@@ -632,6 +680,85 @@ mod tests {
         let (modifier, fg) = cell_style_at(&buffer, "5/5");
         assert!(modifier.contains(Modifier::BOLD));
         assert_eq!(fg, Color::Green);
+    }
+
+    #[test]
+    fn all_approvals_done_shows_bold_green_gate_count() {
+        // Same "complete -> bold green" style as the tasks.md checkbox
+        // badge above (requirement 3.1), exercised the same
+        // build-a-minimal-`Spec`-in-memory way since none of the on-disk
+        // fixtures happen to have every approval gate checked.
+        use crate::spec::{Approval, DocStatus, Spec, SpecMeta, SpecRoot};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut approvals = BTreeMap::new();
+        approvals.insert(DocKind::Requirements, Approval { generated: true, approved: true });
+        approvals.insert(DocKind::Design, Approval { generated: true, approved: true });
+
+        let spec = Spec {
+            name: "all-approved".to_string(),
+            dir: PathBuf::from("/does/not/matter"),
+            meta: Ok(SpecMeta {
+                name: "all-approved".to_string(),
+                phase: "completed".to_string(),
+                approvals,
+                updated_at: None,
+            }),
+            docs: vec![DocEntry {
+                kind: DocKind::Requirements,
+                path: PathBuf::from("/does/not/matter/requirements.md"),
+                exists: true,
+                status: DocStatus::Approved,
+                progress: None,
+            }],
+            definition: None,
+        };
+        let root = SpecRoot {
+            specs: vec![spec],
+            steering: Vec::new(),
+        };
+
+        let buffer = render_root(root, vec![]);
+        let rows = buffer_text(&buffer);
+        assert!(rows.iter().any(|row| row.contains("all-approved 2/2")));
+
+        let (modifier, fg) = cell_style_at(&buffer, "2/2");
+        assert!(modifier.contains(Modifier::BOLD));
+        assert_eq!(fg, Color::Green);
+    }
+
+    #[test]
+    fn spec_with_no_approval_keys_at_all_shows_bare_name() {
+        // An empty `approvals` map (e.g. a spec.json with no gates recorded
+        // yet) shouldn't render a misleading "0/0" -- just the name, same as
+        // tasks.md's own "no checkboxes" case falls back to plain text
+        // instead of "0/0".
+        use crate::spec::{Spec, SpecMeta, SpecRoot};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let spec = Spec {
+            name: "brand-new".to_string(),
+            dir: PathBuf::from("/does/not/matter"),
+            meta: Ok(SpecMeta {
+                name: "brand-new".to_string(),
+                phase: "discovery".to_string(),
+                approvals: BTreeMap::new(),
+                updated_at: None,
+            }),
+            docs: vec![],
+            definition: None,
+        };
+        let root = SpecRoot {
+            specs: vec![spec],
+            steering: Vec::new(),
+        };
+
+        let buffer = render_root(root, vec![]);
+        let rows = buffer_text(&buffer);
+        let idx = row_index(&rows, "brand-new");
+        assert!(!rows[idx].contains('/'), "expected no approval-gate badge, got:\n{}", rows[idx]);
     }
 
     #[test]
@@ -757,7 +884,7 @@ mod tests {
             .expect("draw");
 
         let rows = buffer_text(terminal.backend().buffer());
-        let spec_row = row_index(&rows, "sample-signup [implementation]") as u16;
+        let spec_row = row_index(&rows, "sample-signup 1/3") as u16;
 
         let identifier = crate::app::mouse::tree_identifier_at(&tree_state, 2, spec_row);
         assert_eq!(

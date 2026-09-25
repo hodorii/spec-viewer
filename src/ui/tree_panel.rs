@@ -2,9 +2,11 @@
 //!
 //! Requirements: 2.1 (spec nodes), 2.2/2.3 (canonical doc order), 2.4
 //! (missing-doc dimming), 2.5 (separate Steering group), 2.8 (steering
-//! inclusion badge), 3.1 (phase badge), 3.2/3.4 (approval status symbols),
-//! 3.5 (spec.json parse-failure warning badge), 4.1/4.3/4.4 (tasks
-//! progress). Design.md "ui — Panels" `tree_panel`.
+//! inclusion badge), 3.1 (approval status symbols), 3.5 (spec.json
+//! parse-failure warning badge), 4.1/4.3/4.4 (tasks progress). Design.md
+//! "ui — Panels" `tree_panel`. The spec node's own milestone-progress badge
+//! (spec-viewer-spec-kit-support requirements 3.1-3.4) is
+//! `milestone_badge_spans`, shared with the (future) spec-kit `feature_item`.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -15,8 +17,8 @@ use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use crate::app::FilesTreeItemCache;
 use crate::spec::{
-    DocEntry, DocKind, DocStatus, FsEntry, FsTree, Inclusion, NodeId, SortKey, Spec, SpecRoot,
-    SteeringDoc, TreeSource,
+    DocEntry, DocKind, DocStatus, FsEntry, FsTree, Inclusion, Milestone, NodeId, SortKey, Spec,
+    SpecRoot, SteeringDoc, TreeSource,
 };
 
 /// Style patched onto a search-matched node's label (requirement 2.10;
@@ -57,6 +59,7 @@ pub fn render(
 ) {
     match root {
         TreeSource::Kiro(root) => render_kiro(frame, area, root, tree_state, sort_key, search_matches),
+        TreeSource::SpecKit(features) => render_spec_kit(frame, area, features, tree_state, search_matches),
         TreeSource::Files(tree) => {
             render_files(frame, area, tree, tree_state, search_matches, files_tree_cache)
         }
@@ -90,6 +93,32 @@ fn render_kiro(
     let tree = Tree::new(&items)
         .expect("NodeId is unique per level by construction")
         .block(Block::bordered().title(title))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+
+    frame.render_stateful_widget(tree, area, tree_state);
+}
+
+/// Render a spec-kit(`.specify/`+`specs/<NNN-이름>/`) feature list into
+/// `area` (spec-viewer-spec-kit-support requirements 2.1-2.5). Unlike
+/// `.kiro`, spec-kit has no Steering-doc concept (design.md Out-of-Scope),
+/// so no group node is appended after the feature nodes — `render_kiro`'s
+/// trailing `steering_group_item` push is the only structural difference
+/// from that function.
+fn render_spec_kit(
+    frame: &mut Frame,
+    area: Rect,
+    features: &[Spec],
+    tree_state: &mut TreeState<NodeId>,
+    search_matches: &[Vec<NodeId>],
+) {
+    let items: Vec<TreeItem<'static, NodeId>> = features
+        .iter()
+        .map(|spec| feature_item(spec, search_matches))
+        .collect();
+
+    let tree = Tree::new(&items)
+        .expect("NodeId is unique per level by construction")
+        .block(Block::bordered().title("Spec Kit"))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
     frame.render_stateful_widget(tree, area, tree_state);
@@ -227,14 +256,64 @@ fn file_item(path: &std::path::Path, highlighted: bool) -> TreeItem<'static, Nod
     )
 }
 
+/// Format the shared "n/total" milestone-progress style: bold+green when
+/// every tracked item is done, the caller's `base_style` otherwise
+/// (requirements 3.1/3.4, and 4.4's tasks.md progress reuses the same
+/// rule). Kept as its own function so `milestone_badge_spans` and
+/// `doc_item`'s tasks.md progress suffix share exactly one place that
+/// decides "done == total -> emphasize".
+fn progress_style<T: PartialEq>(done: T, total: T, base_style: Style) -> Style {
+    if done == total {
+        Style::new().add_modifier(Modifier::BOLD).fg(Color::Green)
+    } else {
+        base_style
+    }
+}
+
+/// Build the milestone-progress badge spans shared by `.kiro`'s `spec_item`
+/// and (Task 3.2's) spec-kit `feature_item` -- the single place where the
+/// badge's format (progress vs. all-done emphasis vs. warning) is decided,
+/// so both sources always render it identically (design.md "공유 배지
+/// 렌더링").
+///
+/// - `warning` being `Some` wins outright, regardless of `milestones`'
+///   length: requirement 5.5's `spec.json` parse-failure badge (`" !"`)
+///   stays exactly as before.
+/// - An empty `milestones` (and no warning) means the node tracks nothing
+///   trackable at all -- no badge, just the bare name (requirement 3.3).
+/// - Otherwise a single `" {done}/{total}"` span, styled by
+///   [`progress_style`] (requirements 3.1/3.4).
+fn milestone_badge_spans(
+    milestones: &[Milestone],
+    warning: &Option<String>,
+    highlight: impl Fn(Style) -> Style,
+) -> Vec<Span<'static>> {
+    if warning.is_some() {
+        return vec![Span::styled(" !", highlight(Style::new()))];
+    }
+    if milestones.is_empty() {
+        return Vec::new();
+    }
+    let total = milestones.len();
+    let done = milestones.iter().filter(|m| m.done).count();
+    let style = progress_style(done, total, Style::new());
+    vec![Span::styled(format!(" {done}/{total}"), highlight(style))]
+}
+
 /// Build the `TreeItem` for one spec node and its document children.
 fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
-    let label = match &spec.meta {
-        Ok(meta) => format!("{} [{}]", spec.name, meta.phase),
-        // No phase is available when spec.json failed to parse (or is
-        // missing) — requirement 3.5's warning badge.
-        Err(_) => format!("{} !", spec.name),
+    let own_path = vec![NodeId::Spec(spec.name.clone())];
+    let highlighted = is_search_match(&own_path, search_matches);
+    let highlight = |style: Style| {
+        if highlighted {
+            style.bg(SEARCH_MATCH_BG)
+        } else {
+            style
+        }
     };
+
+    let mut spans = vec![Span::styled(spec.name.clone(), highlight(Style::new()))];
+    spans.extend(milestone_badge_spans(&spec.milestones, &spec.warning, highlight));
 
     let children: Vec<TreeItem<'static, NodeId>> = spec
         .docs
@@ -242,10 +321,43 @@ fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, N
         .map(|entry| doc_item(&spec.name, entry, search_matches))
         .collect();
 
+    TreeItem::new(NodeId::Spec(spec.name.clone()), Line::from(spans), children)
+        .expect("DocKind is unique within one spec's docs by construction")
+}
+
+/// Build the `TreeItem` for one spec-kit feature node and its document
+/// children (spec-viewer-spec-kit-support requirements 2.1-2.5, 3.1-3.4).
+///
+/// Deliberately near-identical to `spec_item`: both render a `Spec`, and
+/// share `milestone_badge_spans` for the badge (design.md "공유 배지
+/// 렌더링") so a `.kiro` spec and a spec-kit feature at the same
+/// progress render pixel-for-pixel the same badge. `NodeId::Spec`/
+/// `NodeId::Doc` are reused as-is rather than adding spec-kit-specific
+/// variants: a single process only ever browses one `TreeSource` for its
+/// whole run (`AppState.root` is fixed at startup and only ever rebuilt as
+/// the same variant on refresh -- see `app::mod::resync`), so `.kiro` and
+/// spec-kit node ids never coexist and can never collide.
+fn feature_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
     let own_path = vec![NodeId::Spec(spec.name.clone())];
     let highlighted = is_search_match(&own_path, search_matches);
+    let highlight = |style: Style| {
+        if highlighted {
+            style.bg(SEARCH_MATCH_BG)
+        } else {
+            style
+        }
+    };
 
-    TreeItem::new(NodeId::Spec(spec.name.clone()), labeled_line(label, highlighted), children)
+    let mut spans = vec![Span::styled(spec.name.clone(), highlight(Style::new()))];
+    spans.extend(milestone_badge_spans(&spec.milestones, &spec.warning, highlight));
+
+    let children: Vec<TreeItem<'static, NodeId>> = spec
+        .docs
+        .iter()
+        .map(|entry| doc_item(&spec.name, entry, search_matches))
+        .collect();
+
+    TreeItem::new(NodeId::Spec(spec.name.clone()), Line::from(spans), children)
         .expect("DocKind is unique within one spec's docs by construction")
 }
 
@@ -303,16 +415,19 @@ fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -
 
     let mut spans = vec![Span::styled(format!("{symbol} {filename}"), highlight(base_style))];
 
-    if entry.kind == DocKind::Tasks {
+    // Match by filename, not just `DocKind::Tasks`: spec-kit's tasks.md
+    // slot is `DocKind::Other("tasks.md")` (its own DocKind vocabulary has
+    // no `Tasks` variant -- design.md "DocEntry/DocKind::Other 재사용"), so
+    // checking the variant alone silently dropped its progress badge
+    // (spec-viewer-spec-kit-support requirement 6.1/6.2, caught by task
+    // 5.3's E2E check). `filename` already normalizes both to "tasks.md".
+    if filename == "tasks.md" {
         if let Some(progress) = entry.progress {
             // Requirement 4.1's "n/m" progress suffix; requirement 4.4's
-            // completed-highlight style when done == total.
+            // completed-highlight style when done == total, via the same
+            // `progress_style` rule `milestone_badge_spans` uses.
             let suffix = format!(" {}/{}", progress.done, progress.total);
-            let style = if progress.done == progress.total {
-                Style::new().add_modifier(Modifier::BOLD).fg(Color::Green)
-            } else {
-                base_style
-            };
+            let style = progress_style(progress.done, progress.total, base_style);
             spans.push(Span::styled(suffix, highlight(style)));
         } else if entry.exists {
             // Requirement 4.3: tasks.md exists but has no checkboxes at all.
@@ -399,31 +514,44 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a row containing {needle:?}, got:\n{rows:?}"))
     }
 
-    /// Locate the first row containing (ASCII) `needle` and return the
-    /// `(modifier, fg)` style of the cell at `needle`'s starting column.
-    fn cell_style_at(buffer: &Buffer, needle: &str) -> (Modifier, Color) {
+    /// Locate the real cell `(x, y)` where `needle` starts. Each cell's
+    /// symbol byte length is accumulated so `row.find(needle)`'s byte
+    /// offset (what `String::find` returns) can be mapped back to the cell
+    /// x it actually falls in -- a multibyte, single-width glyph before
+    /// `needle` (e.g. the tree's `▶`/`▼` expand indicator, 3 UTF-8 bytes
+    /// but one screen cell) otherwise throws the byte offset and the cell
+    /// index out of sync, silently pointing `cell_style_at`/`cell_bg_at` at
+    /// the wrong (often blank) cell.
+    fn find_cell(buffer: &Buffer, needle: &str) -> (u16, u16) {
         let area = buffer.area;
         for y in 0..area.height {
-            let row: String = (0..area.width).map(|x| buffer.get(x, y).symbol()).collect();
-            if let Some(idx) = row.find(needle) {
-                let cell = buffer.get(idx as u16, y);
-                return (cell.modifier, cell.fg);
+            let mut row = String::new();
+            let mut cell_of_byte = Vec::with_capacity(row.capacity());
+            for x in 0..area.width {
+                let symbol = buffer.get(x, y).symbol();
+                cell_of_byte.extend(std::iter::repeat(x).take(symbol.len()));
+                row.push_str(symbol);
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                return (cell_of_byte[byte_idx], y);
             }
         }
         panic!("expected a row containing {needle:?}");
     }
 
+    /// Locate the first row containing `needle` and return the
+    /// `(modifier, fg)` style of the cell at `needle`'s starting column.
+    fn cell_style_at(buffer: &Buffer, needle: &str) -> (Modifier, Color) {
+        let (x, y) = find_cell(buffer, needle);
+        let cell = buffer.get(x, y);
+        (cell.modifier, cell.fg)
+    }
+
     /// Same lookup as [`cell_style_at`], but the background color -- what
     /// task 19.4's search-match highlight (requirement 2.10) actually sets.
     fn cell_bg_at(buffer: &Buffer, needle: &str) -> Color {
-        let area = buffer.area;
-        for y in 0..area.height {
-            let row: String = (0..area.width).map(|x| buffer.get(x, y).symbol()).collect();
-            if let Some(idx) = row.find(needle) {
-                return buffer.get(idx as u16, y).bg;
-            }
-        }
-        panic!("expected a row containing {needle:?}");
+        let (x, y) = find_cell(buffer, needle);
+        buffer.get(x, y).bg
     }
 
     /// Takes `SpecRoot` by value (`SpecRoot` has no `Clone`, and `render`
@@ -509,23 +637,26 @@ mod tests {
     }
 
     #[test]
-    fn spec_with_ok_meta_shows_phase_badge() {
+    fn spec_with_ok_meta_shows_milestone_badge() {
         let root = build_root();
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 
-        // sample-signup/spec.json has "phase": "implementation".
-        assert!(rows.iter().any(|row| row.contains("sample-signup [implementation]")));
+        // sample-signup/spec.json approvals: requirements approved,
+        // bizProcess/design generated-not-approved, no "tasks" key at all
+        // -> 3 recorded gates, 1 done; phase "implementation" (not
+        // "completed") adds no extra milestone.
+        assert!(rows.iter().any(|row| row.contains("sample-signup 1/3")));
     }
 
     #[test]
-    fn spec_with_err_meta_shows_warning_badge_not_phase() {
+    fn spec_with_err_meta_shows_warning_badge_not_milestone_count() {
         let root = build_root();
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 
         let idx = row_index(&rows, "broken-json !");
-        assert!(!rows[idx].contains('['), "broken-json row should show no phase badge");
+        assert!(!rows[idx].contains('/'), "broken-json row should show no milestone badge");
     }
 
     #[test]
@@ -537,7 +668,7 @@ mod tests {
         // sample-signup/spec.json approvals: requirements approved,
         // bizProcess generated-not-approved, design generated-not-approved,
         // no "tasks" key at all (=> NoRecord).
-        let spec_row = row_index(&rows, "sample-signup [implementation]");
+        let spec_row = row_index(&rows, "sample-signup 1/3");
         let req_row = row_index(&rows, "● requirements.md");
         let biz_row = row_index(&rows, "○ biz-process.md");
         let design_row = row_index(&rows, "○ design.md");
@@ -610,7 +741,9 @@ mod tests {
         let spec = Spec {
             name: "all-done".to_string(),
             dir: PathBuf::from("/does/not/matter"),
-            meta: Err(crate::spec::MetaError::InvalidJson("n/a".to_string())),
+            kiro_meta: Some(Err(crate::spec::MetaError::InvalidJson("n/a".to_string()))),
+            milestones: vec![],
+            warning: Some("n/a".to_string()),
             docs: vec![DocEntry {
                 kind: DocKind::Tasks,
                 path: PathBuf::from("/does/not/matter/tasks.md"),
@@ -757,7 +890,7 @@ mod tests {
             .expect("draw");
 
         let rows = buffer_text(terminal.backend().buffer());
-        let spec_row = row_index(&rows, "sample-signup [implementation]") as u16;
+        let spec_row = row_index(&rows, "sample-signup 1/3") as u16;
 
         let identifier = crate::app::mouse::tree_identifier_at(&tree_state, 2, spec_row);
         assert_eq!(
@@ -770,6 +903,147 @@ mod tests {
         // rather than the last item rendered.
         let outside = crate::app::mouse::tree_identifier_at(&tree_state, 2, 39);
         assert_eq!(outside, None);
+    }
+
+    // --- spec-viewer-spec-kit-support task 3.1: shared `milestone_badge_spans`
+    // (requirements 3.1, 3.2, 3.3, 3.4) ------------------------------------
+
+    /// No-op highlight closure shared by the `milestone_badge_spans` unit
+    /// tests below -- they only care about the base style the function
+    /// itself computes, not the search-highlight patch-on.
+    fn no_highlight(style: Style) -> Style {
+        style
+    }
+
+    #[test]
+    fn milestone_badge_spans_all_done_is_bold_and_green() {
+        let milestones = vec![
+            Milestone { name: "a".to_string(), done: true },
+            Milestone { name: "b".to_string(), done: true },
+            Milestone { name: "c".to_string(), done: true },
+            Milestone { name: "d".to_string(), done: true },
+        ];
+        let spans = milestone_badge_spans(&milestones, &None, no_highlight);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), " 4/4");
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn milestone_badge_spans_partial_done_is_base_style() {
+        let milestones = vec![
+            Milestone { name: "a".to_string(), done: true },
+            Milestone { name: "b".to_string(), done: false },
+            Milestone { name: "c".to_string(), done: false },
+        ];
+        let spans = milestone_badge_spans(&milestones, &None, no_highlight);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), " 1/3");
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn milestone_badge_spans_empty_milestones_and_no_warning_yields_no_spans() {
+        let spans = milestone_badge_spans(&[], &None, no_highlight);
+        assert!(spans.is_empty(), "expected no badge spans, got {spans:?}");
+    }
+
+    #[test]
+    fn milestone_badge_spans_warning_overrides_milestone_count() {
+        // A warning must show " !" regardless of how many milestones are
+        // present (requirement 5.5's parse-failure badge takes precedence).
+        let milestones = vec![Milestone { name: "a".to_string(), done: true }];
+        let warning = Some("spec.json parse failed".to_string());
+        let spans = milestone_badge_spans(&milestones, &warning, no_highlight);
+
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, " !");
+    }
+
+    #[test]
+    fn spec_item_with_no_milestones_and_no_warning_shows_bare_name() {
+        let spec = Spec {
+            name: "bare-name".to_string(),
+            dir: PathBuf::from("/does/not/matter"),
+            kiro_meta: None,
+            milestones: vec![],
+            warning: None,
+            docs: vec![],
+            definition: None,
+        };
+        let root = SpecRoot { specs: vec![spec], steering: Vec::new() };
+        let buffer = render_root(root, vec![]);
+        let rows = buffer_text(&buffer);
+
+        let row = rows
+            .iter()
+            .find(|row| row.contains("bare-name"))
+            .expect("expected the bare-name spec row");
+        // No progress badge at all -- every badge form (`n/total` or the
+        // warning `!`) is ruled out by checking neither its digit-slash nor
+        // its warning-mark syntax appear anywhere on the row.
+        assert!(!row.contains('/'), "expected no milestone badge, got row: {row:?}");
+        assert!(!row.contains('!'), "expected no warning badge, got row: {row:?}");
+    }
+
+    #[test]
+    fn two_specs_with_different_milestone_totals_are_shown_independently() {
+        // `spec_a` carries a real doc child (unlike a `docs: vec![]` leaf)
+        // so it renders with the tree's `▶` expand glyph in front of its
+        // label, same as every real `.kiro` spec -- a multibyte,
+        // single-width glyph right before the badge text is exactly what
+        // exposed the `cell_style_at`/`cell_bg_at` byte-offset-as-x-coord
+        // bug (a leaf-only spec accidentally has no such glyph and hides
+        // it).
+        let spec_a = Spec {
+            name: "spec-a".to_string(),
+            dir: PathBuf::from("/does/not/matter/a"),
+            kiro_meta: None,
+            milestones: vec![
+                Milestone { name: "1".to_string(), done: true },
+                Milestone { name: "2".to_string(), done: true },
+                Milestone { name: "3".to_string(), done: true },
+            ],
+            warning: None,
+            docs: vec![DocEntry {
+                kind: DocKind::Requirements,
+                path: PathBuf::from("/does/not/matter/a/requirements.md"),
+                exists: true,
+                status: DocStatus::Approved,
+                progress: None,
+            }],
+            definition: None,
+        };
+        let spec_b = Spec {
+            name: "spec-b".to_string(),
+            dir: PathBuf::from("/does/not/matter/b"),
+            kiro_meta: None,
+            milestones: vec![
+                Milestone { name: "1".to_string(), done: true },
+                Milestone { name: "2".to_string(), done: false },
+                Milestone { name: "3".to_string(), done: false },
+            ],
+            warning: None,
+            docs: vec![],
+            definition: None,
+        };
+        let root = SpecRoot { specs: vec![spec_a, spec_b], steering: Vec::new() };
+        let buffer = render_root(root, vec![]);
+        let rows = buffer_text(&buffer);
+
+        assert!(rows.iter().any(|row| row.contains("spec-a 3/3")));
+        assert!(rows.iter().any(|row| row.contains("spec-b 1/3")));
+
+        let (a_modifier, a_fg) = cell_style_at(&buffer, "3/3");
+        assert!(a_modifier.contains(Modifier::BOLD));
+        assert_eq!(a_fg, Color::Green);
+
+        let (b_modifier, _) = cell_style_at(&buffer, "1/3");
+        assert!(!b_modifier.contains(Modifier::BOLD));
     }
 
     // --- spec-viewer-files-tree-scroll-latency ---------------------------
@@ -874,5 +1148,120 @@ mod tests {
             rows.iter().any(|r| r.contains("f000005.md")),
             "expected the newly-added entry to appear after entries changed, got:\n{rows:?}"
         );
+    }
+
+    // --- spec-viewer-spec-kit-support task 3.2: `TreeSource::SpecKit`
+    // rendering (requirements 2.1-2.5, 3.1-3.4) -----------------------------
+    //
+    // `Spec` is already the common domain type both `.kiro` and spec-kit
+    // build, so these tests construct `Spec` values directly in memory
+    // (same pattern the `.kiro`-side `two_specs_with_different_milestone_totals_are_shown_independently`
+    // test above uses) rather than going through `spec::spec_kit::build` --
+    // that function is real (Task 2.2, approved) but not yet `mod`-declared
+    // into this crate (Task 4's job), so nothing in this file can name it.
+
+    fn render_spec_kit_root(features: Vec<Spec>, open: Vec<Vec<NodeId>>) -> Buffer {
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut tree_state: TreeState<NodeId> = TreeState::default();
+        for path in open {
+            tree_state.open(path);
+        }
+        let source = TreeSource::SpecKit(features);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render(frame, area, &source, &mut tree_state, SortKey::Name, &[], &mut None);
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn spec_kit_feature(name: &str, done: usize, total: usize, docs: Vec<DocEntry>) -> Spec {
+        let milestones = (0..total)
+            .map(|i| Milestone { name: format!("m{i}"), done: i < done })
+            .collect();
+        Spec {
+            name: name.to_string(),
+            dir: PathBuf::from(format!("/does/not/matter/{name}")),
+            kiro_meta: None,
+            milestones,
+            warning: None,
+            docs,
+            definition: None,
+        }
+    }
+
+    fn spec_kit_doc(filename: &str) -> DocEntry {
+        DocEntry {
+            kind: DocKind::Other(filename.to_string()),
+            path: PathBuf::from(format!("/does/not/matter/{filename}")),
+            exists: true,
+            status: DocStatus::NotTracked,
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn spec_kit_feature_renders_name_and_milestone_badge() {
+        let feature = spec_kit_feature("001-login", 2, 3, vec![]);
+        let buffer = render_spec_kit_root(vec![feature], vec![]);
+        let rows = buffer_text(&buffer);
+
+        assert!(
+            rows.iter().any(|row| row.contains("001-login 2/3")),
+            "expected a feature row with its milestone badge, got:\n{rows:?}"
+        );
+    }
+
+    #[test]
+    fn spec_kit_expanding_feature_reveals_docs_in_canonical_order() {
+        let feature = spec_kit_feature(
+            "001-login",
+            3,
+            3,
+            vec![spec_kit_doc("spec.md"), spec_kit_doc("plan.md"), spec_kit_doc("tasks.md")],
+        );
+        let buffer = render_spec_kit_root(vec![feature], vec![vec![NodeId::Spec("001-login".to_string())]]);
+        let rows = buffer_text(&buffer);
+
+        let spec_row = row_index(&rows, "001-login 3/3");
+        let spec_md_row = row_index(&rows, "spec.md");
+        let plan_md_row = row_index(&rows, "plan.md");
+        let tasks_md_row = row_index(&rows, "tasks.md");
+
+        assert!(spec_row < spec_md_row);
+        assert!(spec_md_row < plan_md_row);
+        assert!(plan_md_row < tasks_md_row);
+    }
+
+    #[test]
+    fn spec_kit_tree_shows_no_steering_group() {
+        let feature = spec_kit_feature("001-login", 1, 3, vec![]);
+        let buffer = render_spec_kit_root(vec![feature], vec![]);
+        let rows = buffer_text(&buffer);
+
+        assert!(
+            !rows.iter().any(|row| row.contains("Steering")),
+            "spec-kit rendering must never show a Steering group, got:\n{rows:?}"
+        );
+    }
+
+    #[test]
+    fn spec_kit_two_features_with_different_progress_are_shown_independently() {
+        let far_along = spec_kit_feature("001-far-along", 3, 3, vec![spec_kit_doc("spec.md")]);
+        let just_started = spec_kit_feature("002-just-started", 1, 3, vec![]);
+        let buffer = render_spec_kit_root(vec![far_along, just_started], vec![]);
+        let rows = buffer_text(&buffer);
+
+        assert!(rows.iter().any(|row| row.contains("001-far-along 3/3")));
+        assert!(rows.iter().any(|row| row.contains("002-just-started 1/3")));
+
+        let (a_modifier, a_fg) = cell_style_at(&buffer, "3/3");
+        assert!(a_modifier.contains(Modifier::BOLD));
+        assert_eq!(a_fg, Color::Green);
+
+        let (b_modifier, _) = cell_style_at(&buffer, "1/3");
+        assert!(!b_modifier.contains(Modifier::BOLD));
     }
 }

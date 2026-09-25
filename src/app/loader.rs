@@ -320,12 +320,17 @@ fn utc_ymd_hms(secs: i64) -> (i64, u32, u32, u32, u32) {
 /// Like [`load_doc`], `width` is the panel's *outer* width (see
 /// [`DOC_PANEL_BORDER`]) — content renders at the inner width.
 pub fn load_definition(spec: &Spec, width: u16) -> DocView {
-    match &spec.meta {
-        Err(e) => DocView::MetaError {
+    // NOTE: compile-only fix for the `Spec.meta` -> `Spec.kiro_meta` rename
+    // (Task 1.1); behavior for `.kiro` specs (always `Some(...)`) is
+    // unchanged. `None` (a future spec-kit source with no single meta file)
+    // falls into the non-error branch, since there is no parse failure to
+    // report.
+    match &spec.kiro_meta {
+        Some(Err(e)) => DocView::MetaError {
             spec: spec.name.clone(),
             msg: e.to_string(),
         },
-        Ok(_) => {
+        Some(Ok(_)) | None => {
             let text = spec.definition.as_deref().unwrap_or("정의 없음");
             DocView::Definition {
                 spec: spec.name.clone(),
@@ -494,7 +499,7 @@ mod tests {
     #[test]
     fn load_definition_on_broken_meta_is_meta_error() {
         let spec = build_fixture_spec("broken-json");
-        assert!(spec.meta.is_err());
+        assert!(matches!(spec.kiro_meta, Some(Err(_))));
 
         let view = load_definition(&spec, 80);
 

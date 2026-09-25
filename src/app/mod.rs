@@ -1140,7 +1140,29 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
         // Requirement 1.9: a folder has no "정의" concept -- nothing to show.
         (_, Some(NodeId::SteeringGroup)) | (_, Some(NodeId::Dir(_))) => DocView::Empty,
         (TreeSource::Files(_), Some(NodeId::File(path))) => loader::load_doc(path, width),
-        (TreeSource::Files(_), Some(_)) | (TreeSource::Kiro(_), Some(NodeId::File(_))) => DocView::Empty,
+        // spec-kit reuses the same `NodeId::Spec`/`NodeId::Doc` kinds as
+        // `.kiro` (task 3.2), and `Spec`/`DocEntry` are the shared domain
+        // types, so this mirrors the `TreeSource::Kiro` arms above exactly,
+        // just walking `features: &[Spec]` directly instead of `root.specs`.
+        (TreeSource::SpecKit(features), Some(NodeId::Spec(name))) => {
+            match features.iter().find(|s| &s.name == name) {
+                Some(spec) => loader::load_for_selection(spec, None, width),
+                None => DocView::Empty,
+            }
+        }
+        (TreeSource::SpecKit(features), Some(NodeId::Doc(name, kind))) => {
+            match features.iter().find(|s| &s.name == name) {
+                Some(spec) => loader::load_for_selection(spec, Some(kind), width),
+                None => DocView::Empty,
+            }
+        }
+        // Mismatched (source, NodeId kind) combos that can't happen in
+        // practice -- each source only ever produces its own NodeId kinds --
+        // resolve to Empty rather than panic.
+        (TreeSource::Files(_), Some(_))
+        | (TreeSource::Kiro(_), Some(NodeId::File(_)))
+        | (TreeSource::SpecKit(_), Some(NodeId::Steering(_)))
+        | (TreeSource::SpecKit(_), Some(NodeId::File(_))) => DocView::Empty,
     }
 }
 
@@ -1179,10 +1201,15 @@ fn reload_current_doc(state: &AppState, width: u16) -> Option<DocView> {
 
 /// Re-read `state.kiro_root` from disk and rebuild `state.root` in place
 /// (requirements 7.3, 7.4: metadata/structure changes are picked up on any
-/// `Action::Fs`/`Action::Refresh`), the same way for either `TreeSource`
-/// (requirement 1.9's file-watch parity for `--all` mode). Debounce/
-/// selective diffing is explicitly out of scope — this always does a full
-/// rebuild, which this crate's data sizes make cheap.
+/// `Action::Fs`/`Action::Refresh`), the same way for every `TreeSource`
+/// (requirement 1.9's file-watch parity for `--all` mode, and 1.4's parity
+/// for spec-kit mode). Debounce/selective diffing is explicitly out of
+/// scope — this always does a full rebuild, which this crate's data sizes
+/// make cheap.
+///
+/// For `TreeSource::SpecKit`, `state.kiro_root` holds the `specs/` watch
+/// root (set by `main::resolve_source`, task 4) -- the same field `.kiro`
+/// mode stores its own root in, just pointing at a different directory.
 fn resync(state: &mut AppState) {
     state.root = match &state.root {
         TreeSource::Kiro(_) => {
@@ -1196,6 +1223,9 @@ fn resync(state: &mut AppState) {
             TreeSource::Kiro(root)
         }
         TreeSource::Files(_) => TreeSource::Files(crate::spec::FsTree::scan(&state.kiro_root)),
+        TreeSource::SpecKit(_) => {
+            TreeSource::SpecKit(crate::spec::spec_kit::build(&state.kiro_root))
+        }
     };
     refresh_current_doc(state);
 }
@@ -1588,7 +1618,7 @@ mod reducer_tests {
     fn spec_names(state: &AppState) -> Vec<String> {
         match &state.root {
             TreeSource::Kiro(root) => root.specs.iter().map(|s| s.name.clone()).collect(),
-            TreeSource::Files(_) => panic!("expected TreeSource::Kiro"),
+            TreeSource::SpecKit(_) | TreeSource::Files(_) => panic!("expected TreeSource::Kiro"),
         }
     }
 
@@ -2500,9 +2530,10 @@ mod reducer_tests {
             .iter()
             .find(|s| s.name == "demo")
             .expect("demo spec still present after resync");
-        match &spec.meta {
-            Ok(meta) => assert_eq!(meta.phase, "implementation"),
-            Err(e) => panic!("expected Ok meta after resync, got {e}"),
+        match &spec.kiro_meta {
+            Some(Ok(meta)) => assert_eq!(meta.phase, "implementation"),
+            Some(Err(e)) => panic!("expected Ok meta after resync, got {e}"),
+            None => panic!("expected Some(kiro_meta) for a .kiro spec"),
         }
         assert_eq!(state.tree.selected().to_vec(), sel);
 
@@ -2524,6 +2555,81 @@ mod reducer_tests {
         assert!(state.root.as_kiro().unwrap().specs.iter().any(|s| s.name == "second-spec"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    // --- spec-viewer-spec-kit-support task 4: SpecKit resync + selection --
+
+    fn temp_spec_kit_specs_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spec_viewer_resync_spec_kit_{name}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_spec_kit_feature(specs_dir: &Path, name: &str, spec_md: &str) {
+        let dir = specs_dir.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("spec.md"), spec_md).unwrap();
+    }
+
+    fn build_spec_kit_state_from(specs_dir: &Path, size: (u16, u16)) -> AppState {
+        let features = crate::spec::spec_kit::build(specs_dir);
+        AppState::new(
+            TreeSource::SpecKit(features),
+            specs_dir.to_path_buf(),
+            size,
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        )
+    }
+
+    #[test]
+    fn fs_event_picks_up_newly_added_spec_kit_feature_directory() {
+        let specs_dir = temp_spec_kit_specs_dir("structure_change");
+        write_spec_kit_feature(&specs_dir, "001-first", "# First\n");
+
+        let mut state = build_spec_kit_state_from(&specs_dir, (120, 40));
+        match &state.root {
+            TreeSource::SpecKit(features) => assert_eq!(features.len(), 1),
+            _ => panic!("expected TreeSource::SpecKit"),
+        }
+
+        write_spec_kit_feature(&specs_dir, "002-second", "# Second\n");
+        assert_eq!(update(&mut state, fs_event()), Control::Continue);
+
+        match &state.root {
+            TreeSource::SpecKit(features) => {
+                assert_eq!(features.len(), 2);
+                assert!(features.iter().any(|s| s.name == "002-second"));
+            }
+            _ => panic!("expected TreeSource::SpecKit after resync"),
+        }
+
+        fs::remove_dir_all(&specs_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_selection_spec_kit_doc_returns_rendered_view() {
+        let specs_dir = temp_spec_kit_specs_dir("doc_selection");
+        write_spec_kit_feature(&specs_dir, "001-login", "# Login Spec\n\nbody text\n");
+
+        let mut state = build_spec_kit_state_from(&specs_dir, (120, 40));
+        state.tree.select(vec![
+            NodeId::Spec("001-login".to_string()),
+            NodeId::Doc("001-login".to_string(), DocKind::Other("spec.md".to_string())),
+        ]);
+        key_action(&mut state, KeyCode::Enter);
+
+        match &state.doc {
+            DocView::Rendered { .. } => {}
+            other => panic!("expected DocView::Rendered, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&specs_dir).unwrap();
     }
 
     #[test]
@@ -2628,9 +2734,10 @@ mod reducer_tests {
             .iter()
             .find(|s| s.name == "demo")
             .expect("demo spec still present after manual refresh");
-        match &spec.meta {
-            Ok(meta) => assert_eq!(meta.phase, "implementation"),
-            Err(e) => panic!("expected Ok meta after manual refresh, got {e}"),
+        match &spec.kiro_meta {
+            Some(Ok(meta)) => assert_eq!(meta.phase, "implementation"),
+            Some(Err(e)) => panic!("expected Ok meta after manual refresh, got {e}"),
+            None => panic!("expected Some(kiro_meta) for a .kiro spec"),
         }
 
         fs::remove_dir_all(&root).unwrap();

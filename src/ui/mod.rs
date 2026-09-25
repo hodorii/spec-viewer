@@ -437,11 +437,11 @@ mod tests {
         );
         // Not "sample-signup" alone: the status bar (always rendered,
         // regardless of layout mode) shows the doc's path, which itself
-        // contains that spec name -- "sample-signup 1/3" is the tree
-        // panel's own approval-gate badge syntax (`tree_panel::spec_item`),
-        // never emitted anywhere else.
+        // contains that spec name -- "[implementation]" is the tree panel's
+        // own phase-badge syntax (`tree_panel::spec_item`), never emitted
+        // anywhere else.
         assert!(
-            find_col(&rows, "sample-signup 1/3").is_none(),
+            find_col(&rows, "[implementation]").is_none(),
             "did not expect tree content when Single mode is showing the doc"
         );
     }
@@ -970,7 +970,7 @@ mod tests {
         let mut state = build_state((120, 40));
         let buffer = draw(&mut state, 120, 40);
         let rows = buffer_rows(&buffer);
-        let row = row_of(&rows, "sample-signup 1/3");
+        let row = row_of(&rows, "sample-signup [implementation]");
         let col = state.layout.tree.x + 2;
         let click = || {
             app::Action::Mouse(crossterm::event::MouseEvent {

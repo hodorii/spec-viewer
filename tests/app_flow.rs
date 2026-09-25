@@ -221,10 +221,10 @@ fn l2_a2_expanding_a_spec_shows_docs_in_canonical_order_with_known_status() {
     // and no research.md / extra files, so the canonical slot order is
     // exactly Requirements -> BizProcess -> Design -> Tasks.
     // Wide enough that the tree panel's 30% share (see `ui::mod`'s
-    // `TREE_PANEL_PERCENT`) can fit the full "sample-signup 1/3" label
-    // without truncation -- unlike `ui::tree_panel`'s own unit tests, which
-    // give the tree panel the *entire* frame width, this test renders the
-    // full `ui::render` composition (tree + doc side by side).
+    // `TREE_PANEL_PERCENT`) can fit the full "sample-signup [implementation]"
+    // label without truncation -- unlike `ui::tree_panel`'s own unit tests,
+    // which give the tree panel the *entire* frame width, this test renders
+    // the full `ui::render` composition (tree + doc side by side).
     let mut state = build_state_from(&fixtures_root(), (150, 30));
     state
         .tree
@@ -238,7 +238,7 @@ fn l2_a2_expanding_a_spec_shows_docs_in_canonical_order_with_known_status() {
     let buffer = terminal.backend().buffer().clone();
     let rows = buffer_text(&buffer);
 
-    let spec_row = row_index(&rows, "sample-signup 1/3");
+    let spec_row = row_index(&rows, "sample-signup [implementation]");
     let req_row = row_index(&rows, "● requirements.md");
     let biz_row = row_index(&rows, "○ biz-process.md");
     let design_row = row_index(&rows, "○ design.md");
@@ -472,7 +472,7 @@ fn l2_mouse_click_wheel_tree_open_drag_select_copy() {
     // select+expand it (a folder click also toggles), then click its
     // newly-visible requirements.md row to select+load it.
     let rows = buffer_text(terminal.backend().buffer());
-    let alpha_row = row_index(&rows, "alpha 1/1") as u16;
+    let alpha_row = row_index(&rows, "alpha [design]") as u16;
     step(&mut terminal, &mut state, mouse(MouseEventKind::Down(MouseButton::Left), tree_area.x + 2, alpha_row));
     assert_eq!(state.tree.selected(), [NodeId::Spec("alpha".to_string())]);
     assert!(

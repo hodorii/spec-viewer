@@ -34,7 +34,7 @@
 - 2.8: [steering 파일 표시] → front matter `inclusion` 값(`always`/`manual`/`fileMatch`/`auto`, 부재 시 `always`)을 배지로 표시.
 
 ### 3. 스펙 상태 표시
-- 3.1: [스펙 노드 표시] → `spec.json`의 `approvals`에 기록된 항목 중 승인된 개수를 `n/total`로 이름 옆에 표시(`doc_item`의 tasks.md 진행률 배지와 같은 표기, 전부 승인되면 굵게+녹색). `approvals`가 비어 있으면 배지 없이 이름만 표시. (원래는 `phase` 문자열 그대로 표시했으나, 진행 정도를 한눈에 보기 어려워 승인 게이트 개수 표시로 변경.)
+- 3.1: [스펙 노드 표시] → `spec.json`의 `phase` 값을 이름 옆에 표시.
 - 3.2: [문서 노드 표시] → `spec.json` `approvals`의 대응 키(`requirements`·`bugfix`·`bizProcess`·`design`·`tasks`)로 승인 상태(미생성/미승인/승인됨)를 배지로 표시. `research`·기타 문서는 배지 없음.
 - 3.3: [스키마 혼용] → `feature_name` 및 `name` 키를 모두 지원하여 동일하게 표시.
 - 3.4: [승인 항목 누락] → "상태 없음"으로 표시하고 정상 동작 유지.

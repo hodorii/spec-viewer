@@ -35,6 +35,9 @@ m [path]                 # find the nearest .kiro root at/above `path` (default:
 m --all [dir]             # browse any markdown directory, no .kiro required
 ```
 
+`--all` only picks which mode you *start* in — press `m` at any time to switch
+between full mode and spec mode without restarting.
+
 Flags:
 - `--tree <auto|always|hidden|single>` — tree panel visibility mode (default `auto`)
 - `--sort <name|phase|updated|progress>` — initial spec-tree sort key
@@ -48,7 +51,11 @@ Keys: `q` quit · `Tab` switch panel · `j`/`k` line scroll · `d`/`u` half-page
 `[`/`]` prev/next heading · `/` search, `n`/`N` next/prev match · `t` table of
 contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/single) ·
 `s` cycle sort key · `e` edit the displayed file in an external editor (`--editor` >
-`$VISUAL` > `$EDITOR` > `vi`) · `?` help · arrow keys for tree/document navigation.
+`$VISUAL` > `$EDITOR` > `vi`) · `m` toggle between full mode and spec mode at
+runtime (`--all` only sets which one you start in) · `o`/`c` expand/collapse
+every tree node at once (individual node fold/unfold via `Left`/`Right`/`Enter`
+stays one level at a time) · `?` help (scrolls with `j`/`k`/arrows) · arrow keys
+for tree/document navigation.
 
 ## Diagram engines
 

@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame, area: Rect, popup: &Popup, doc: &DocView) {
 
     match popup {
         Popup::Toc(selected) => render_toc(frame, popup_area, *selected, doc),
-        Popup::Help(entries) => render_help(frame, popup_area, entries),
+        Popup::Help(entries, selected) => render_help(frame, popup_area, entries, *selected),
         Popup::SearchInput(buffer) => render_search_input(frame, popup_area, buffer),
         Popup::Message(msg) => render_message(frame, popup_area, msg),
     }
@@ -85,14 +85,29 @@ fn render_toc(frame: &mut Frame, area: Rect, selected: usize, doc: &DocView) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_help(frame: &mut Frame, area: Rect, entries: &[(String, String)]) {
+/// `selected` mirrors `render_toc`'s own `ListState`-driven auto-scroll:
+/// `BINDINGS` (34 entries as of `spec-viewer-tree-navigation-modes`) does
+/// not fit this popup's fixed-height area on a realistically sized
+/// terminal, confirmed by a real pty smoke test during that spec's
+/// verification -- without a selected row for `List` to scroll to, several
+/// bindings near the end of the array were simply unreachable.
+fn render_help(frame: &mut Frame, area: Rect, entries: &[(String, String)], selected: usize) {
     let block = Block::new().borders(Borders::ALL).title("Help");
     let items: Vec<ListItem> = entries
         .iter()
         .map(|(key, desc)| ListItem::new(format!("{key}  {desc}")))
         .collect();
-    let list = List::new(items).block(block);
-    frame.render_widget(list, area);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default().with_selected(if entries.is_empty() {
+        None
+    } else {
+        Some(selected)
+    });
+
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_search_input(frame: &mut Frame, area: Rect, buffer: &str) {
@@ -250,7 +265,7 @@ mod tests {
             ("q".to_string(), "종료".to_string()),
             ("?".to_string(), "도움말".to_string()),
         ];
-        let popup = Popup::Help(entries);
+        let popup = Popup::Help(entries, 0);
         let doc = DocView::Empty;
 
         let backend = TestBackend::new(100, 40);
@@ -275,27 +290,23 @@ mod tests {
     /// bindings actually reach the help popup a user opens, in the same
     /// "key  설명" format every other binding uses.
     ///
-    /// Terminal height chosen tall enough to fit all of `BINDINGS`'
-    /// entries: `render_help` draws a plain non-scrolling `List` into a
-    /// fixed 60%-height popup area (`centered_rect(60, 60, area)`), so on a
-    /// realistically small terminal several bindings near the end of the
-    /// array -- including this feature's own `m`/`o`/`c`, and even the
-    /// already-shipped `e` (edit) binding from `spec-viewer-editor-mode` --
-    /// are silently clipped off-screen entirely (confirmed while writing
-    /// this test: reproduces at 100x40). That clipping is a pre-existing,
-    /// cross-cutting limitation of the Help popup's own layout, unrelated to
-    /// this feature and out of its Boundary Commitments to fix -- this test
-    /// instead verifies what this task actually owns (the three bindings
-    /// reach the shared help-exposure mechanism in the right format) under
-    /// a terminal tall enough for that mechanism to show its own output in
-    /// full.
+    /// Uses a normal-sized terminal (100x40, like every other test in this
+    /// file) rather than an oversized one: `BINDINGS` (34 entries) does not
+    /// fit this popup's fixed-height area at a realistic size, confirmed by
+    /// a real pty smoke test during this spec's verification -- fixed by
+    /// giving `render_help` a stateful, auto-scrolling `List` (mirroring
+    /// `render_toc`'s own pattern) instead of a static one. Selecting the
+    /// last row (`collapse_all`/`c`) scrolls the tail of the list -- where
+    /// `edit`/`toggle_source_mode`/`expand_all`/`collapse_all` all sit --
+    /// into view, proving the scroll (not just the data) actually works.
     #[test]
     fn help_popup_real_render_shows_mode_switch_and_expand_collapse_keys() {
         let entries = crate::app::keymap::help_entries();
-        let popup = Popup::Help(entries);
+        let last = entries.len() - 1;
+        let popup = Popup::Help(entries, last);
         let doc = DocView::Empty;
 
-        let backend = TestBackend::new(100, 64);
+        let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {

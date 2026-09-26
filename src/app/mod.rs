@@ -216,7 +216,18 @@ pub struct SearchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
     Toc(usize),
-    Help(Vec<(String, String)>),
+    /// The bindings list plus the currently-highlighted row (mirrors
+    /// `Toc(usize)`'s own "index alongside the data" shape): `render_help`
+    /// (ui::popup) uses a stateful `List` keyed off this index so the view
+    /// auto-scrolls to keep it visible -- needed because the entry count
+    /// (34 as of `spec-viewer-tree-navigation-modes`) exceeds what fits in
+    /// the popup's fixed-height area on a realistically sized terminal,
+    /// confirmed via a real pty smoke test during that spec's verification
+    /// (a defect this session found and fixed: without scrolling, several
+    /// bindings near the end of `BINDINGS` -- including `m`/`o`/`c` and
+    /// `e` -- were unreachable in the help screen on any terminal shorter
+    /// than roughly 60 rows).
+    Help(Vec<(String, String)>, usize),
     SearchInput(String),
     Message(String),
 }
@@ -892,7 +903,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
             Control::Continue
         }
         "help" => {
-            state.popup = Some(Popup::Help(keymap::help_entries()));
+            state.popup = Some(Popup::Help(keymap::help_entries(), 0));
             Control::Continue
         }
         "select" => {
@@ -1106,12 +1117,18 @@ fn handle_popup_key(state: &mut AppState, key: KeyEvent) -> Control {
                 _ => Some(Popup::SearchInput(buffer)),
             };
         }
-        Some(Popup::Help(entries)) => {
+        Some(Popup::Help(entries, selected)) => {
             let is_help_reopen_key = key.code == KeyCode::Char('?');
-            state.popup = if key.code == KeyCode::Esc || is_help_reopen_key {
-                None
-            } else {
-                Some(Popup::Help(entries))
+            let len = entries.len();
+            state.popup = match key.code {
+                _ if key.code == KeyCode::Esc || is_help_reopen_key => None,
+                KeyCode::Down | KeyCode::Char('j') if len > 0 => {
+                    Some(Popup::Help(entries, (selected + 1) % len))
+                }
+                KeyCode::Up | KeyCode::Char('k') if len > 0 => {
+                    Some(Popup::Help(entries, (selected + len - 1) % len))
+                }
+                _ => Some(Popup::Help(entries, selected)),
             };
         }
         Some(Popup::Message(msg)) => {
@@ -2259,11 +2276,12 @@ mod reducer_tests {
 
         key_action(&mut state, KeyCode::Char('?'));
         match &state.popup {
-            Some(Popup::Help(entries)) => {
+            Some(Popup::Help(entries, selected)) => {
                 assert!(entries.iter().any(|(k, h)| k == "q" && h.contains("종료")));
                 assert!(entries.iter().any(|(_, h)| h.contains("전환")));
                 assert!(entries.iter().any(|(k, _)| k == "["));
                 assert!(entries.iter().any(|(k, _)| k == "]"));
+                assert_eq!(*selected, 0, "help popup should open with the first row highlighted");
             }
             other => panic!("expected Popup::Help, got {other:?}"),
         }
@@ -2275,6 +2293,49 @@ mod reducer_tests {
         key_action(&mut state, KeyCode::Char('?'));
         assert!(state.popup.is_some());
         key_action(&mut state, KeyCode::Char('?'));
+        assert_eq!(state.popup, None);
+    }
+
+    /// Regression for a real pty smoke test finding during
+    /// `spec-viewer-tree-navigation-modes` verification: the help popup's
+    /// `List` doesn't fit all 34 bindings in a realistically sized terminal,
+    /// so `j`/`k`/Down/Up must move the highlighted row (letting
+    /// `render_help`'s stateful `List` auto-scroll it into view) rather than
+    /// being ignored the way every other popup key used to be.
+    #[test]
+    fn help_popup_down_and_up_move_the_highlighted_row_and_wrap() {
+        let mut state = test_state();
+        key_action(&mut state, KeyCode::Char('?'));
+        let len = match &state.popup {
+            Some(Popup::Help(entries, 0)) => entries.len(),
+            other => panic!("expected Popup::Help opened at row 0, got {other:?}"),
+        };
+        assert!(len > 2, "test assumes more than a couple of bindings exist");
+
+        key_action(&mut state, KeyCode::Down);
+        assert!(matches!(state.popup, Some(Popup::Help(_, 1))));
+
+        key_action(&mut state, KeyCode::Char('j'));
+        assert!(matches!(state.popup, Some(Popup::Help(_, 2))));
+
+        key_action(&mut state, KeyCode::Char('k'));
+        assert!(matches!(state.popup, Some(Popup::Help(_, 1))));
+
+        key_action(&mut state, KeyCode::Up);
+        assert!(matches!(state.popup, Some(Popup::Help(_, 0))));
+
+        // Wraps in both directions.
+        key_action(&mut state, KeyCode::Up);
+        match &state.popup {
+            Some(Popup::Help(_, selected)) => assert_eq!(*selected, len - 1),
+            other => panic!("expected Popup::Help, got {other:?}"),
+        }
+        key_action(&mut state, KeyCode::Down);
+        assert!(matches!(state.popup, Some(Popup::Help(_, 0))));
+
+        // Esc still closes it regardless of scroll position.
+        key_action(&mut state, KeyCode::Down);
+        key_action(&mut state, KeyCode::Esc);
         assert_eq!(state.popup, None);
     }
 
@@ -3142,7 +3203,7 @@ mod reducer_tests {
         let mut state = test_state();
 
         key_action(&mut state, KeyCode::Char('?'));
-        assert!(matches!(state.popup, Some(Popup::Help(_))));
+        assert!(matches!(state.popup, Some(Popup::Help(_, _))));
 
         key_action(&mut state, KeyCode::Esc);
         assert_eq!(state.popup, None);

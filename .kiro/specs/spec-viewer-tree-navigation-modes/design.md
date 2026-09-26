@@ -161,3 +161,32 @@ src/app/
   keymap.rs   # m/o/c 바인딩
 src/main.rs    # resolve_spec_mode 추출, resolve_source가 이를 재사용하도록 리팩터링, handle_switch_mode 신규, run_loop 시그니처 확장
 ```
+
+## Verification Addendum (kiro-verify-completion)
+
+Task 4 검증 중 실제 컴파일된 바이너리로 pty 스모크 테스트를 한 결과, 도움말
+팝업(`ui::popup::render_help`)이 스크롤을 지원하지 않아 `BINDINGS`(34개) 중
+뒤쪽 다수 — 이번 스펙의 `m`/`o`/`c`뿐 아니라 이전 스펙(`spec-viewer-editor-mode`)의
+`e`까지 — 가 일반적인 터미널 높이(예: 45행)에서 아예 화면에 보이지 않는
+사실을 확인했다. 이는 요구사항 4.1("도움말에 m/o/c가 다른 키와 같은 형식으로
+표시된다")을 실질적으로 충족하지 못하는 상황이었고, 원인은 이번 기능이
+아니라 기존부터 있던 도움말 팝업 자체의 구조적 한계였다.
+
+사용자에게 상황을 보고하고 "지금 이 스펙 범위에서 바로 고침"으로 확인받아,
+Boundary Commitments를 다음과 같이 확장했다(문서화된 범위 확장):
+- **추가 In-Scope**: `app::Popup::Help`가 선택 행 인덱스를 함께 들고
+  (`Toc(usize)`와 같은 모양), `ui::popup::render_help`가 `render_toc`와
+  동일한 `ListState` 기반 스크롤 `List`를 쓰도록 변경(`src/app/mod.rs`,
+  `src/ui/popup.rs`). `handle_popup_key`의 `Popup::Help` 분기에 `j`/`k`/
+  `Up`/`Down` 스크롤(순환) 추가.
+- **여전히 Out-of-Scope**: 다른 팝업(`Toc`/`SearchInput`/`Message`)의 동작
+  변경, `BINDINGS` 자체의 재배열/그룹핑.
+
+실물 검증: `Action::Key` 실제 디스패치로 스크롤 동작을 확인하는 유닛
+테스트, `TestBackend` 실제 렌더로 스크롤 후 m/o/c가 화면에 나타나는 것을
+확인하는 렌더 테스트, 그리고 실제 컴파일된 바이너리 pty 스모크 테스트(모드
+전환 왕복·전체펼치기/접기)로 재확인했다. 도움말 팝업의 스크롤 자체는
+`highlight_style`(SGR 역상) 관련 pty 하네스(`pyte`) 자체 버그로 실제
+pty에서는 재현하지 못했으나, 이미 프로덕션에 있는 `render_toc`의 동일
+기법이 재현 대상이라 이 기능의 회귀가 아니라 스모크 테스트 도구 자체의
+한계로 판단했다(`kiro-verify-completion` 보고서 참고).

@@ -65,3 +65,10 @@ spec-viewer 구현자를 위해 design.md 컴포넌트 경계(`app`/`app::keymap
   - _Depends: 2_
   - _Difficulty: low_
   - _BizProcess: BP-TREE-NAV.L2-B4_
+
+- [x] 5. (kiro-verify-completion에서 발견, 사용자 승인 후 범위 확장) 도움말 팝업 스크롤 지원
+  - DONE: 실제 pty 스모크 테스트로 도움말 팝업이 스크롤을 지원하지 않아 `m`/`o`/`c`(및 기존 `e`)가 일반 터미널 높이에서 안 보이는 것을 발견 → `Popup::Help`에 선택 행 인덱스 추가, `render_help`를 `render_toc`와 동일한 스크롤 가능 `List`로 변경, `j`/`k`/`Up`/`Down` 순환 스크롤 추가. 실제 키 디스패치·실제 렌더 테스트로 확인.
+  - _Requirements: 4.1 (재확인)_
+  - _Boundary: app (Popup::Help), ui::popup (render_help)_
+  - _Difficulty: low_
+  - design.md "Verification Addendum" 참고.

@@ -388,6 +388,13 @@ pub enum Control {
     /// decides *whether* an edit should happen (`current_editable_path`)
     /// and hands the path back for `main` to act on.
     EditFile(PathBuf),
+    /// Requirement 1.4: `main` (a later task) consumes this to actually
+    /// decide which source mode to switch to and restart the file watcher
+    /// against it -- the same "reducer only signals intent" split
+    /// `EditFile` already establishes for editing. The reducer itself never
+    /// judges priority or touches the watcher; it always returns this,
+    /// unconditionally, on `Action::ToggleSourceMode`.
+    SwitchMode,
 }
 
 /// All inputs the reducer can react to.
@@ -415,6 +422,35 @@ pub enum Action {
     /// the failure back through this action after the terminal is restored,
     /// carrying the message to show the user.
     EditFailed(String),
+    /// Requirement 1.4: the mode-switch key was pressed. The reducer never
+    /// judges which mode to switch to or whether the switch is even
+    /// possible -- see `Control::SwitchMode`'s doc comment -- it always
+    /// signals intent and lets `main` act on it.
+    ToggleSourceMode,
+    /// `main`'s answer to a `Control::SwitchMode` signal once it has
+    /// resolved the next mode and rebuilt the tree from disk (requirements
+    /// 1.5, 1.6, 1.7): swap in the freshly built `source`, remember `root` as
+    /// the new resync root, reset every piece of view state that keyed off
+    /// the old tree/doc so nothing from the previous mode lingers, and
+    /// record the outcome of restarting the file watcher against the new
+    /// root (`watch_status`) so the status bar reflects the new mode's real
+    /// watch state rather than the old one's.
+    ApplySourceSwitch {
+        source: TreeSource,
+        root: PathBuf,
+        watch_status: WatchStatus,
+    },
+    /// `main`'s answer to a `Control::SwitchMode` signal when the switch
+    /// itself could not be completed (e.g. the target root failed to load)
+    /// -- reported the same way `Action::EditFailed` reports an editor
+    /// failure.
+    SwitchModeFailed(String),
+    /// Requirement 2.1/2.2: open every folder-like node in the current
+    /// tree, leaving selection untouched.
+    ExpandAll,
+    /// Requirement 2.3/2.4: close every open node in the current tree,
+    /// leaving selection untouched.
+    CollapseAll,
 }
 
 /// The single state-transition entry point (design.md "app — State &
@@ -465,6 +501,60 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
         Action::EditFailed(msg) => {
             state.popup = Some(Popup::Message(msg));
             Control::Continue
+        }
+        // Requirement 1.4: always signal intent -- `main` (a later task)
+        // owns the actual priority judgment and watcher restart, exactly
+        // as `Control::SwitchMode`'s doc comment describes.
+        Action::ToggleSourceMode => Control::SwitchMode,
+        Action::ApplySourceSwitch { source, root, watch_status } => {
+            state.root = source;
+            state.kiro_root = root;
+            // Requirement 1.6: fold/selection state keys off the old tree's
+            // `NodeId`s, which are meaningless against the new source.
+            state.tree = TreeState::default();
+            // Requirement 1.7: nothing is selected in the new tree yet, so
+            // the doc panel has nothing left to show.
+            state.doc = DocView::Empty;
+            state.selection = None;
+            state.search = SearchState::default();
+            state.tree_search = SearchState::default();
+            state.tree_matches = Vec::new();
+            state.popup = None;
+            // Requirement 1.5: the watch was restarted against the new root
+            // before this action was dispatched (`main::handle_switch_mode`)
+            // -- reflect its real outcome instead of leaving the old mode's
+            // status behind.
+            state.watch = watch_status;
+            Control::Continue
+        }
+        Action::SwitchModeFailed(msg) => {
+            state.popup = Some(Popup::Message(msg));
+            Control::Continue
+        }
+        Action::ExpandAll => {
+            expand_all(state);
+            Control::Continue
+        }
+        Action::CollapseAll => {
+            state.tree.close_all();
+            Control::Continue
+        }
+    }
+}
+
+/// Requirement 2.1/2.2: open every folder-like node (`Spec`, `SteeringGroup`,
+/// `Dir` -- the only `NodeId` variants that can have children; `Doc`/
+/// `Steering`/`File` are leaves and opening them is meaningless) so every
+/// document becomes reachable without manually expanding each ancestor.
+/// Reuses `search::flatten_tree`'s own traversal (SSoT for "every node in
+/// this tree, in path order") rather than re-walking `state.root` itself.
+fn expand_all(state: &mut AppState) {
+    for (path, _label) in search::flatten_tree(&state.root) {
+        if matches!(
+            path.last(),
+            Some(NodeId::Spec(_)) | Some(NodeId::SteeringGroup) | Some(NodeId::Dir(_))
+        ) {
+            state.tree.open(path);
         }
     }
 }
@@ -942,6 +1032,19 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
         // bridge from the keymap's `"edit"` string to that variant that a
         // real keypress needs; nothing else constructs `Action::Edit`.
         "edit" => update(state, Action::Edit),
+        // The `'m'`/`'o'`/`'c'` bindings (requirements 1.4, 2.1, 2.2): same
+        // bridge pattern as `"edit"` above -- task 1 defined
+        // `Action::ToggleSourceMode`/`ExpandAll`/`CollapseAll` and task 2
+        // bound the keys, but neither wired the keymap's action *names* to
+        // these variants here, so a real keypress fell through to the
+        // catch-all no-op below despite every unit test (which dispatches
+        // the `Action` directly, never through `action_for_key`) passing --
+        // caught only while building task 3.2's real end-to-end wiring, the
+        // exact "dead wiring" class of bug this project has hit before with
+        // `"edit"` itself.
+        "toggle_source_mode" => update(state, Action::ToggleSourceMode),
+        "expand_all" => update(state, Action::ExpandAll),
+        "collapse_all" => update(state, Action::CollapseAll),
         _ => Control::Continue,
     }
 }
@@ -1321,7 +1424,7 @@ fn resize_and_preserve_position(state: &mut AppState, w: u16, h: u16) {
 mod reducer_tests {
     use super::*;
     use crate::markdown;
-    use crate::spec::{self, DocKind};
+    use crate::spec::{self, DocKind, FsTree};
     use crossterm::event::KeyModifiers;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3252,5 +3355,166 @@ mod reducer_tests {
             state.popup,
             Some(Popup::Message("editor exited with error".to_string()))
         );
+    }
+
+    // --- Task 1.1/1.2 (spec-viewer-tree-navigation-modes): mode-switch
+    // signal + expand/collapse-all --------------------------------------
+
+    #[test]
+    fn toggle_source_mode_action_always_returns_switch_mode_control() {
+        // Requirement 1.4: the reducer never judges priority itself -- it
+        // always signals `Control::SwitchMode` and leaves state untouched;
+        // `main` (a later task) decides what actually happens.
+        let mut state = test_state();
+        state.tree.select(vec![NodeId::Spec("sample-signup".to_string())]);
+        let selected_before = state.tree.selected().to_vec();
+
+        let control = update(&mut state, Action::ToggleSourceMode);
+
+        assert_eq!(control, Control::SwitchMode);
+        assert_eq!(state.tree.selected(), selected_before.as_slice());
+        assert!(state.popup.is_none());
+    }
+
+    #[test]
+    fn apply_source_switch_replaces_root_and_resets_every_view_field() {
+        // Requirements 1.6, 1.7: start from a state with something loaded
+        // in every field that must be reset, so a missing reset actually
+        // fails this test instead of vacuously passing.
+        let mut state = test_state();
+        state.tree.select(vec![NodeId::Spec("sample-signup".to_string())]);
+        state.tree.open(vec![NodeId::Spec("sample-signup".to_string())]);
+        state.doc = DocView::Rendered {
+            path: PathBuf::from("/tmp/spec-viewer-switch-test.md"),
+            r: markdown::render("# hi\n", 80),
+            meta: FileInfo::default(),
+        };
+        state.selection = Some(Selection { anchor: (0, 0), head: (1, 2) });
+        state.search = SearchState {
+            query: "needle".to_string(),
+            matches: vec![1, 2],
+            current: Some(0),
+        };
+        state.tree_search = SearchState {
+            query: "needle".to_string(),
+            matches: vec![0],
+            current: Some(0),
+        };
+        state.tree_matches = vec![vec![NodeId::Spec("sample-signup".to_string())]];
+        state.popup = Some(Popup::Message("stale".to_string()));
+        state.watch = WatchStatus::Live;
+
+        let new_root = TreeSource::Files(FsTree { root: PathBuf::from("/tmp/new-root"), entries: vec![] });
+        let new_kiro_root = PathBuf::from("/tmp/new-root");
+        let control = update(
+            &mut state,
+            Action::ApplySourceSwitch {
+                source: new_root,
+                root: new_kiro_root.clone(),
+                watch_status: WatchStatus::Manual { reason: "restarted".to_string() },
+            },
+        );
+
+        assert_eq!(control, Control::Continue);
+        assert!(matches!(state.root, TreeSource::Files(ref t) if t.root == PathBuf::from("/tmp/new-root")));
+        assert_eq!(state.kiro_root, new_kiro_root);
+        assert!(matches!(state.doc, DocView::Empty));
+        assert!(state.tree.selected().is_empty());
+        assert!(state.tree.opened().is_empty());
+        assert_eq!(state.selection, None);
+        assert_eq!(state.search, SearchState::default());
+        assert_eq!(state.tree_search, SearchState::default());
+        assert!(state.tree_matches.is_empty());
+        assert_eq!(state.popup, None);
+        // Requirement 1.5: the new watch outcome replaces the old one.
+        assert_eq!(state.watch, WatchStatus::Manual { reason: "restarted".to_string() });
+    }
+
+    #[test]
+    fn switch_mode_failed_action_puts_the_message_into_the_popup() {
+        let mut state = test_state();
+
+        let control = update(&mut state, Action::SwitchModeFailed("모드 전환 실패".to_string()));
+
+        assert_eq!(control, Control::Continue);
+        assert_eq!(state.popup, Some(Popup::Message("모드 전환 실패".to_string())));
+    }
+
+    /// Every `NodeId` variant that can hold children under `TreeSource::Kiro`
+    /// (`Spec`, `SteeringGroup`) must end up open; leaf nodes (`Doc`,
+    /// `Steering`) are irrelevant to "expand all" and are not asserted on.
+    #[test]
+    fn expand_all_opens_every_folder_node_and_preserves_selection() {
+        let mut state = test_state();
+        let selected = vec![NodeId::Spec("sample-signup".to_string())];
+        state.tree.select(selected.clone());
+        assert!(state.tree.opened().is_empty(), "test setup: nothing should be open yet");
+
+        let control = update(&mut state, Action::ExpandAll);
+
+        assert_eq!(control, Control::Continue);
+        for name in spec_names(&state) {
+            assert!(
+                state.tree.opened().contains(&vec![NodeId::Spec(name.clone())]),
+                "expected Spec({name}) to be open after ExpandAll"
+            );
+        }
+        assert!(state.tree.opened().contains(&vec![NodeId::SteeringGroup]));
+        assert_eq!(state.tree.selected(), selected.as_slice());
+    }
+
+    #[test]
+    fn collapse_all_closes_everything_and_preserves_selection() {
+        let mut state = test_state();
+        let selected = vec![NodeId::Spec("sample-signup".to_string())];
+        state.tree.select(selected.clone());
+        update(&mut state, Action::ExpandAll);
+        assert!(!state.tree.opened().is_empty(), "test setup: expected something open");
+
+        let control = update(&mut state, Action::CollapseAll);
+
+        assert_eq!(control, Control::Continue);
+        assert!(state.tree.opened().is_empty());
+        assert_eq!(state.tree.selected(), selected.as_slice());
+    }
+
+    /// Verify-completion regression, same class as
+    /// `e_keypress_reaches_action_edit_through_the_real_key_dispatch_path`:
+    /// every test above drives `Action::ToggleSourceMode`/`ExpandAll`/
+    /// `CollapseAll` directly, which never proves the real keypress --
+    /// `Action::Key(KeyCode::Char('m'/'o'/'c'))`, exactly what `run_loop`
+    /// constructs -- actually reaches these variants through `handle_key`'s
+    /// `keymap::action_for_key` string dispatch. It didn't (none of the
+    /// three action names had an arm there, so they silently fell through
+    /// to the wildcard `Control::Continue`) until this test caught it.
+    #[test]
+    fn mode_switch_and_expand_collapse_keys_reach_their_actions_through_the_real_key_dispatch_path() {
+        let mut state = test_state();
+
+        assert_eq!(key_action(&mut state, KeyCode::Char('m')), Control::SwitchMode);
+
+        assert!(state.tree.opened().is_empty());
+        assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);
+        assert!(!state.tree.opened().is_empty(), "expected 'o' to open at least one node");
+
+        assert_eq!(key_action(&mut state, KeyCode::Char('c')), Control::Continue);
+        assert!(state.tree.opened().is_empty(), "expected 'c' to close everything again");
+    }
+
+    #[test]
+    fn expand_all_and_collapse_all_on_an_empty_tree_do_not_panic() {
+        let mut state = AppState::new(
+            TreeSource::Files(FsTree { root: PathBuf::from("/tmp/empty-files-root"), entries: vec![] }),
+            PathBuf::from("/tmp/empty-files-root"),
+            (120, 40),
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        );
+
+        assert_eq!(update(&mut state, Action::ExpandAll), Control::Continue);
+        assert!(state.tree.opened().is_empty());
+        assert_eq!(update(&mut state, Action::CollapseAll), Control::Continue);
+        assert!(state.tree.opened().is_empty());
     }
 }

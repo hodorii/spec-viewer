@@ -269,6 +269,47 @@ mod tests {
         assert!(contains(buffer, "도움말"));
     }
 
+    /// Task 4.4 (spec-viewer-tree-navigation-modes), requirement 4.1: real
+    /// rendered frame, driven from the actual `keymap::help_entries()` (not
+    /// a hand-picked fixture like the test above) -- proves the `m`/`o`/`c`
+    /// bindings actually reach the help popup a user opens, in the same
+    /// "key  설명" format every other binding uses.
+    ///
+    /// Terminal height chosen tall enough to fit all of `BINDINGS`'
+    /// entries: `render_help` draws a plain non-scrolling `List` into a
+    /// fixed 60%-height popup area (`centered_rect(60, 60, area)`), so on a
+    /// realistically small terminal several bindings near the end of the
+    /// array -- including this feature's own `m`/`o`/`c`, and even the
+    /// already-shipped `e` (edit) binding from `spec-viewer-editor-mode` --
+    /// are silently clipped off-screen entirely (confirmed while writing
+    /// this test: reproduces at 100x40). That clipping is a pre-existing,
+    /// cross-cutting limitation of the Help popup's own layout, unrelated to
+    /// this feature and out of its Boundary Commitments to fix -- this test
+    /// instead verifies what this task actually owns (the three bindings
+    /// reach the shared help-exposure mechanism in the right format) under
+    /// a terminal tall enough for that mechanism to show its own output in
+    /// full.
+    #[test]
+    fn help_popup_real_render_shows_mode_switch_and_expand_collapse_keys() {
+        let entries = crate::app::keymap::help_entries();
+        let popup = Popup::Help(entries);
+        let doc = DocView::Empty;
+
+        let backend = TestBackend::new(100, 64);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render(frame, area, &popup, &doc);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(contains(buffer, "m  전체 모드 ↔ 스펙 모드 전환"));
+        assert!(contains(buffer, "o  트리 전체 펼치기"));
+        assert!(contains(buffer, "c  트리 전체 접기"));
+    }
+
     #[test]
     fn search_input_renders_slash_prefixed_buffer() {
         let popup = Popup::SearchInput("hello".to_string());

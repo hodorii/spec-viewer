@@ -83,7 +83,10 @@ flowchart TD
 pub enum Action {
     // 기존 변형 그대로 + 아래 추가
     ToggleSourceMode,
-    ApplySourceSwitch { source: TreeSource, root: PathBuf },
+    // 설계 보강(3.2 통합 중 발견): main이 감시를 재시작하면서 결정하는
+    // Live/Manual 상태(state.watch)도 이 액션이 함께 반영해야 상태 표시줄이
+    // 새 모드의 실제 감시 상태를 보여준다 -- 원래 시그니처에서 빠져 있던 것.
+    ApplySourceSwitch { source: TreeSource, root: PathBuf, watch_status: WatchStatus },
     SwitchModeFailed(String),
     ExpandAll,
     CollapseAll,
@@ -96,7 +99,7 @@ pub enum Control {
     SwitchMode,   // 신규
 }
 ```
-- 계약 특이사항: `Action::ToggleSourceMode`는 항상 `Control::SwitchMode`를 반환한다(현재 상태로 판단 가능한 조건 분기가 없음 — 판단은 `main`이 함). `Action::ApplySourceSwitch`는 `state.root`/`state.kiro_root`를 교체하고 `state.tree`/`state.doc`/`state.selection`/`state.search`/`state.tree_search`/`state.popup`을 초기 상태로 리셋한다(1.6, 1.7). `Action::ExpandAll`은 `flatten_tree`가 돌려주는 전체 노드 중 폴더성 노드(`Spec`/`SteeringGroup`/`Dir`) 경로 전부에 `state.tree.open()`을 호출한다(2.1). `Action::CollapseAll`은 `state.tree.close_all()`을 호출한다(2.2). 둘 다 `state.selection`(트리 노드 선택과는 별개인 문서 내 드래그 선택 필드)과 `state.tree`의 `selected`를 건드리지 않는다(2.3 — `TreeState::open`/`close_all`이 애초에 `selected`와 분리된 `opened` 필드만 다루므로 자연히 보장됨). 트리에 노드가 없으면(`flatten_tree`가 빈 벡터) 두 액션 모두 반복할 대상이 없어 자연히 아무 효과가 없다(2.4, 별도 분기 불필요).
+- 계약 특이사항: `Action::ToggleSourceMode`는 항상 `Control::SwitchMode`를 반환한다(현재 상태로 판단 가능한 조건 분기가 없음 — 판단은 `main`이 함). `Action::ApplySourceSwitch`는 `state.root`/`state.kiro_root`를 교체하고 `state.tree`/`state.doc`/`state.selection`/`state.search`/`state.tree_search`/`state.popup`을 초기 상태로 리셋하며, `watch_status`를 `state.watch`에 그대로 대입해 상태 표시줄이 새 모드의 실제 감시 상태(Live/Manual)를 반영하게 한다(1.5~1.7). `Action::ExpandAll`은 `flatten_tree`가 돌려주는 전체 노드 중 폴더성 노드(`Spec`/`SteeringGroup`/`Dir`) 경로 전부에 `state.tree.open()`을 호출한다(2.1). `Action::CollapseAll`은 `state.tree.close_all()`을 호출한다(2.2). 둘 다 `state.selection`(트리 노드 선택과는 별개인 문서 내 드래그 선택 필드)과 `state.tree`의 `selected`를 건드리지 않는다(2.3 — `TreeState::open`/`close_all`이 애초에 `selected`와 분리된 `opened` 필드만 다루므로 자연히 보장됨). 트리에 노드가 없으면(`flatten_tree`가 빈 벡터) 두 액션 모두 반복할 대상이 없어 자연히 아무 효과가 없다(2.4, 별도 분기 불필요).
 
 ### main — 모드 전환 실행과 감시 재시작
 - Intent: `Control::SwitchMode`를 소비해 실제 파일시스템 판정과 감시 재시작을 수행한다.
@@ -107,8 +110,9 @@ pub enum Control {
 fn resolve_spec_mode(start: &Path) -> Result<(spec_viewer::spec::TreeSource, PathBuf), String>;
 
 /// `Control::SwitchMode`를 처리한다: 현재 `state.root`의 종류로 방향을 정하고,
-/// 성공하면 새 감시를 시작해 `*watch`를 교체한 뒤 `Action::ApplySourceSwitch`를,
-/// 실패하면 `Action::SwitchModeFailed`를 `step()`으로 디스패치한다.
+/// 성공하면 새 감시를 시작해 `*watch`를 교체하고 그 결과(Live/Manual)를
+/// `watch_status`로 담아 `Action::ApplySourceSwitch`를, 실패하면
+/// `Action::SwitchModeFailed`를 `step()`으로 디스패치한다.
 fn handle_switch_mode<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut spec_viewer::app::AppState,
@@ -118,7 +122,8 @@ fn handle_switch_mode<B: ratatui::backend::Backend<Error = std::io::Error>>(
     watch: &mut spec_viewer::watch::Watch,
 ) -> std::io::Result<spec_viewer::app::Control>;
 ```
-- 계약 특이사항: `resolve_source`(기존, 시작 시점 전용)는 `resolve_spec_mode`를 호출해 `Err(String)`을 자신의 `StartupError::RootNotFound`로 얇게 변환하도록 리팩터링한다(동작 변화 없음, 순수 내부 재사용). `run_loop`의 시그니처는 `args`/`tx`/`watch: &mut Watch`를 추가로 받도록 확장된다(design.md Revalidation Triggers에 명시된 대로, `spec-viewer-editor-mode`가 이미 한 번 거친 것과 같은 종류의 확장).
+(구현 시 조정: 이 함수는 실제로 `handle_edit_file`과 동일하게 `B: ratatui::backend::Backend`(Error 제약 없음)로 선언되고 `Result<Control, B::Error>`를 반환한다 -- `TestBackend`(`Error = Infallible`)로 직접 구동해 이 태스크의 DONE 기준인 통합 테스트를 작성하기 위함이며, `run_loop`의 `B::Error = std::io::Error` 제약 하에서는 동작이 동일하다. task 3.1의 `SpecModeSource` 조정과 같은 종류의, 문서화된 구현 시 조정이다.)
+- 계약 특이사항: `resolve_source`(기존, 시작 시점 전용)는 `resolve_spec_mode`를 호출해 `Err(String)`을 자신의 `StartupError::RootNotFound`로 얇게 변환하도록 리팩터링한다(동작 변화 없음, 순수 내부 재사용). `run_loop`의 시그니처는 `args`/`tx`/`watch: &mut Watch`를 추가로 받도록 확장된다(design.md Revalidation Triggers에 명시된 대로, `spec-viewer-editor-mode`가 이미 한 번 거친 것과 같은 종류의 확장). `handle_switch_mode`가 감시를 재시작한 뒤 그 결과(`watch::Watch::Live`/`Manual`을 요약한 `WatchStatus`)를 `Action::ApplySourceSwitch`의 `watch_status` 필드로 실어 보낸다 — `state.watch`를 갱신하는 유일한 경로다(위 "설계 보강" 참고).
 
 ### app::keymap (module) — 신규 키 바인딩
 - Intent: 모드 전환/전체펼치기/전체접기 키를 기존 도움말 노출 메커니즘에 자연히 편입시킨다.
@@ -143,8 +148,8 @@ Binding { keys: &[KeyCode::Char('c')], action: "collapse_all", help: "트리 전
 
 ## Testing Strategy
 - **Depth**: Standard — 신규 로직이지만 `Control::EditFile` 선례를 그대로 복제하는 구조라 새로운 상태기계는 아님(verification-mapping.md 기준 "신규 로직·다화면"에 해당, "도메인 규칙·상태기계"까지는 아님).
-- **Unit**: `Action::ExpandAll`/`CollapseAll`이 `state.tree`의 `opened`/`selected`를 올바르게 바꾸는지(선택 유지 포함, 2.1~2.4); `Action::ApplySourceSwitch`가 `root`/`kiro_root`/`tree`/`doc`/`selection`/`popup`을 정확히 리셋하는지(1.6, 1.7); `resolve_spec_mode`가 `resolve_source`와 동일한 우선순위 결과를 내는지(회귀).
-- **Integration**: `handle_switch_mode`가 Files→Kiro/SpecKit, Kiro/SpecKit→Files, 실패 케이스 각각에서 올바른 Action을 디스패치하고 `watch`가 실제로 새 root로 재시작되는지(임시 디렉터리 기반).
+- **Unit**: `Action::ExpandAll`/`CollapseAll`이 `state.tree`의 `opened`/`selected`를 올바르게 바꾸는지(선택 유지 포함, 2.1~2.4); `Action::ApplySourceSwitch`가 `root`/`kiro_root`/`tree`/`doc`/`selection`/`popup`/`watch`를 정확히 리셋·반영하는지(1.5~1.7); `resolve_spec_mode`가 `resolve_source`와 동일한 우선순위 결과를 내는지(회귀).
+- **Integration**: `handle_switch_mode`가 Files→Kiro/SpecKit, Kiro/SpecKit→Files, 실패 케이스 각각에서 올바른 Action(성공 시 `watch_status`가 실제 재시작 결과와 일치하는 `ApplySourceSwitch`)을 디스패치하고 `watch`가 실제로 새 root로 재시작되는지(임시 디렉터리 기반).
 - **E2E**: 실행 중 `m` 키로 왕복 전환(스펙→전체→스펙) 후 트리와 감시가 일관된지; `o`/`c` 키로 전체펼치기 후 접기까지 실제 렌더 프레임으로 확인.
 - **Acceptance**: 요구사항 15개 전부 실물 실행 확인(가능하면 `spec-viewer-spec-kit-support`가 남긴 `tests/fixtures/spec-kit/`를 재사용해 실제 컴파일된 바이너리로도 스모크 확인).
 - **Performance**: 해당 없음.

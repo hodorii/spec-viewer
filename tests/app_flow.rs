@@ -712,3 +712,110 @@ fn l2_all_mode_browses_a_plain_markdown_tree_with_fold_select_and_live_edits() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+// --- task 4.2 (spec-viewer-tree-navigation-modes): expand-all/collapse-all
+// real render — requirements 2.1-2.4 ----------------------------------------
+
+#[test]
+fn e2e_expand_all_reveals_every_docs_across_multiple_specs_and_steering_at_once() {
+    // `tests/fixtures/kiro` has several specs (each with its own docs) plus
+    // a Steering group -- expand-all opening *only* the selected spec would
+    // still look like a real "expand" from a single-spec test, so this
+    // fixture set is exactly what proves it opens *every* folder-like node
+    // at once, not just the one under the cursor.
+    let mut state = build_state_from(&fixtures_root(), (150, 80));
+    state
+        .tree
+        .select(vec![NodeId::Spec("sample-signup".to_string())]);
+    let selected_before = state.tree.selected().to_vec();
+
+    let backend = TestBackend::new(150, 80);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        !rows.iter().any(|r| r.contains("requirements.md")),
+        "test setup: nothing should be expanded yet, got:\n{rows:?}"
+    );
+
+    // `o` -- real keypress, not a synthetic `Action::ExpandAll`.
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
+    assert_eq!(control, Control::Continue);
+
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        rows.iter().any(|r| r.contains("sample-signup 1/3")),
+        "expected sample-signup's own docs visible, got:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("● requirements.md")),
+        "expected sample-signup's requirements.md visible, got:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("notes.md")),
+        "expected with-extra's docs visible too -- a different spec than the selected one, \
+         proving every spec opened at once, got:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("product.md")),
+        "expected the Steering group's own children visible too, got:\n{rows:?}"
+    );
+    assert_eq!(
+        state.tree.selected(),
+        selected_before.as_slice(),
+        "requirement 2.3: selection must survive expand-all"
+    );
+
+    // `c` -- real keypress, collapses everything back down.
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('c'))));
+    assert_eq!(control, Control::Continue);
+
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        !rows.iter().any(|r| r.contains("requirements.md")),
+        "expected every doc hidden again after collapse-all, got:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("sample-signup")),
+        "expected the top-level spec node itself to remain visible, got:\n{rows:?}"
+    );
+    assert_eq!(
+        state.tree.selected(),
+        selected_before.as_slice(),
+        "requirement 2.3: selection must survive collapse-all too"
+    );
+}
+
+#[test]
+fn e2e_expand_all_and_collapse_all_on_an_empty_files_tree_do_not_panic_or_change_the_frame() {
+    // Requirement 2.4: an empty tree (a `--all` scan of a directory with no
+    // markdown files at all) must not panic on either key, and the frame
+    // stays a normal (empty) render.
+    let dir = std::env::temp_dir().join(format!(
+        "spec_viewer_app_flow_expand_all_empty_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create empty scratch dir");
+
+    let tree = spec::FsTree::scan(&dir);
+    let mut state = AppState::new(
+        TreeSource::Files(tree),
+        dir.clone(),
+        (120, 40),
+        WatchStatus::Live,
+        spec_viewer::app::TreeMode::Auto,
+        true,
+    );
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
+
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
+    assert_eq!(control, Control::Continue);
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('c'))));
+    assert_eq!(control, Control::Continue);
+
+    fs::remove_dir_all(&dir).ok();
+}

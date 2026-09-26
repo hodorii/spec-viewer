@@ -205,6 +205,10 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     rx: &std::sync::mpsc::Receiver<spec_viewer::watch::FsEvent>,
     mouse_capture_enabled: bool,
     cli_editor: Option<&str>,
+    start: &Path,
+    args: &Args,
+    tx: &std::sync::mpsc::Sender<spec_viewer::watch::FsEvent>,
+    watch: &mut spec_viewer::watch::Watch,
 ) -> std::io::Result<()> {
     // Draw once before waiting on any event: without this, the screen stays
     // blank until the first keypress or fs event arrives, since every draw
@@ -246,6 +250,11 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             // path is handed to `handle_edit_file` once this batch's own
             // draw (below) has happened.
             let mut edit_file: Option<PathBuf> = None;
+            // Set when a raw event's reducer call returns
+            // `Control::SwitchMode` -- same drain-stop rationale as
+            // `edit_file` above: any other queued raw events in this batch
+            // predate the mode switch and are stale once the tree/doc reset.
+            let mut switch_mode = false;
             loop {
                 let action = match crossterm::event::read()? {
                     crossterm::event::Event::Key(k) => spec_viewer::app::Action::Key(k),
@@ -268,6 +277,10 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                         edit_file = Some(path);
                         break;
                     }
+                    spec_viewer::app::Control::SwitchMode => {
+                        switch_mode = true;
+                        break;
+                    }
                     spec_viewer::app::Control::Continue => {}
                 }
                 if !crossterm::event::poll(std::time::Duration::ZERO)? {
@@ -283,6 +296,12 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             if let Some(path) = edit_file {
                 let control =
                     handle_edit_file(terminal, state, path, cli_editor, mouse_capture_enabled)?;
+                if control == spec_viewer::app::Control::Quit {
+                    break;
+                }
+            }
+            if switch_mode {
+                let control = handle_switch_mode(terminal, state, start, args, tx, watch)?;
                 if control == spec_viewer::app::Control::Quit {
                     break;
                 }
@@ -454,6 +473,101 @@ fn handle_edit_file<B: ratatui::backend::Backend>(
     }
 }
 
+/// Consumes a `Control::SwitchMode` returned from the reducer (design.md's
+/// mode-switch flow, requirement 1.4/1.5): decides which direction to switch
+/// based on the current `state.root`, does the actual filesystem judgment or
+/// scan and restarts the file watcher, then dispatches the outcome back into
+/// the reducer via [`step`] -- the same "reducer signals intent, `main` acts,
+/// `main` reports back" split [`handle_edit_file`] already establishes for
+/// `Control::EditFile`.
+///
+/// - Currently `TreeSource::Files` -> tries to switch into spec mode via
+///   [`resolve_spec_mode`] (SSoT with `resolve_source`'s own startup
+///   judgment, requirement 1.2); sorts a `.kiro` result by the *current*
+///   `state.sort_key` (research.md: the runtime sort key, not `--sort`,
+///   since it may have been cycled since startup).
+/// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into full mode by
+///   scanning `start` as a plain markdown directory, mirroring `--all`'s own
+///   startup scan; this direction always succeeds (requirement 1.3).
+/// - On success, restarts the watch against the new root (requirement 1.5)
+///   -- `--no-watch` keeps it `Manual` forever, exactly like `main()`'s own
+///   initial setup, rather than resurrecting watching the user explicitly
+///   disabled -- and folds the outcome into `Action::ApplySourceSwitch`'s
+///   `watch_status` so the status bar reflects the new mode's real state.
+/// - On failure, dispatches `Action::SwitchModeFailed(msg)` instead; the
+///   screen and watch are left exactly as they were (requirement 1.4).
+///
+/// Generic over plain `Backend` (design deviation from design.md's literal
+/// `Backend<Error = std::io::Error>` bound, same kind of documented,
+/// PM-authorized adjustment task 3.1 made for `SpecModeSource`): mirrors
+/// [`handle_edit_file`]'s own bound exactly, precisely so a `TestBackend`
+/// (`Error = Infallible`) can drive this function directly in tests, the
+/// way tasks.md's own DONE criterion for this task requires ("통합
+/// 테스트... 실제 watch 값 교체 확인"). `run_loop`'s `B::Error =
+/// std::io::Error` bound still makes its `?` on this function's result a
+/// no-op conversion, so nothing changes for the only real caller.
+fn handle_switch_mode<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &mut spec_viewer::app::AppState,
+    start: &Path,
+    args: &Args,
+    tx: &std::sync::mpsc::Sender<spec_viewer::watch::FsEvent>,
+    watch: &mut spec_viewer::watch::Watch,
+) -> Result<spec_viewer::app::Control, B::Error> {
+    let switch_result: Result<(spec_viewer::spec::TreeSource, PathBuf), String> =
+        if matches!(state.root, spec_viewer::spec::TreeSource::Files(_)) {
+            resolve_spec_mode(start).map(|(source, root)| match source {
+                SpecModeSource::Kiro(mut spec_root) => {
+                    spec_viewer::spec::sort_specs(&mut spec_root.specs, state.sort_key);
+                    (spec_viewer::spec::TreeSource::Kiro(spec_root), root)
+                }
+                SpecModeSource::SpecKit(features) => {
+                    (spec_viewer::spec::TreeSource::SpecKit(features), root)
+                }
+            })
+        } else if std::fs::read_dir(start).is_err() {
+            Err(format!(
+                "spec-viewer: cannot read directory '{}' for full mode",
+                start.display()
+            ))
+        } else {
+            let tree = spec_viewer::spec::FsTree::scan(start);
+            Ok((spec_viewer::spec::TreeSource::Files(tree), start.to_path_buf()))
+        };
+
+    let (source, root) = match switch_result {
+        Ok(v) => v,
+        Err(msg) => {
+            return step(terminal, state, spec_viewer::app::Action::SwitchModeFailed(msg));
+        }
+    };
+
+    let new_watch = if args.no_watch {
+        spec_viewer::watch::manual("--no-watch")
+    } else {
+        spec_viewer::watch::start(&root, tx.clone())
+    };
+    let watch_status = match &new_watch {
+        spec_viewer::watch::Watch::Live(_) => spec_viewer::app::WatchStatus::Live,
+        spec_viewer::watch::Watch::Manual(reason) => spec_viewer::app::WatchStatus::Manual {
+            reason: reason.clone(),
+        },
+    };
+    // The new watch is already live by the time this assignment runs; only
+    // now does the old `Watch` (and its live Debouncer, if any) get dropped
+    // -- a brief window where both watchers are active, not one where
+    // neither is. research.md's Risks accepted the opposite (a gap between
+    // old-drop and new-start) as harmless since the switch rescans from
+    // scratch regardless; this ordering avoids even that gap.
+    *watch = new_watch;
+
+    step(
+        terminal,
+        state,
+        spec_viewer::app::Action::ApplySourceSwitch { source, root, watch_status },
+    )
+}
+
 /// What kind of tree source startup resolved to, plus everything `main()`
 /// needs to wire up the rest of the app around it: the watch/scan root,
 /// whether requirement 1.6's file view applies, and (only then) the file
@@ -471,14 +585,121 @@ struct Startup {
     file_view_path: Option<PathBuf>,
 }
 
+/// `resolve_spec_mode`가 판정한, 아직 `TreeSource`로 감싸지 않은 원본 결과.
+/// `TreeSource::Files`는 이 함수가 절대 만들 일이 없으므로(그건 `--all`
+/// 전용, 이 함수의 판정 대상이 아님) 아예 표현 불가능하게 좁혀둔다
+/// (design.md는 `resolve_spec_mode(start) -> Result<(TreeSource, PathBuf),
+/// String>`이라고 적었으나, 호출부가 절대 도달하지 않는 `Files` variant를
+/// 처리해야 하는 어색함을 피하려고 이 반환 타입으로 조정했다 -- task 3.1
+/// Status Report 참고).
+enum SpecModeSource {
+    Kiro(spec_viewer::spec::SpecRoot),
+    SpecKit(Vec<spec_viewer::spec::Spec>),
+}
+
+/// `.kiro`와 spec-kit(`.specify/`) 중 무엇을 쓸지 판정한다(요구사항
+/// 1.1~1.4의 순수 로직 부분) -- `resolve_source`(시작 시점)와 다음 태스크
+/// (3.2)의 실행 중 모드 전환 핸들러가 공유한다(SSoT). `.kiro`쪽 결과는
+/// 정렬 전(`sort_specs` 미적용) 원본 그대로 반환한다 -- 정렬 키는 호출부
+/// 마다 다를 수 있어서(시작 시점은 `--sort`, 실행 중 전환은 그 시점의
+/// `state.sort_key`) 호출부의 책임으로 남긴다.
+///
+/// `find_root`와 `spec_kit::find_spec_kit_root`는 각각 독립적으로 같은
+/// `start`에서 탐색된다; `find_spec_kit_root`는 이미 같은 디렉터리 공존을
+/// `.kiro`의 승리로 해소하므로(요구사항 1.2, `None` 반환), 여기서는 "서로
+/// 다른 레벨" 케이스만 명시적으로 승부를 가르면 된다(더 가까운/깊은 쪽
+/// 승리, 동률이면 `.kiro` 우선).
+fn resolve_spec_mode(start: &Path) -> Result<(SpecModeSource, PathBuf), String> {
+    let kiro_dir = spec_viewer::spec::find_root(start);
+    let spec_kit_root = spec_viewer::spec::spec_kit::find_spec_kit_root(start);
+
+    let prefer_spec_kit = match (&kiro_dir, &spec_kit_root) {
+        (None, Some(_)) => true,
+        (Some(kiro_dir), Some(spec_kit_root)) => {
+            // Recover the actual `.specify` marker path so both sides
+            // compare like-for-like (`kiro_dir` is already `.kiro` itself).
+            // Whichever marker sits deeper (more path components, i.e.
+            // closer to `start`) wins; an exact tie favors `.kiro`.
+            let specify_marker = spec_kit_root.join(".specify");
+            specify_marker.components().count() > kiro_dir.components().count()
+        }
+        _ => false,
+    };
+
+    if prefer_spec_kit {
+        let sk_root = spec_kit_root.expect("prefer_spec_kit implies Some(spec_kit_root)");
+        let specs_dir = sk_root.join("specs");
+        let features = spec_viewer::spec::spec_kit::build(&specs_dir);
+        return Ok((SpecModeSource::SpecKit(features), specs_dir));
+    }
+
+    match kiro_dir {
+        Some(root) => {
+            let snapshot = spec_viewer::app::load_snapshot(&root);
+            let spec_root = spec_viewer::spec::build(&snapshot);
+            Ok((SpecModeSource::Kiro(spec_root), root))
+        }
+        None => Err(format!(
+            "no .kiro or .specify directory found searching from '{}'",
+            start.display()
+        )),
+    }
+}
+
+/// `.kiro` 시작 경로를 마무리한다: `resolve_startup`(루트 재검증 +
+/// `--log` 검사)을 호출하고 최종 `.kiro` `Startup`을 만든다. `spec_root_hint`
+/// 가 있으면(`resolve_spec_mode`가 이미 `.kiro`로 판정해 `SpecRoot`를 만들어
+/// 둔 흔한 경우) 그것을 재사용해 디스크를 두 번 스캔하지 않는다;
+/// `spec_root_hint`가 `None`이면(`.kiro`도 `.specify`도 없어
+/// `resolve_spec_mode`가 `Err`를 반환한 경우) 새로 빌드한다 -- 이 경우
+/// 보통은 아래 `resolve_startup(args)?`가 같은 이유로 먼저 실패해 여기까지
+/// 오지 않지만, 방어적으로 처리해 둔다.
+fn finish_kiro_startup(
+    args: &Args,
+    spec_root_hint: Option<spec_viewer::spec::SpecRoot>,
+) -> Result<Startup, StartupError> {
+    let (root, log) = resolve_startup(args)?;
+    // Accepted/validated (requirement 8.2); this task does not otherwise
+    // consume the log destination.
+    let _log_path = log;
+
+    // requirement 1.6: a `.md` path argument opens a file view (no tree,
+    // doc panel at full width) instead of the tree-rooted spec browser.
+    // `resolve_startup`'s `root` is already found from the file's own
+    // location (`find_root`'s ancestor search starts at `start`'s parent),
+    // so no second root lookup is needed here.
+    let start_path = args
+        .path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let is_file = start_path.is_file();
+
+    let mut spec_root = match spec_root_hint {
+        Some(spec_root) => spec_root,
+        None => {
+            let snapshot = spec_viewer::app::load_snapshot(&root);
+            spec_viewer::spec::build(&snapshot)
+        }
+    };
+    spec_viewer::spec::sort_specs(&mut spec_root.specs, args.sort.into());
+    let file_view_path = if is_file { Some(start_path) } else { None };
+    Ok(Startup {
+        source: spec_viewer::spec::TreeSource::Kiro(spec_root),
+        root,
+        is_file,
+        file_view_path,
+    })
+}
+
 /// Resolve which [`TreeSource`](spec_viewer::spec::TreeSource) and watch
 /// root to use for this run: `--all` (requirement 1.8) skips
 /// `find_root`/`.kiro` entirely and scans `args.path` (default cwd)
-/// directly as a plain `FsTree`; otherwise this is the existing
-/// `.kiro`-rooted `SpecRoot` flow, `resolve_startup`'s root-search failure
-/// (1.3) included. Requirement 1.6's file-view special case is a
-/// `.kiro`-mode-only concept (that requirement's own text), so `--all`
-/// never produces a `file_view_path`.
+/// directly as a plain `FsTree`; otherwise this delegates the `.kiro`-vs-
+/// spec-kit priority decision to [`resolve_spec_mode`] (SSoT with the
+/// runtime mode-switch handler, task 3.2), `resolve_startup`'s root-search
+/// failure (1.3) included via [`finish_kiro_startup`]. Requirement 1.6's
+/// file-view special case is a `.kiro`-mode-only concept (that
+/// requirement's own text), so `--all` never produces a `file_view_path`.
 fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
     if args.all {
         let dir = args
@@ -502,38 +723,13 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
         });
     }
 
-    // Requirement 1.1-1.3: decide between `.kiro` and spec-kit before
-    // falling back to `resolve_startup`'s `.kiro`-only search. `find_root`
-    // and `spec_kit::find_spec_kit_root` are each independently searched
-    // from the same `start`; `find_spec_kit_root` already resolves same-
-    // directory coexistence in `.kiro`'s favor (requirement 1.2) by
-    // returning `None` in that case, so here only the "different levels"
-    // case needs an explicit tie-break.
     let start = args
         .path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let kiro_dir = spec_viewer::spec::find_root(&start);
-    let spec_kit_root = spec_viewer::spec::spec_kit::find_spec_kit_root(&start);
 
-    let prefer_spec_kit = match (&kiro_dir, &spec_kit_root) {
-        (None, Some(_)) => true,
-        (Some(kiro_dir), Some(spec_kit_root)) => {
-            // Recover the actual `.specify` marker path so both sides
-            // compare like-for-like (`kiro_dir` is already `.kiro` itself).
-            // Whichever marker sits deeper (more path components, i.e.
-            // closer to `start`) wins; an exact tie favors `.kiro`.
-            let specify_marker = spec_kit_root.join(".specify");
-            specify_marker.components().count() > kiro_dir.components().count()
-        }
-        _ => false,
-    };
-
-    if prefer_spec_kit {
-        let sk_root = spec_kit_root.expect("prefer_spec_kit implies Some(spec_kit_root)");
-        let specs_dir = sk_root.join("specs");
-        let features = spec_viewer::spec::spec_kit::build(&specs_dir);
-        return Ok(Startup {
+    match resolve_spec_mode(&start) {
+        Ok((SpecModeSource::SpecKit(features), specs_dir)) => Ok(Startup {
             source: spec_viewer::spec::TreeSource::SpecKit(features),
             // The watch/scan root is `specs/` itself, not the whole
             // project -- mirrors `.kiro` mode's `root` being the `.kiro`
@@ -543,35 +739,19 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
             // Requirement 1.6's file-view special case is `.kiro`-only
             // (design.md Out-of-Scope for spec-kit).
             file_view_path: None,
-        });
+        }),
+        // `.kiro` won -- reuse the `SpecRoot` `resolve_spec_mode` already
+        // built rather than re-scanning, but still run `resolve_startup`
+        // for its `--log` validation and (logically identical) `root`.
+        Ok((SpecModeSource::Kiro(spec_root), _root_from_resolve_spec_mode)) => {
+            finish_kiro_startup(args, Some(spec_root))
+        }
+        // Neither `.kiro` nor spec-kit found -- fall through to
+        // `resolve_startup`, whose `?` here reproduces the exact same
+        // `StartupError::RootNotFound` (same searched path, same message)
+        // this function returned before this refactor.
+        Err(_) => finish_kiro_startup(args, None),
     }
-
-    let (root, log) = resolve_startup(args)?;
-    // Accepted/validated (requirement 8.2); this task does not otherwise
-    // consume the log destination.
-    let _log_path = log;
-
-    // requirement 1.6: a `.md` path argument opens a file view (no tree,
-    // doc panel at full width) instead of the tree-rooted spec browser.
-    // `resolve_startup`'s `root` is already found from the file's own
-    // location (`find_root`'s ancestor search starts at `start`'s parent),
-    // so no second root lookup is needed here.
-    let start_path = args
-        .path
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let is_file = start_path.is_file();
-
-    let snapshot = spec_viewer::app::load_snapshot(&root);
-    let mut spec_root = spec_viewer::spec::build(&snapshot);
-    spec_viewer::spec::sort_specs(&mut spec_root.specs, args.sort.into());
-    let file_view_path = if is_file { Some(start_path) } else { None };
-    Ok(Startup {
-        source: spec_viewer::spec::TreeSource::Kiro(spec_root),
-        root,
-        is_file,
-        file_view_path,
-    })
 }
 
 fn main() {
@@ -583,6 +763,17 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     }
+
+    // The one starting path both of `resolve_source`'s branches (`--all`'s
+    // `dir` and the spec-mode branch's own `start`) compute identically from
+    // `args` -- kept here, in `main()`, as its own local variable (research.md
+    // "start 경로는 AppState가 아니라 main()이 계속 들고 있는다") so a later
+    // runtime mode switch (`handle_switch_mode`) can re-run the exact same
+    // judgment from the exact same origin, every time (requirement 1.8).
+    let start = args
+        .path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let Startup {
         source,
@@ -614,10 +805,14 @@ fn main() {
     .is_ok();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let watch = if args.no_watch {
+    // `tx.clone()`, not `tx` itself: a later runtime mode switch
+    // (`handle_switch_mode`) restarts the watch against a new root and needs
+    // its own sender to hand to `watch::start` again, so `tx` must survive
+    // this first call rather than being consumed by it.
+    let mut watch = if args.no_watch {
         spec_viewer::watch::manual("--no-watch")
     } else {
-        spec_viewer::watch::start(&root, tx)
+        spec_viewer::watch::start(&root, tx.clone())
     };
     let watch_status = match &watch {
         spec_viewer::watch::Watch::Live(_) => spec_viewer::app::WatchStatus::Live,
@@ -665,6 +860,10 @@ fn main() {
         &rx,
         mouse_capture_enabled,
         args.editor.as_deref(),
+        &start,
+        &args,
+        &tx,
+        &mut watch,
     );
 
     drop(watch);
@@ -1075,6 +1274,141 @@ mod tests {
         }
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // --- task 3.1: resolve_spec_mode extracted priority logic (SSoT) -----
+
+    #[test]
+    fn resolve_spec_mode_only_kiro_present_returns_kiro() {
+        let root = scratch_dir("mode_only_kiro");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+
+        let result = resolve_spec_mode(&root);
+
+        match result {
+            Ok((SpecModeSource::Kiro(_), resolved_root)) => {
+                assert_eq!(resolved_root, root.join(".kiro"));
+            }
+            Ok((SpecModeSource::SpecKit(_), _)) => panic!("expected Kiro, got SpecKit"),
+            Err(e) => panic!("expected Ok(Kiro, ..), got Err: {e}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_spec_mode_only_spec_kit_present_returns_spec_kit() {
+        let root = scratch_dir("mode_only_spec_kit");
+        let specs_dir = init_spec_kit(&root);
+
+        let result = resolve_spec_mode(&root);
+
+        match result {
+            Ok((SpecModeSource::SpecKit(features), resolved_root)) => {
+                assert_eq!(features.len(), 1);
+                assert_eq!(features[0].name, "001-demo");
+                assert_eq!(resolved_root, specs_dir);
+            }
+            Ok((SpecModeSource::Kiro(_), _)) => panic!("expected SpecKit, got Kiro"),
+            Err(e) => panic!("expected Ok(SpecKit, ..), got Err: {e}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_spec_mode_kiro_and_spec_kit_coexist_in_same_dir_prefers_kiro() {
+        let root = scratch_dir("mode_coexist_same_dir");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+        init_spec_kit(&root);
+
+        let result = resolve_spec_mode(&root);
+
+        match result {
+            Ok((SpecModeSource::Kiro(_), resolved_root)) => {
+                assert_eq!(resolved_root, root.join(".kiro"));
+            }
+            Ok((SpecModeSource::SpecKit(_), _)) => panic!("expected Kiro, got SpecKit"),
+            Err(e) => panic!("expected Ok(Kiro, ..), got Err: {e}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_spec_mode_prefers_deeper_spec_kit_over_shallower_kiro() {
+        // `.kiro` sits 3 levels above `.specify` -- spec-kit is the closer
+        // (deeper) root relative to `start` and must win even though both
+        // exist (just not in the same directory).
+        let far_root = scratch_dir("mode_far_kiro");
+        fs::create_dir_all(far_root.join(".kiro/specs")).unwrap();
+        let mid = far_root.join("a/b/c");
+        fs::create_dir_all(&mid).unwrap();
+        let specs_dir = init_spec_kit(&mid);
+        let start = mid.join("d/e");
+        fs::create_dir_all(&start).unwrap();
+
+        let result = resolve_spec_mode(&start);
+
+        match result {
+            Ok((SpecModeSource::SpecKit(_), resolved_root)) => {
+                assert_eq!(resolved_root, specs_dir);
+            }
+            Ok((SpecModeSource::Kiro(_), _)) => {
+                panic!("expected SpecKit (closer/deeper than .kiro), got Kiro")
+            }
+            Err(e) => panic!("expected Ok(SpecKit, ..), got Err: {e}"),
+        }
+
+        fs::remove_dir_all(&far_root).ok();
+    }
+
+    #[test]
+    fn resolve_spec_mode_prefers_deeper_kiro_over_shallower_spec_kit() {
+        // Reverse of the above: `.specify` sits 3 levels above `.kiro` --
+        // `.kiro` is the closer (deeper) root and must win, proving the
+        // tie-break is symmetric, not just "spec-kit always wins when both
+        // exist at different levels".
+        let far_root = scratch_dir("mode_far_spec_kit");
+        init_spec_kit(&far_root);
+        let mid = far_root.join("a/b/c");
+        fs::create_dir_all(mid.join(".kiro/specs")).unwrap();
+        let start = mid.join("d/e");
+        fs::create_dir_all(&start).unwrap();
+
+        let result = resolve_spec_mode(&start);
+
+        match result {
+            Ok((SpecModeSource::Kiro(_), resolved_root)) => {
+                assert_eq!(resolved_root, mid.join(".kiro"));
+            }
+            Ok((SpecModeSource::SpecKit(_), _)) => {
+                panic!("expected Kiro (closer/deeper than .specify), got SpecKit")
+            }
+            Err(e) => panic!("expected Ok(Kiro, ..), got Err: {e}"),
+        }
+
+        fs::remove_dir_all(&far_root).ok();
+    }
+
+    #[test]
+    fn resolve_spec_mode_neither_present_returns_err() {
+        let leaf = scratch_dir("mode_neither").join("a/b");
+        fs::create_dir_all(&leaf).unwrap();
+
+        let result = resolve_spec_mode(&leaf);
+
+        match result {
+            Err(msg) => {
+                assert!(
+                    msg.contains(&leaf.to_string_lossy().to_string()),
+                    "error message should include the searched path: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+
+        fs::remove_dir_all(leaf.parent().unwrap().parent().unwrap()).ok();
     }
 
     #[test]
@@ -2024,6 +2358,341 @@ gamma trailing line
         }
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // --- task 3.2 (spec-viewer-tree-navigation-modes): handle_switch_mode
+    // wires Control::SwitchMode end to end -----------------------------
+
+    #[test]
+    fn handle_switch_mode_switches_from_files_to_kiro_and_restarts_the_watch() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = scratch_dir("switch_files_to_kiro");
+        fs::create_dir_all(start.join(".kiro/specs")).unwrap();
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree {
+                root: start.clone(),
+                entries: vec![],
+            }),
+            start.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Manual { reason: "sentinel-before-switch".to_string() },
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed");
+
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(state.kiro_root, start.join(".kiro"));
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+        assert!(
+            matches!(watch, spec_viewer::watch::Watch::Live(_)),
+            "expected the sentinel Manual watch to be replaced by a real Live watch"
+        );
+
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn handle_switch_mode_switches_from_files_to_spec_kit_and_restarts_the_watch() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = scratch_dir("switch_files_to_spec_kit");
+        let specs_dir = init_spec_kit(&start);
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree {
+                root: start.clone(),
+                entries: vec![],
+            }),
+            start.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Manual { reason: "sentinel-before-switch".to_string() },
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed");
+
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+        match &state.root {
+            spec_viewer::spec::TreeSource::SpecKit(features) => {
+                assert_eq!(features.len(), 1);
+                assert_eq!(features[0].name, "001-demo");
+            }
+            _ => panic!("expected TreeSource::SpecKit"),
+        }
+        assert_eq!(state.kiro_root, specs_dir);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+        assert!(matches!(watch, spec_viewer::watch::Watch::Live(_)));
+
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn handle_switch_mode_switches_from_kiro_to_files_and_always_succeeds() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("switch_kiro_to_files");
+        write_requirements_spec(&root, "demo", "# Doc\n");
+        // `handle_switch_mode`'s full-mode direction scans `start` itself
+        // (mirroring `--all`), not `state.kiro_root` -- use `root`'s parent
+        // as `start` so the scan target is a real, readable directory
+        // unrelated to the `.kiro`-shaped fixture layout above.
+        let start = root.clone();
+
+        let mut state = build_state_from(&root, (120, 40)); // TreeSource::Kiro, WatchStatus::Live
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed");
+
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+        match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, start),
+            _ => panic!("expected TreeSource::Files"),
+        }
+        assert_eq!(state.kiro_root, start);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+        assert!(matches!(watch, spec_viewer::watch::Watch::Live(_)));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn handle_switch_mode_respects_no_watch_and_never_resurrects_live_watching() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = scratch_dir("switch_no_watch");
+        fs::create_dir_all(start.join(".kiro/specs")).unwrap();
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree {
+                root: start.clone(),
+                entries: vec![],
+            }),
+            start.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Manual { reason: "--no-watch".to_string() },
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let mut args = args_with_path(Some(start.clone()));
+        args.no_watch = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("--no-watch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed");
+
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(
+            state.watch,
+            spec_viewer::app::WatchStatus::Manual { reason: "--no-watch".to_string() }
+        );
+        match &watch {
+            spec_viewer::watch::Watch::Manual(reason) => assert_eq!(reason, "--no-watch"),
+            spec_viewer::watch::Watch::Live(_) => panic!("--no-watch must never restart into Live"),
+        }
+
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn handle_switch_mode_fails_when_no_marker_is_found_and_leaves_state_and_watch_untouched() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Same caution as `resolve_source_neither_kiro_nor_spec_kit_returns_root_not_found`:
+        // a scratch leaf dir with no `.kiro`/`.specify` anywhere we control
+        // in its ancestry.
+        let leaf = scratch_dir("switch_no_marker").join("a/b");
+        fs::create_dir_all(&leaf).unwrap();
+        let original_root = spec_viewer::spec::FsTree { root: leaf.clone(), entries: vec![] };
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(original_root),
+            leaf.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Manual { reason: "sentinel-before-switch".to_string() },
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let args = args_with_path(Some(leaf.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_switch_mode(&mut terminal, &mut state, &leaf, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed even on a rejected switch");
+
+        // Requirement 1.4: rejected, with a status-bar message, and the
+        // screen (mode + watch) left exactly as it was before the attempt.
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+        match &state.popup {
+            Some(Popup::Message(_)) => {}
+            other => panic!("expected Some(Popup::Message(_)), got {other:?}"),
+        }
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(ref t) if t.root == leaf));
+        assert_eq!(state.kiro_root, leaf);
+        assert_eq!(
+            state.watch,
+            spec_viewer::app::WatchStatus::Manual { reason: "sentinel-before-switch".to_string() }
+        );
+        match &watch {
+            spec_viewer::watch::Watch::Manual(reason) => assert_eq!(reason, "sentinel-before-switch"),
+            spec_viewer::watch::Watch::Live(_) => panic!("a failed switch must not touch the watch"),
+        }
+
+        fs::remove_dir_all(leaf.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    // --- task 4.1 (spec-viewer-tree-navigation-modes): E2E mode-switch
+    // round trip through the real key dispatch path, requirement 1.1-1.8 --
+    // unlike the `handle_switch_mode_*` tests above (which construct
+    // `Control::SwitchMode` situations directly), this drives the real `'m'`
+    // keypress through `spec_viewer::app::update` first, exactly as
+    // `run_loop`'s key-read branch does, and inspects the real rendered
+    // frame at every step, not just reducer state.
+
+    #[test]
+    fn e2e_mode_switch_round_trip_through_the_real_key_dispatch_path() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = scratch_dir("e2e_mode_roundtrip");
+        fs::create_dir_all(project.join(".kiro/specs")).unwrap();
+        write_requirements_spec(&project.join(".kiro"), "demo", "# Doc\n\nSPEC_MODE_MARKER_TEXT\n");
+        fs::write(project.join("plain.md"), "# Plain\n\nFULL_MODE_MARKER_TEXT\n").unwrap();
+
+        let mut state = build_state_from(&project.join(".kiro"), (150, 40));
+        let target = project.join(".kiro/specs/demo/requirements.md");
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        state.tree.select(vec![NodeId::Spec("demo".to_string())]);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+
+        let args = args_with_path(Some(project.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::start(&project.join(".kiro"), tx.clone());
+
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| spec_viewer::ui::render(f, &mut state))
+            .expect("initial draw");
+        assert!(
+            buffer_contains(terminal.backend().buffer(), "SPEC_MODE_MARKER_TEXT"),
+            "expected the spec-mode doc visible before any switch"
+        );
+
+        // Spec mode -> full mode (requirement 1.1): real 'm' keypress.
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        assert_eq!(control, spec_viewer::app::Control::SwitchMode);
+        let control = handle_switch_mode(&mut terminal, &mut state, &project, &args, &tx, &mut watch)
+            .expect("switch to full mode should succeed (1.3: always succeeds)");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
+        assert_eq!(state.kiro_root, project);
+        assert!(matches!(state.doc, DocView::Empty), "requirement 1.7: doc panel resets");
+        assert!(state.tree.selected().is_empty(), "requirement 1.6: selection resets");
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live, "requirement 1.5: watch restarted");
+        assert!(
+            buffer_contains(terminal.backend().buffer(), "plain.md"),
+            "expected the full-mode markdown tree"
+        );
+        assert!(
+            !buffer_contains(terminal.backend().buffer(), "SPEC_MODE_MARKER_TEXT"),
+            "expected the old spec-mode doc gone after switching"
+        );
+
+        // Full mode -> spec mode again (requirement 1.2): same key, same
+        // origin `start` (requirement 1.8) re-judged from scratch.
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        assert_eq!(control, spec_viewer::app::Control::SwitchMode);
+        let control = handle_switch_mode(&mut terminal, &mut state, &project, &args, &tx, &mut watch)
+            .expect("switch back to spec mode should succeed (.kiro still present)");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(state.kiro_root, project.join(".kiro"));
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+        assert!(
+            buffer_contains(terminal.backend().buffer(), "demo"),
+            "expected the spec tree back after switching back"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn e2e_mode_switch_to_spec_mode_without_a_marker_leaves_the_full_mode_screen_up_with_guidance() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Same ancestry caution as `resolve_source_neither_kiro_nor_spec_kit_returns_root_not_found`.
+        let leaf = scratch_dir("e2e_mode_switch_no_marker").join("a/b");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("plain.md"), "# Plain\n\nFULL_MODE_MARKER_TEXT\n").unwrap();
+
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree::scan(&leaf)),
+            leaf.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        let args = args_with_path(Some(leaf.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::start(&leaf, tx.clone());
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| spec_viewer::ui::render(f, &mut state))
+            .expect("initial draw");
+
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        assert_eq!(control, spec_viewer::app::Control::SwitchMode);
+        let control = handle_switch_mode(&mut terminal, &mut state, &leaf, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed even on a rejected switch");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        // Requirement 1.4: rejected, real render still shows the full-mode
+        // screen (not blanked/replaced) plus a guidance popup, watch left
+        // untouched.
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
+        assert!(matches!(watch, spec_viewer::watch::Watch::Live(_)));
+        assert!(
+            buffer_contains(terminal.backend().buffer(), "plain.md"),
+            "expected the full-mode tree still up behind the popup"
+        );
+        assert!(
+            buffer_contains(terminal.backend().buffer(), ".kiro")
+                || buffer_contains(terminal.backend().buffer(), ".specify"),
+            "expected the rejection popup's guidance text on screen"
+        );
+
+        fs::remove_dir_all(leaf.parent().unwrap().parent().unwrap()).ok();
     }
 
     // --- task 5: E2E -- Action::Edit through handle_edit_file, full pipeline

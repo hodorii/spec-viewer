@@ -105,7 +105,7 @@ type TreeRow = (Vec<NodeId>, String);
 /// `ui::tree_panel::render` builds its `TreeItem`s in — not just the
 /// currently visible/expanded ones, since a collapsed match still needs to
 /// be found (2.10's "접힌 폴더 안의 일치는 조상을 펼쳐서 이동").
-fn flatten_tree(root: &TreeSource) -> Vec<TreeRow> {
+pub(super) fn flatten_tree(root: &TreeSource) -> Vec<TreeRow> {
     match root {
         TreeSource::Kiro(root) => flatten_kiro(root),
         TreeSource::SpecKit(features) => flatten_spec_kit(features),

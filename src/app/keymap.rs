@@ -209,7 +209,7 @@ pub const BINDINGS: &[Binding] = &[
         help: "전체 모드 ↔ 스펙 모드 전환",
     },
     Binding {
-        keys: &[KeyCode::Char('a')],
+        keys: &[KeyCode::Char('o')],
         action: "toggle_expand_all",
         help: "트리 전체 펼치기/접기 토글",
     },
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn toggle_expand_all_key_resolves_to_toggle_expand_all_action() {
-        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
         assert_eq!(action_for_key(key), Some("toggle_expand_all"));
     }
 
@@ -320,20 +320,20 @@ mod tests {
             .any(|(k, h)| k == "m" && h == "전체 모드 ↔ 스펙 모드 전환"));
         assert!(entries
             .iter()
-            .any(|(k, h)| k == "a" && h == "트리 전체 펼치기/접기 토글"));
+            .any(|(k, h)| k == "o" && h == "트리 전체 펼치기/접기 토글"));
     }
 
     #[test]
-    fn no_binding_reuses_the_m_or_a_keys() {
+    fn no_binding_reuses_the_m_or_o_keys() {
         let reused_keys: Vec<String> = BINDINGS
             .iter()
             .filter(|b| b.action != "toggle_source_mode" && b.action != "toggle_expand_all")
             .map(key_label)
-            .filter(|label| label == "m" || label == "a")
+            .filter(|label| label == "m" || label == "o")
             .collect();
         assert!(
             reused_keys.is_empty(),
-            "m/a keys must be unused by other bindings, found: {reused_keys:?}"
+            "m/o keys must be unused by other bindings, found: {reused_keys:?}"
         );
     }
 }

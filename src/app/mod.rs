@@ -3676,7 +3676,7 @@ mod reducer_tests {
     /// `e_keypress_reaches_action_edit_through_the_real_key_dispatch_path`:
     /// every test above drives `Action::ToggleSourceMode`/`ToggleExpandAll`
     /// directly, which never proves the real keypress --
-    /// `Action::Key(KeyCode::Char('m'/'a'))`, exactly what `run_loop`
+    /// `Action::Key(KeyCode::Char('m'/'o'))`, exactly what `run_loop`
     /// constructs -- actually reaches these variants through `handle_key`'s
     /// `keymap::action_for_key` string dispatch.
     #[test]
@@ -3686,11 +3686,11 @@ mod reducer_tests {
         assert_eq!(key_action(&mut state, KeyCode::Char('m')), Control::SwitchMode);
 
         assert!(state.tree.opened().is_empty());
-        assert_eq!(key_action(&mut state, KeyCode::Char('a')), Control::Continue);
-        assert!(!state.tree.opened().is_empty(), "expected 'a' to open at least one node");
+        assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);
+        assert!(!state.tree.opened().is_empty(), "expected 'o' to open at least one node");
 
-        assert_eq!(key_action(&mut state, KeyCode::Char('a')), Control::Continue);
-        assert!(state.tree.opened().is_empty(), "expected 'a' again to close everything back down");
+        assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);
+        assert!(state.tree.opened().is_empty(), "expected 'o' again to close everything back down");
     }
 
     #[test]

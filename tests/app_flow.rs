@@ -757,7 +757,7 @@ fn l2_all_mode_browses_a_plain_markdown_tree_with_fold_select_and_live_edits() {
 // toggle real render — requirements 2.1-2.4 ----------------------------------
 //
 // `o`/`c` (two separate keys/actions) were merged into a single toggle key
-// (`a` / `Action::ToggleExpandAll`) after user feedback post-`v0.6.0` ship:
+// (`o` / `Action::ToggleExpandAll`) after user feedback post-`v0.6.0` ship:
 // the two directions are mutually exclusive, so one key that picks its own
 // direction from the current tree state is simpler than two.
 
@@ -783,9 +783,9 @@ fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_a
         "test setup: nothing should be expanded yet, got:\n{rows:?}"
     );
 
-    // `a` -- real keypress, not a synthetic `Action::ToggleExpandAll`.
+    // `o` -- real keypress, not a synthetic `Action::ToggleExpandAll`.
     // Nothing is open yet, so this direction is expand.
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('a'))));
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
 
     let rows = buffer_text(&terminal.backend().buffer().clone());
@@ -812,9 +812,9 @@ fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_a
         "requirement 2.3: selection must survive expand-all"
     );
 
-    // `a` again -- everything is now open, so this press flips direction and
+    // `o` again -- everything is now open, so this press flips direction and
     // collapses everything back down (the toggle, not a re-expand no-op).
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('a'))));
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
 
     let rows = buffer_text(&terminal.backend().buffer().clone());
@@ -859,9 +859,9 @@ fn e2e_toggle_expand_all_on_an_empty_files_tree_does_not_panic_or_change_the_fra
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
 
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('a'))));
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('a'))));
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
 
     fs::remove_dir_all(&dir).ok();

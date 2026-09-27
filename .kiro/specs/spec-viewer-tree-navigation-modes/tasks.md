@@ -79,3 +79,10 @@ spec-viewer 구현자를 위해 design.md 컴포넌트 경계(`app`/`app::keymap
   - _Boundary: app (Action, keymap)_
   - _Difficulty: low_
   - design.md "Post-Ship Amendment" 참고.
+
+- [x] 7. (바로 이어진 피드백) 토글 키 `a` → `o` 원복
+  - DONE: `keymap.rs`의 토글 바인딩 키만 `a`에서 `o`로 교체(액션 이름·판정 로직 불변). 모든 테스트/문서의 `a` 참조를 `o`로 갱신.
+  - _Requirements: 2.1~2.4 (키 표기만)_
+  - _Boundary: app::keymap_
+  - _Difficulty: low_
+  - design.md "Post-Ship Amendment 2" 참고.

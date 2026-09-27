@@ -211,3 +211,11 @@ pty에서는 재현하지 못했으나, 이미 프로덕션에 있는 `render_to
   왕복을 확인하는 유닛 테스트, `TestBackend` 실제 렌더로 여러 스펙+
   Steering을 동시에 펼치고 접는 E2E 테스트, 실제 컴파일된 바이너리 pty
   스모크 테스트(모드 전환 왕복 + `a` 토글 왕복) 전부 재확인.
+
+## Post-Ship Amendment 2: 토글 키 `a` → `o` 원복
+
+바로 다음 피드백으로 토글 키를 `a`에서 `o`로 다시 바꿨다("a 원복, o 로
+토글") — 액션 이름(`Action::ToggleExpandAll`)과 방향 판정 로직은 그대로,
+`keymap.rs`의 `Binding.keys`만 `Char('a')` → `Char('o')`로 교체. 위
+Amendment 1의 "`a`(all)" 키 선택 자체가 재검토 대상이 됐을 뿐, 통합
+자체(두 키 → 한 토글)는 유지된다. `a`는 다시 자유 키로 반납.

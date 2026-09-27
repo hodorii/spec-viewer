@@ -52,7 +52,7 @@ Keys: `q` quit · `Tab` switch panel · `j`/`k` line scroll · `d`/`u` half-page
 contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/single) ·
 `s` cycle sort key · `e` edit the displayed file in an external editor (`--editor` >
 `$VISUAL` > `$EDITOR` > `vi`) · `m` toggle between full mode and spec mode at
-runtime (`--all` only sets which one you start in) · `a` toggle every tree
+runtime (`--all` only sets which one you start in) · `o` toggle every tree
 node open/closed at once, picking direction from the current tree state
 (individual node fold/unfold via `Left`/`Right`/`Enter` stays one level at a
 time) · `?` help (scrolls with `j`/`k`/arrows) · arrow keys for tree/document

@@ -86,3 +86,10 @@ spec-viewer 구현자를 위해 design.md 컴포넌트 경계(`app`/`app::keymap
   - _Boundary: app::keymap_
   - _Difficulty: low_
   - design.md "Post-Ship Amendment 2" 참고.
+
+- [x] 8. (바로 이어진 피드백) 토글 통합 자체를 원복 — `Action::ExpandAll`/`CollapseAll`로 복귀
+  - DONE: task 6의 통합을 되돌려 `Action::ToggleExpandAll`을 다시 `Action::ExpandAll`/`Action::CollapseAll` 둘로 분리, `tree_fully_expanded`/`folder_like_paths` 헬퍼 제거, 키 바인딩을 `o`(전체펼치기)/`c`(전체접기) 둘로 복귀. task 1.2/2가 만든 원본 테스트를 그대로 복원해 통과 확인, 실제 바이너리 pty 스모크 테스트(선택 하이라이트 없는 경로)로 `o` 펼침→접힘 재확인.
+  - _Requirements: 2.1~2.4 (원래 표현으로 복귀)_
+  - _Boundary: app (Action, keymap)_
+  - _Difficulty: low_
+  - design.md "Post-Ship Amendment 3" 참고.

@@ -753,16 +753,11 @@ fn l2_all_mode_browses_a_plain_markdown_tree_with_fold_select_and_live_edits() {
     fs::remove_dir_all(&root).ok();
 }
 
-// --- task 4.2 (spec-viewer-tree-navigation-modes): expand/collapse-all
-// toggle real render — requirements 2.1-2.4 ----------------------------------
-//
-// `o`/`c` (two separate keys/actions) were merged into a single toggle key
-// (`o` / `Action::ToggleExpandAll`) after user feedback post-`v0.6.0` ship:
-// the two directions are mutually exclusive, so one key that picks its own
-// direction from the current tree state is simpler than two.
+// --- task 4.2 (spec-viewer-tree-navigation-modes): expand-all/collapse-all
+// real render — requirements 2.1-2.4 ----------------------------------------
 
 #[test]
-fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_at_once() {
+fn e2e_expand_all_reveals_every_docs_across_multiple_specs_and_steering_at_once() {
     // `tests/fixtures/kiro` has several specs (each with its own docs) plus
     // a Steering group -- expand-all opening *only* the selected spec would
     // still look like a real "expand" from a single-spec test, so this
@@ -783,8 +778,7 @@ fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_a
         "test setup: nothing should be expanded yet, got:\n{rows:?}"
     );
 
-    // `o` -- real keypress, not a synthetic `Action::ToggleExpandAll`.
-    // Nothing is open yet, so this direction is expand.
+    // `o` -- real keypress, not a synthetic `Action::ExpandAll`.
     let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
 
@@ -812,15 +806,14 @@ fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_a
         "requirement 2.3: selection must survive expand-all"
     );
 
-    // `o` again -- everything is now open, so this press flips direction and
-    // collapses everything back down (the toggle, not a re-expand no-op).
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
+    // `c` -- real keypress, collapses everything back down.
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('c'))));
     assert_eq!(control, Control::Continue);
 
     let rows = buffer_text(&terminal.backend().buffer().clone());
     assert!(
         !rows.iter().any(|r| r.contains("requirements.md")),
-        "expected every doc hidden again after the toggle flips to collapse, got:\n{rows:?}"
+        "expected every doc hidden again after collapse-all, got:\n{rows:?}"
     );
     assert!(
         rows.iter().any(|r| r.contains("sample-signup")),
@@ -834,12 +827,12 @@ fn e2e_toggle_expand_all_reveals_every_docs_across_multiple_specs_and_steering_a
 }
 
 #[test]
-fn e2e_toggle_expand_all_on_an_empty_files_tree_does_not_panic_or_change_the_frame() {
+fn e2e_expand_all_and_collapse_all_on_an_empty_files_tree_do_not_panic_or_change_the_frame() {
     // Requirement 2.4: an empty tree (a `--all` scan of a directory with no
-    // markdown files at all) must not panic on repeated presses, and the
-    // frame stays a normal (empty) render.
+    // markdown files at all) must not panic on either key, and the frame
+    // stays a normal (empty) render.
     let dir = std::env::temp_dir().join(format!(
-        "spec_viewer_app_flow_toggle_expand_all_empty_{}",
+        "spec_viewer_app_flow_expand_all_empty_{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
@@ -861,7 +854,7 @@ fn e2e_toggle_expand_all_on_an_empty_files_tree_does_not_panic_or_change_the_fra
 
     let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
     assert_eq!(control, Control::Continue);
-    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('c'))));
     assert_eq!(control, Control::Continue);
 
     fs::remove_dir_all(&dir).ok();

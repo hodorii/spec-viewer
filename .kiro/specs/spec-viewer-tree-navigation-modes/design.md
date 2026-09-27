@@ -157,8 +157,8 @@ Binding { keys: &[KeyCode::Char('c')], action: "collapse_all", help: "트리 전
 ## File Structure Plan
 ```
 src/app/
-  mod.rs      # Action::ToggleSourceMode/ApplySourceSwitch/SwitchModeFailed/ToggleExpandAll, Control::SwitchMode, 리듀서 처리
-  keymap.rs   # m/a 바인딩
+  mod.rs      # Action::ToggleSourceMode/ApplySourceSwitch/SwitchModeFailed/ExpandAll/CollapseAll, Control::SwitchMode, 리듀서 처리
+  keymap.rs   # m/o/c 바인딩
 src/main.rs    # resolve_spec_mode 추출, resolve_source가 이를 재사용하도록 리팩터링, handle_switch_mode 신규, run_loop 시그니처 확장
 ```
 
@@ -219,3 +219,27 @@ pty에서는 재현하지 못했으나, 이미 프로덕션에 있는 `render_to
 `keymap.rs`의 `Binding.keys`만 `Char('a')` → `Char('o')`로 교체. 위
 Amendment 1의 "`a`(all)" 키 선택 자체가 재검토 대상이 됐을 뿐, 통합
 자체(두 키 → 한 토글)는 유지된다. `a`는 다시 자유 키로 반납.
+
+## Post-Ship Amendment 3: 토글 통합 자체를 원복 (`Action::ExpandAll`/`CollapseAll`로 복귀)
+
+곧이어 사용자가 "a, o, c 초기구현으로 원복"을 요청 — Amendment 1/2의 토글
+통합 자체를 되돌리고, 최초 tasks.md 1.2가 정의했던 두 개의 독립된 액션/키로
+복귀한다:
+
+- **`Action::ToggleExpandAll` → `Action::ExpandAll`/`Action::CollapseAll`
+  둘로 재분리**: `tree_fully_expanded`/`folder_like_paths` 헬퍼는 제거하고,
+  `expand_all`은 원래 형태(`flatten_tree`를 직접 순회하며 폴더형 노드만
+  열기)로 복귀. `Action::CollapseAll`은 다시 `state.tree.close_all()`을
+  직접 호출.
+- **키 바인딩**: `o`(전체펼치기)/`c`(전체접기) 두 바인딩으로 복귀, `a`는
+  다시 자유 키로 반납.
+- **요구사항 2.1~2.4**: "토글 키" 표현을 최초의 "전체펼치기 키"/"전체접기
+  키" 표현으로 되돌리고, 섹션 머리에 이번 왕복(토글 통합 → `a` → `o` →
+  재분리)을 한 줄 이력으로 남김(requirements.md 참고). 관찰 가능한 동작
+  자체(2.1 펼치기/2.2 접기/2.3 선택 유지/2.4 빈 트리 안전)는 이 왕복
+  내내 동일하게 성립했다.
+- 실물 검증: `Action::Key(KeyCode::Char('o'))`/`Char('c')` 각각 실제
+  디스패치로 펼침·접힘을 확인하는 유닛 테스트(Amendment 1 이전 원본으로
+  복귀), `TestBackend` 실제 렌더 E2E 테스트, 실제 컴파일된 바이너리 pty
+  스모크 테스트(선택 하이라이트를 건드리지 않는 경로로 `o` 펼침→`o` 접힘
+  왕복) 전부 재확인.

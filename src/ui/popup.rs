@@ -286,7 +286,7 @@ mod tests {
 
     /// Task 4.4 (spec-viewer-tree-navigation-modes), requirement 4.1: real
     /// rendered frame, driven from the actual `keymap::help_entries()` (not
-    /// a hand-picked fixture like the test above) -- proves the `m`/`o`
+    /// a hand-picked fixture like the test above) -- proves the `m`/`o`/`c`
     /// bindings actually reach the help popup a user opens, in the same
     /// "key  설명" format every other binding uses.
     ///
@@ -296,11 +296,11 @@ mod tests {
     /// pty smoke test during this spec's verification -- fixed by giving
     /// `render_help` a stateful, auto-scrolling `List` (mirroring
     /// `render_toc`'s own pattern) instead of a static one. Selecting the
-    /// last row (`toggle_expand_all`/`o`) scrolls the tail of the list --
-    /// where `edit`/`toggle_source_mode`/`toggle_expand_all` all sit -- into
-    /// view, proving the scroll (not just the data) actually works.
+    /// last row (`collapse_all`/`c`) scrolls the tail of the list -- where
+    /// `edit`/`toggle_source_mode`/`expand_all`/`collapse_all` all sit --
+    /// into view, proving the scroll (not just the data) actually works.
     #[test]
-    fn help_popup_real_render_shows_mode_switch_and_toggle_expand_all_keys() {
+    fn help_popup_real_render_shows_mode_switch_and_expand_collapse_keys() {
         let entries = crate::app::keymap::help_entries();
         let last = entries.len() - 1;
         let popup = Popup::Help(entries, last);
@@ -317,7 +317,8 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert!(contains(buffer, "m  전체 모드 ↔ 스펙 모드 전환"));
-        assert!(contains(buffer, "o  트리 전체 펼치기/접기 토글"));
+        assert!(contains(buffer, "o  트리 전체 펼치기"));
+        assert!(contains(buffer, "c  트리 전체 접기"));
     }
 
     #[test]

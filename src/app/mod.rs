@@ -456,15 +456,14 @@ pub enum Action {
     /// -- reported the same way `Action::EditFailed` reports an editor
     /// failure.
     SwitchModeFailed(String),
-    /// Requirement 2.1/2.2: originally two separate actions (`ExpandAll`/
-    /// `CollapseAll`, one key each) -- merged into a single toggle after
-    /// user feedback post-`v0.6.0` ship pointed out the two were mutually
-    /// exclusive (only one direction is ever the "useful" one to press at a
-    /// given moment) and didn't need a key each. Direction is decided from
-    /// the current tree state (`tree_fully_expanded`): open everything if
-    /// anything is still folded, otherwise close everything. Leaves
-    /// selection untouched either way.
-    ToggleExpandAll,
+    /// Requirement 2.1/2.2: open every folder-like node in the current
+    /// tree, leaving selection untouched. (Briefly merged with
+    /// `CollapseAll` into a single toggle action post-`v0.6.0`; reverted
+    /// back to two separate actions/keys per user request.)
+    ExpandAll,
+    /// Requirement 2.3/2.4: close every open node in the current tree,
+    /// leaving selection untouched.
+    CollapseAll,
 }
 
 /// The single state-transition entry point (design.md "app — State &
@@ -545,55 +544,32 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             state.popup = Some(Popup::Message(msg));
             Control::Continue
         }
-        Action::ToggleExpandAll => {
-            if tree_fully_expanded(state) {
-                state.tree.close_all();
-            } else {
-                expand_all(state);
-            }
+        Action::ExpandAll => {
+            expand_all(state);
+            Control::Continue
+        }
+        Action::CollapseAll => {
+            state.tree.close_all();
             Control::Continue
         }
     }
 }
 
-/// Every folder-like node's path in the current tree (`Spec`,
-/// `SteeringGroup`, `Dir` -- the only `NodeId` variants that can have
-/// children; `Doc`/`Steering`/`File` are leaves, irrelevant to expand/
-/// collapse-all). Reuses `search::flatten_tree`'s own traversal (SSoT for
-/// "every node in this tree, in path order") rather than re-walking
-/// `state.root` itself. Shared by `expand_all` and `tree_fully_expanded` so
-/// both agree on exactly what counts as a folder.
-fn folder_like_paths(state: &AppState) -> Vec<Vec<NodeId>> {
-    search::flatten_tree(&state.root)
-        .into_iter()
-        .filter_map(|(path, _label)| {
-            matches!(
-                path.last(),
-                Some(NodeId::Spec(_)) | Some(NodeId::SteeringGroup) | Some(NodeId::Dir(_))
-            )
-            .then_some(path)
-        })
-        .collect()
-}
-
-/// Requirement 2.1/2.2 (expand direction): open every folder-like node so
-/// every document becomes reachable without manually expanding each
-/// ancestor.
+/// Requirement 2.1/2.2: open every folder-like node (`Spec`, `SteeringGroup`,
+/// `Dir` -- the only `NodeId` variants that can have children; `Doc`/
+/// `Steering`/`File` are leaves and opening them is meaningless) so every
+/// document becomes reachable without manually expanding each ancestor.
+/// Reuses `search::flatten_tree`'s own traversal (SSoT for "every node in
+/// this tree, in path order") rather than re-walking `state.root` itself.
 fn expand_all(state: &mut AppState) {
-    for path in folder_like_paths(state) {
-        state.tree.open(path);
+    for (path, _label) in search::flatten_tree(&state.root) {
+        if matches!(
+            path.last(),
+            Some(NodeId::Spec(_)) | Some(NodeId::SteeringGroup) | Some(NodeId::Dir(_))
+        ) {
+            state.tree.open(path);
+        }
     }
-}
-
-/// Requirement 2.1/2.2's toggle direction: true once every folder-like node
-/// is already open, including the vacuous case of a tree with no
-/// folder-like nodes at all (an empty tree, or one with only leaves) --
-/// there, `ToggleExpandAll` harmlessly picks the also-no-op `close_all()`
-/// branch rather than `expand_all()`, either being equally correct.
-fn tree_fully_expanded(state: &AppState) -> bool {
-    folder_like_paths(state)
-        .iter()
-        .all(|path| state.tree.opened().contains(path))
 }
 
 /// Requirements 1.1, 1.3: the file `Action::Edit` may open, if any. Only
@@ -1083,19 +1059,19 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
         // bridge from the keymap's `"edit"` string to that variant that a
         // real keypress needs; nothing else constructs `Action::Edit`.
         "edit" => update(state, Action::Edit),
-        // The `'m'`/`'a'` bindings (requirements 1.4, 2.1, 2.2): same
+        // The `'m'`/`'o'`/`'c'` bindings (requirements 1.4, 2.1, 2.2): same
         // bridge pattern as `"edit"` above -- task 1 defined
-        // `Action::ToggleSourceMode`/`ExpandAll`/`CollapseAll` (the latter
-        // two later merged into `ToggleExpandAll`, see its doc comment) and
-        // task 2 bound the keys, but neither wired the keymap's action
-        // *names* to these variants here, so a real keypress fell through
-        // to the catch-all no-op below despite every unit test (which
-        // dispatches the `Action` directly, never through `action_for_key`)
-        // passing -- caught only while building task 3.2's real end-to-end
-        // wiring, the exact "dead wiring" class of bug this project has hit
-        // before with `"edit"` itself.
+        // `Action::ToggleSourceMode`/`ExpandAll`/`CollapseAll` and task 2
+        // bound the keys, but neither wired the keymap's action *names* to
+        // these variants here, so a real keypress fell through to the
+        // catch-all no-op below despite every unit test (which dispatches
+        // the `Action` directly, never through `action_for_key`) passing --
+        // caught only while building task 3.2's real end-to-end wiring, the
+        // exact "dead wiring" class of bug this project has hit before with
+        // `"edit"` itself.
         "toggle_source_mode" => update(state, Action::ToggleSourceMode),
-        "toggle_expand_all" => update(state, Action::ToggleExpandAll),
+        "expand_all" => update(state, Action::ExpandAll),
+        "collapse_all" => update(state, Action::CollapseAll),
         _ => Control::Continue,
     }
 }
@@ -3633,39 +3609,35 @@ mod reducer_tests {
     /// Every `NodeId` variant that can hold children under `TreeSource::Kiro`
     /// (`Spec`, `SteeringGroup`) must end up open; leaf nodes (`Doc`,
     /// `Steering`) are irrelevant to "expand all" and are not asserted on.
-    /// A tree with nothing open yet is the "not fully expanded" case, so
-    /// the toggle's direction is expand.
     #[test]
-    fn toggle_expand_all_opens_every_folder_node_and_preserves_selection_when_not_fully_expanded() {
+    fn expand_all_opens_every_folder_node_and_preserves_selection() {
         let mut state = test_state();
         let selected = vec![NodeId::Spec("sample-signup".to_string())];
         state.tree.select(selected.clone());
         assert!(state.tree.opened().is_empty(), "test setup: nothing should be open yet");
 
-        let control = update(&mut state, Action::ToggleExpandAll);
+        let control = update(&mut state, Action::ExpandAll);
 
         assert_eq!(control, Control::Continue);
         for name in spec_names(&state) {
             assert!(
                 state.tree.opened().contains(&vec![NodeId::Spec(name.clone())]),
-                "expected Spec({name}) to be open after ToggleExpandAll"
+                "expected Spec({name}) to be open after ExpandAll"
             );
         }
         assert!(state.tree.opened().contains(&vec![NodeId::SteeringGroup]));
         assert_eq!(state.tree.selected(), selected.as_slice());
     }
 
-    /// Once everything is already open, the same key's next press must flip
-    /// direction and close everything, rather than being a no-op re-expand.
     #[test]
-    fn toggle_expand_all_closes_everything_and_preserves_selection_when_fully_expanded() {
+    fn collapse_all_closes_everything_and_preserves_selection() {
         let mut state = test_state();
         let selected = vec![NodeId::Spec("sample-signup".to_string())];
         state.tree.select(selected.clone());
-        update(&mut state, Action::ToggleExpandAll);
+        update(&mut state, Action::ExpandAll);
         assert!(!state.tree.opened().is_empty(), "test setup: expected something open");
 
-        let control = update(&mut state, Action::ToggleExpandAll);
+        let control = update(&mut state, Action::CollapseAll);
 
         assert_eq!(control, Control::Continue);
         assert!(state.tree.opened().is_empty());
@@ -3674,13 +3646,15 @@ mod reducer_tests {
 
     /// Verify-completion regression, same class as
     /// `e_keypress_reaches_action_edit_through_the_real_key_dispatch_path`:
-    /// every test above drives `Action::ToggleSourceMode`/`ToggleExpandAll`
-    /// directly, which never proves the real keypress --
-    /// `Action::Key(KeyCode::Char('m'/'o'))`, exactly what `run_loop`
+    /// every test above drives `Action::ToggleSourceMode`/`ExpandAll`/
+    /// `CollapseAll` directly, which never proves the real keypress --
+    /// `Action::Key(KeyCode::Char('m'/'o'/'c'))`, exactly what `run_loop`
     /// constructs -- actually reaches these variants through `handle_key`'s
-    /// `keymap::action_for_key` string dispatch.
+    /// `keymap::action_for_key` string dispatch. It didn't (none of the
+    /// three action names had an arm there, so they silently fell through
+    /// to the wildcard `Control::Continue`) until this test caught it.
     #[test]
-    fn mode_switch_and_toggle_expand_all_keys_reach_their_actions_through_the_real_key_dispatch_path() {
+    fn mode_switch_and_expand_collapse_keys_reach_their_actions_through_the_real_key_dispatch_path() {
         let mut state = test_state();
 
         assert_eq!(key_action(&mut state, KeyCode::Char('m')), Control::SwitchMode);
@@ -3689,12 +3663,12 @@ mod reducer_tests {
         assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);
         assert!(!state.tree.opened().is_empty(), "expected 'o' to open at least one node");
 
-        assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);
-        assert!(state.tree.opened().is_empty(), "expected 'o' again to close everything back down");
+        assert_eq!(key_action(&mut state, KeyCode::Char('c')), Control::Continue);
+        assert!(state.tree.opened().is_empty(), "expected 'c' to close everything again");
     }
 
     #[test]
-    fn toggle_expand_all_on_an_empty_tree_does_not_panic() {
+    fn expand_all_and_collapse_all_on_an_empty_tree_do_not_panic() {
         let mut state = AppState::new(
             TreeSource::Files(FsTree { root: PathBuf::from("/tmp/empty-files-root"), entries: vec![] }),
             PathBuf::from("/tmp/empty-files-root"),
@@ -3704,9 +3678,9 @@ mod reducer_tests {
             true,
         );
 
-        assert_eq!(update(&mut state, Action::ToggleExpandAll), Control::Continue);
+        assert_eq!(update(&mut state, Action::ExpandAll), Control::Continue);
         assert!(state.tree.opened().is_empty());
-        assert_eq!(update(&mut state, Action::ToggleExpandAll), Control::Continue);
+        assert_eq!(update(&mut state, Action::CollapseAll), Control::Continue);
         assert!(state.tree.opened().is_empty());
     }
 }

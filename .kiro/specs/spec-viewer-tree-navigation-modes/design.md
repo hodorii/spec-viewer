@@ -157,8 +157,8 @@ Binding { keys: &[KeyCode::Char('c')], action: "collapse_all", help: "트리 전
 ## File Structure Plan
 ```
 src/app/
-  mod.rs      # Action::ToggleSourceMode/ApplySourceSwitch/SwitchModeFailed/ExpandAll/CollapseAll, Control::SwitchMode, 리듀서 처리
-  keymap.rs   # m/o/c 바인딩
+  mod.rs      # Action::ToggleSourceMode/ApplySourceSwitch/SwitchModeFailed/ToggleExpandAll, Control::SwitchMode, 리듀서 처리
+  keymap.rs   # m/a 바인딩
 src/main.rs    # resolve_spec_mode 추출, resolve_source가 이를 재사용하도록 리팩터링, handle_switch_mode 신규, run_loop 시그니처 확장
 ```
 
@@ -190,3 +190,24 @@ Boundary Commitments를 다음과 같이 확장했다(문서화된 범위 확장
 pty에서는 재현하지 못했으나, 이미 프로덕션에 있는 `render_toc`의 동일
 기법이 재현 대상이라 이 기능의 회귀가 아니라 스모크 테스트 도구 자체의
 한계로 판단했다(`kiro-verify-completion` 보고서 참고).
+
+## Post-Ship Amendment: 전체펼치기/전체접기 키 통합 (`o`/`c` → `a`)
+
+`v0.6.0` 배포 후 사용자가 키맵 전체를 재점검해 달라고 요청 — 핵심 지적은
+"`o`(전체펼치기)/`c`(전체접기)는 한 시점엔 둘 중 하나만 의미가 있는
+상호 배타적 동작이라 키 두 개가 필요 없다"는 것. 공개 배포 전 상태라
+하위호환 부담 없이 바로 변경 가능하다는 확인을 받아 다음과 같이 조정했다:
+
+- **`Action::ExpandAll`/`Action::CollapseAll` → `Action::ToggleExpandAll`
+  하나로 통합**: 방향은 `tree_fully_expanded(state)`(모든 폴더형 노드가
+  이미 열려 있는지)로 판정 — 아니면 펼치고(`expand_all`), 맞으면
+  `close_all()`. `flatten_tree` 필터링 로직은 `folder_like_paths`로
+  추출해 `expand_all`/`tree_fully_expanded` 둘 다 재사용(SSoT).
+- **키 바인딩**: `o`/`c` 두 바인딩 제거, `a`(all) 하나로 대체. `o`/`c`는
+  자유 키로 반납.
+- **요구사항 2.1~2.4**: 표현만 "전체펼치기 키"/"전체접기 키" → "토글 키"로
+  갱신, 관찰 가능한 동작(요구사항의 의도)은 그대로(requirements.md 참고).
+- 실물 검증: `Action::Key(KeyCode::Char('a'))` 실제 디스패치로 펼침→접힘
+  왕복을 확인하는 유닛 테스트, `TestBackend` 실제 렌더로 여러 스펙+
+  Steering을 동시에 펼치고 접는 E2E 테스트, 실제 컴파일된 바이너리 pty
+  스모크 테스트(모드 전환 왕복 + `a` 토글 왕복) 전부 재확인.

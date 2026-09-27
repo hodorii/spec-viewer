@@ -72,3 +72,10 @@ spec-viewer 구현자를 위해 design.md 컴포넌트 경계(`app`/`app::keymap
   - _Boundary: app (Popup::Help), ui::popup (render_help)_
   - _Difficulty: low_
   - design.md "Verification Addendum" 참고.
+
+- [x] 6. (v0.6.0 배포 후 사용자 피드백, 공개 전이라 하위호환 부담 없음) 전체펼치기/전체접기 키 통합
+  - DONE: `Action::ExpandAll`/`CollapseAll`을 `Action::ToggleExpandAll` 하나로 합치고(방향은 `tree_fully_expanded`로 판정), 키 바인딩을 `o`/`c` 두 개에서 `a` 하나로 교체. 기존 회귀(선택 유지, 빈 트리 안전, 실제 키 디스패치)를 새 액션/키 이름으로 재작성해 통과 확인, 실제 바이너리 pty 스모크 테스트로 왕복 재확인.
+  - _Requirements: 2.1~2.4 (표현 갱신)_
+  - _Boundary: app (Action, keymap)_
+  - _Difficulty: low_
+  - design.md "Post-Ship Amendment" 참고.

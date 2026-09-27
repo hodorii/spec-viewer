@@ -286,6 +286,46 @@ fn l2_a3_selecting_a_doc_node_and_pressing_enter_renders_its_content() {
     );
 }
 
+// --- bugfix (user report), requirement 1.10 "자동... 좁으면 단일 모드처럼
+// 동작": narrow Auto mode must auto-switch to the doc side on selection
+// (not just collapse to whichever panel already has focus), and the real
+// rendered frame must actually show the document, not the tree, right after
+// selecting it — no separate manual Tab/Right needed. -----------------------
+
+#[test]
+fn narrow_auto_mode_selecting_a_doc_shows_it_full_width_without_a_manual_panel_switch() {
+    let mut state = build_state_from(&fixtures_root(), (40, 20));
+    assert_eq!(state.tree_mode, spec_viewer::app::TreeMode::Auto);
+    assert_eq!(state.focus, Panel::Tree, "test setup: starts on the tree side");
+    state.tree.select(vec![
+        NodeId::Spec("sample-signup".to_string()),
+        NodeId::Doc("sample-signup".to_string(), DocKind::Requirements),
+    ]);
+
+    let backend = TestBackend::new(40, 20);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+
+    // `Enter` alone -- no manual focus/Tab switch -- must be enough.
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)));
+    assert_eq!(control, Control::Continue);
+    assert_eq!(state.focus, Panel::Doc);
+
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        rows.iter().any(|r| r.contains("Validate user input on signup form")),
+        "expected the very next frame to already show the selected doc's real content, got:\n{rows:?}"
+    );
+
+    // And Esc returns to the tree, mirroring Single mode's own Esc rule.
+    step(&mut terminal, &mut state, Action::Key(key(KeyCode::Esc)));
+    assert_eq!(state.focus, Panel::Tree);
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        rows.iter().any(|r| r.contains("sample-signup")),
+        "expected Esc to bring the tree back into view, got:\n{rows:?}"
+    );
+}
+
 // --- L2-A4: 문서 안 이동·검색 (탐색) — requirement 6.1 -----------------------
 
 #[test]

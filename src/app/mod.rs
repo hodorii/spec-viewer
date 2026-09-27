@@ -887,6 +887,20 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
         return Control::Continue;
     }
 
+    // Same "Esc -> 트리 복귀" rule for narrow Auto mode (requirement 1.10
+    // "좁으면 단일 모드처럼 동작"), mirroring the `Single`-mode branch just
+    // above -- narrow Auto has no separate `doc_focus` flag (it reuses
+    // `focus` itself, see `load_selected_doc`), so the condition checks
+    // `focus == Panel::Doc` directly instead.
+    if key.code == KeyCode::Esc
+        && state.tree_mode == TreeMode::Auto
+        && state.size.0 < NARROW_WIDTH_THRESHOLD
+        && state.focus == Panel::Doc
+    {
+        state.focus = Panel::Tree;
+        return Control::Continue;
+    }
+
     let Some(action_name) = keymap::action_for_key(key) else {
         return Control::Continue;
     };
@@ -1250,6 +1264,20 @@ fn load_selected_doc(state: &mut AppState) {
     if state.tree_mode == TreeMode::Single {
         state.doc_focus = !matches!(state.doc, DocView::Empty);
         if state.doc_focus {
+            state.focus = Panel::Doc;
+        }
+    } else if state.tree_mode == TreeMode::Auto && state.size.0 < NARROW_WIDTH_THRESHOLD {
+        // Requirement 1.10 "자동... 좁으면 단일 모드처럼 동작": the width
+        // fallback in `ui::render` already collapses narrow Auto to
+        // whichever single panel `state.focus` names, but nothing was ever
+        // flipping `focus` itself on selection the way Single mode's own
+        // `doc_focus` above does -- so selecting a document while narrow
+        // silently did nothing visible until the user manually pressed
+        // Tab/Right (found from a user report: the expected behavior is
+        // that narrow Auto mode auto-switches to the doc side on selection,
+        // exactly like Single mode, not just "collapse to one panel and
+        // require a manual switch").
+        if !matches!(state.doc, DocView::Empty) {
             state.focus = Panel::Doc;
         }
     }
@@ -1757,6 +1785,81 @@ mod reducer_tests {
     fn initial_tree_visible_is_true_for_single_regardless_of_file_arg() {
         assert!(initial_tree_visible(TreeMode::Single, true, 80));
         assert!(initial_tree_visible(TreeMode::Single, false, 80));
+    }
+
+    // --- bugfix (user report): requirement 1.10 "자동... 좁으면 단일
+    // 모드처럼 동작" -- narrow Auto mode must also auto-switch to the doc
+    // side on selection and return to the tree on Esc, exactly like Single
+    // mode, not just collapse to whichever single panel `focus` already
+    // names. Mirrors the `single_mode_*` tests just above one-for-one. -----
+
+    #[test]
+    fn narrow_auto_mode_selecting_a_doc_switches_focus_to_doc() {
+        let mut state = build_state_from(&fixtures_root(), (40, 40));
+        assert_eq!(state.tree_mode, TreeMode::Auto);
+        assert_eq!(state.focus, Panel::Tree);
+
+        state.tree.select(vec![
+            NodeId::Spec("sample-signup".to_string()),
+            NodeId::Doc("sample-signup".to_string(), DocKind::Requirements),
+        ]);
+        key_action(&mut state, KeyCode::Enter);
+
+        assert_eq!(
+            state.focus,
+            Panel::Doc,
+            "selecting a real document in narrow Auto mode should switch focus to the doc side"
+        );
+        assert!(matches!(state.doc, DocView::Rendered { .. }));
+    }
+
+    #[test]
+    fn narrow_auto_mode_esc_returns_focus_to_the_tree() {
+        let mut state = build_state_from(&fixtures_root(), (40, 40));
+        state.tree.select(vec![
+            NodeId::Spec("sample-signup".to_string()),
+            NodeId::Doc("sample-signup".to_string(), DocKind::Requirements),
+        ]);
+        key_action(&mut state, KeyCode::Enter);
+        assert_eq!(state.focus, Panel::Doc);
+
+        key_action(&mut state, KeyCode::Esc);
+        assert_eq!(state.focus, Panel::Tree, "Esc should return narrow Auto mode to the tree side");
+    }
+
+    #[test]
+    fn narrow_auto_mode_selecting_an_empty_node_does_not_switch_focus() {
+        // Requirement 1.9: a folder node (SteeringGroup) resolves to
+        // DocView::Empty -- nothing to show, so focus must stay on the tree
+        // rather than flipping to a blank doc panel.
+        let mut state = build_state_from(&fixtures_root(), (40, 40));
+        state.tree.select(vec![NodeId::SteeringGroup]);
+        key_action(&mut state, KeyCode::Enter);
+
+        assert_eq!(state.focus, Panel::Tree);
+        assert!(matches!(state.doc, DocView::Empty));
+    }
+
+    #[test]
+    fn wide_auto_mode_selecting_a_doc_does_not_auto_switch_focus() {
+        // Requirement 1.10's auto-switch is specific to the narrow ("좁으면
+        // 단일 모드처럼 동작") case -- at/above the threshold both panels
+        // already show side by side, so there is nothing to "switch" to.
+        let mut state = build_state_from(&fixtures_root(), (120, 40));
+        assert_eq!(state.tree_mode, TreeMode::Auto);
+
+        state.tree.select(vec![
+            NodeId::Spec("sample-signup".to_string()),
+            NodeId::Doc("sample-signup".to_string(), DocKind::Requirements),
+        ]);
+        key_action(&mut state, KeyCode::Enter);
+
+        assert_eq!(
+            state.focus,
+            Panel::Tree,
+            "wide Auto mode should leave focus alone on selection -- both panels are already visible"
+        );
+        assert!(matches!(state.doc, DocView::Rendered { .. }));
     }
 
     // --- task 19.2: spec tree sort (requirement 2.9) ---------------------

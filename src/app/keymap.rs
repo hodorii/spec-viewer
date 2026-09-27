@@ -209,14 +209,9 @@ pub const BINDINGS: &[Binding] = &[
         help: "전체 모드 ↔ 스펙 모드 전환",
     },
     Binding {
-        keys: &[KeyCode::Char('o')],
-        action: "expand_all",
-        help: "트리 전체 펼치기",
-    },
-    Binding {
-        keys: &[KeyCode::Char('c')],
-        action: "collapse_all",
-        help: "트리 전체 접기",
+        keys: &[KeyCode::Char('a')],
+        action: "toggle_expand_all",
+        help: "트리 전체 펼치기/접기 토글",
     },
 ];
 
@@ -312,42 +307,33 @@ mod tests {
     }
 
     #[test]
-    fn expand_all_key_resolves_to_expand_all_action() {
-        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
-        assert_eq!(action_for_key(key), Some("expand_all"));
+    fn toggle_expand_all_key_resolves_to_toggle_expand_all_action() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(action_for_key(key), Some("toggle_expand_all"));
     }
 
     #[test]
-    fn collapse_all_key_resolves_to_collapse_all_action() {
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
-        assert_eq!(action_for_key(key), Some("collapse_all"));
-    }
-
-    #[test]
-    fn help_entries_cover_toggle_source_mode_expand_all_and_collapse_all() {
+    fn help_entries_cover_toggle_source_mode_and_toggle_expand_all() {
         let entries = help_entries();
         assert!(entries
             .iter()
             .any(|(k, h)| k == "m" && h == "전체 모드 ↔ 스펙 모드 전환"));
         assert!(entries
             .iter()
-            .any(|(k, h)| k == "o" && h == "트리 전체 펼치기"));
-        assert!(entries
-            .iter()
-            .any(|(k, h)| k == "c" && h == "트리 전체 접기"));
+            .any(|(k, h)| k == "a" && h == "트리 전체 펼치기/접기 토글"));
     }
 
     #[test]
-    fn no_binding_reuses_the_m_o_or_c_keys() {
+    fn no_binding_reuses_the_m_or_a_keys() {
         let reused_keys: Vec<String> = BINDINGS
             .iter()
-            .filter(|b| b.action != "toggle_source_mode" && b.action != "expand_all" && b.action != "collapse_all")
+            .filter(|b| b.action != "toggle_source_mode" && b.action != "toggle_expand_all")
             .map(key_label)
-            .filter(|label| label == "m" || label == "o" || label == "c")
+            .filter(|label| label == "m" || label == "a")
             .collect();
         assert!(
             reused_keys.is_empty(),
-            "m/o/c keys must be unused by other bindings, found: {reused_keys:?}"
+            "m/a keys must be unused by other bindings, found: {reused_keys:?}"
         );
     }
 }

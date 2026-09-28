@@ -1157,16 +1157,28 @@ fn handle_popup_key(state: &mut AppState, key: KeyEvent) -> Control {
 }
 
 /// Requirement 2.9 "정렬 키를 핫키로 순환": advance `state.sort_key` and
-/// re-sort `root.specs` in place to match. A no-op under `TreeSource::Files`
-/// -- sorting is a `Kiro`-only concept (there is no `spec.json` metadata to
-/// sort by in `--all` mode; requirement 1.9). `state.tree`'s
-/// selected/opened sets are untouched (same reasoning as `refresh_current_doc`'s
-/// own comment): they key on `NodeId`, not position, so reordering the
-/// underlying `Vec` never disturbs which node is selected.
+/// re-sort the current tree in place to match. `Kiro` cycles through all
+/// four keys and re-sorts `root.specs`, exactly as before. `Files` (`--all`
+/// mode, spec-viewer-files-mode-sort requirements 1.1-1.3, 2.1) cycles
+/// through only `Name`/`Updated` (`SortKey::cycle_for_files` -- `Phase`/
+/// `Progress` have no meaning without `.kiro` spec metadata) and
+/// re-sorts the `FsTree`'s siblings via `FsTree::sort_entries`, which
+/// preserves the tree's own nesting. `SpecKit` is a no-op -- it has no
+/// sort concept, unaffected by this feature. In every case, `state.tree`'s
+/// selected/opened sets are untouched (2.2): they key on `NodeId`, not
+/// position, so reordering the underlying data never disturbs which node
+/// is selected or open.
 fn cycle_sort(state: &mut AppState) {
-    state.sort_key = state.sort_key.cycle();
-    if let TreeSource::Kiro(root) = &mut state.root {
-        crate::spec::sort_specs(&mut root.specs, state.sort_key);
+    match &mut state.root {
+        TreeSource::Kiro(root) => {
+            state.sort_key = state.sort_key.cycle();
+            crate::spec::sort_specs(&mut root.specs, state.sort_key);
+        }
+        TreeSource::Files(tree) => {
+            state.sort_key = state.sort_key.cycle_for_files();
+            tree.sort_entries(state.sort_key);
+        }
+        TreeSource::SpecKit(_) => {}
     }
 }
 
@@ -1367,7 +1379,15 @@ fn resync(state: &mut AppState) {
             crate::spec::sort_specs(&mut root.specs, state.sort_key);
             TreeSource::Kiro(root)
         }
-        TreeSource::Files(_) => TreeSource::Files(crate::spec::FsTree::scan(&state.kiro_root)),
+        TreeSource::Files(_) => {
+            let mut tree = crate::spec::FsTree::scan(&state.kiro_root);
+            // spec-viewer-files-mode-sort requirement 2.3: a rebuild from
+            // disk starts back at `scan`'s own (path-order) ordering --
+            // re-apply whatever sort the user had active, mirroring the
+            // `Kiro` branch above.
+            tree.sort_entries(state.sort_key);
+            TreeSource::Files(tree)
+        }
         TreeSource::SpecKit(_) => {
             TreeSource::SpecKit(crate::spec::spec_kit::build(&state.kiro_root))
         }
@@ -1911,6 +1931,129 @@ mod reducer_tests {
             vec!["z-spec", "a-spec"],
             "a resync's freshly rebuilt SpecRoot must be re-sorted, not left in filesystem order"
         );
+    }
+
+    // --- Files-mode sort (spec-viewer-files-mode-sort) --------------------
+
+    fn temp_files_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spec_viewer_files_sort_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn build_files_state_from(root: &Path, size: (u16, u16)) -> AppState {
+        let tree = crate::spec::FsTree::scan(root);
+        AppState::new(TreeSource::Files(tree), root.to_path_buf(), size, WatchStatus::Live, TreeMode::Auto, true)
+    }
+
+    fn files_names(state: &AppState) -> Vec<String> {
+        match &state.root {
+            TreeSource::Files(tree) => tree
+                .entries
+                .iter()
+                .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
+            TreeSource::Kiro(_) | TreeSource::SpecKit(_) => panic!("expected TreeSource::Files"),
+        }
+    }
+
+    #[test]
+    fn sort_hotkey_cycles_files_mode_between_name_and_updated_only() {
+        let root = temp_files_root("cycle");
+        fs::write(root.join("b.md"), "x").unwrap();
+        fs::write(root.join("a.md"), "x").unwrap();
+        let mut state = build_files_state_from(&root, (120, 40));
+        assert_eq!(state.sort_key, spec::SortKey::Name);
+        assert_eq!(files_names(&state), vec!["a.md", "b.md"]);
+
+        key_action(&mut state, KeyCode::Char('s'));
+        assert_eq!(
+            state.sort_key,
+            spec::SortKey::Updated,
+            "Files mode's cycle must skip Phase/Progress entirely"
+        );
+
+        key_action(&mut state, KeyCode::Char('s'));
+        assert_eq!(state.sort_key, spec::SortKey::Name);
+        assert_eq!(files_names(&state), vec!["a.md", "b.md"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cycling_sort_in_files_mode_preserves_the_current_tree_selection() {
+        let root = temp_files_root("selection");
+        fs::write(root.join("a.md"), "x").unwrap();
+        fs::write(root.join("b.md"), "x").unwrap();
+        let mut state = build_files_state_from(&root, (120, 40));
+        let target = crate::spec::NodeId::File(root.join("b.md"));
+        state.tree.select(vec![target.clone()]);
+
+        key_action(&mut state, KeyCode::Char('s'));
+
+        assert_eq!(
+            state.tree.selected(),
+            &[target][..],
+            "selection is keyed by NodeId, not position, so re-sorting must not change or clear it"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn files_mode_sort_survives_a_resync() {
+        let root = temp_files_root("resync");
+        let now = std::time::SystemTime::now();
+        fs::write(root.join("old.md"), "x").unwrap();
+        std::fs::File::open(root.join("old.md"))
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(100))
+            .unwrap();
+        fs::write(root.join("new.md"), "x").unwrap();
+        std::fs::File::open(root.join("new.md"))
+            .unwrap()
+            .set_modified(now + std::time::Duration::from_secs(100))
+            .unwrap();
+
+        let mut state = build_files_state_from(&root, (120, 40));
+        key_action(&mut state, KeyCode::Char('s')); // Name -> Updated
+        assert_eq!(state.sort_key, spec::SortKey::Updated);
+        assert_eq!(files_names(&state), vec!["new.md", "old.md"]);
+
+        update(&mut state, fs_event());
+
+        assert_eq!(state.sort_key, spec::SortKey::Updated, "a resync must not reset the active sort key");
+        assert_eq!(
+            files_names(&state),
+            vec!["new.md", "old.md"],
+            "a resync's freshly rescanned FsTree must be re-sorted, not left in scan (path) order"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn spec_kit_mode_ignores_the_sort_hotkey() {
+        // Requirement 4.2: spec-kit has no sort concept, unaffected by this
+        // feature -- the key press is a harmless no-op.
+        let root = temp_files_root("spec_kit_noop");
+        let mut state = AppState::new(
+            TreeSource::SpecKit(vec![]),
+            root.clone(),
+            (120, 40),
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        );
+        let before = state.sort_key;
+
+        let control = key_action(&mut state, KeyCode::Char('s'));
+
+        assert_eq!(control, Control::Continue);
+        assert_eq!(state.sort_key, before);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -531,7 +531,14 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
                 start.display()
             ))
         } else {
-            let tree = spec_viewer::spec::FsTree::scan(start);
+            let mut tree = spec_viewer::spec::FsTree::scan(start);
+            // spec-viewer-files-mode-sort requirement 2.4: apply the
+            // current (normalized) sort key to the freshly scanned tree,
+            // mirroring the `Kiro` direction's own `sort_specs` call just
+            // above -- `state.sort_key` itself is left untouched so a
+            // round trip back to `Kiro` still sees whatever key was active
+            // there before.
+            tree.sort_entries(state.sort_key.for_files());
             Ok((spec_viewer::spec::TreeSource::Files(tree), start.to_path_buf()))
         };
 
@@ -754,6 +761,26 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
     }
 }
 
+/// spec-viewer-files-mode-sort requirement 1.4: apply `state`'s current
+/// sort key to a freshly built `TreeSource::Files` tree, if that's what
+/// `state.root` is (a no-op for `Kiro`/`SpecKit`) -- `--all` mode has no
+/// `Phase`/`Progress` concept (no `spec.json`/`tasks.md` in a plain
+/// markdown directory), so `SortKey::for_files` normalizes a `.kiro`-only
+/// value to `Name` first. `state.sort_key` itself is left exactly as
+/// `--sort` set it -- untouched, the same way switching modes never
+/// overwrites it (`handle_switch_mode`) -- only the *effective*,
+/// normalized key is ever applied to the tree or shown in the title
+/// (`ui::tree_panel::render_files`), so a `.kiro`-only value never breaks
+/// anything, it just always reads as `Name` here.
+///
+/// Extracted out of `main()` (this module's doc comment: `main()` itself is
+/// a thin, deliberately untested wrapper) purely for unit testability.
+fn apply_initial_files_sort(state: &mut spec_viewer::app::AppState) {
+    if let spec_viewer::spec::TreeSource::Files(tree) = &mut state.root {
+        tree.sort_entries(state.sort_key.for_files());
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -839,10 +866,10 @@ fn main() {
         tree_visible,
     );
     // `resolve_source` already sorted the built `SpecRoot` by this same key
-    // (`--all` mode has no sort concept and never reaches here with a
-    // non-Kiro source, per `sort_key`'s own doc comment) -- this just keeps
-    // `state.sort_key` in sync with it for the `s` hotkey / a later resync.
+    // -- this just keeps `state.sort_key` in sync with it for the `s`
+    // hotkey / a later resync.
     state.sort_key = args.sort.into();
+    apply_initial_files_sort(&mut state);
 
     if let Some(path) = &file_view_path {
         // The doc panel's own outer width for this state, not the raw
@@ -1276,6 +1303,105 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    // --- spec-viewer-files-mode-sort: apply_initial_files_sort ------------
+
+    #[test]
+    fn apply_initial_files_sort_normalizes_kiro_only_sort_key_to_name() {
+        let dir = scratch_dir("initial_sort_normalize");
+        fs::write(dir.join("b.md"), "x").unwrap();
+        fs::write(dir.join("a.md"), "x").unwrap();
+
+        let tree = spec_viewer::spec::FsTree::scan(&dir);
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(tree),
+            dir.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        // As if `--sort phase --all` were passed: a `.kiro`-only value that
+        // `--all` mode cannot act on.
+        state.sort_key = spec_viewer::spec::SortKey::Phase;
+
+        apply_initial_files_sort(&mut state);
+
+        let names: Vec<String> = match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => tree
+                .entries
+                .iter()
+                .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
+            _ => panic!("expected TreeSource::Files"),
+        };
+        assert_eq!(
+            names,
+            vec!["a.md", "b.md"],
+            "a .kiro-only sort key must fall back to Name order rather than leaving scan's default untouched-but-mislabeled or panicking"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_initial_files_sort_applies_a_valid_updated_key() {
+        let dir = scratch_dir("initial_sort_updated");
+        let now = std::time::SystemTime::now();
+        fs::write(dir.join("old.md"), "x").unwrap();
+        fs::File::open(dir.join("old.md"))
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(100))
+            .unwrap();
+        fs::write(dir.join("new.md"), "x").unwrap();
+        fs::File::open(dir.join("new.md"))
+            .unwrap()
+            .set_modified(now + std::time::Duration::from_secs(100))
+            .unwrap();
+
+        let tree = spec_viewer::spec::FsTree::scan(&dir);
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(tree),
+            dir.clone(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        state.sort_key = spec_viewer::spec::SortKey::Updated;
+
+        apply_initial_files_sort(&mut state);
+
+        let names: Vec<String> = match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => tree
+                .entries
+                .iter()
+                .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect(),
+            _ => panic!("expected TreeSource::Files"),
+        };
+        assert_eq!(names, vec!["new.md", "old.md"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_initial_files_sort_is_a_no_op_under_kiro_mode() {
+        let mut state = build_state_from(&fixtures_root(), (120, 40));
+        let before: Vec<String> = match &state.root {
+            spec_viewer::spec::TreeSource::Kiro(root) => root.specs.iter().map(|s| s.name.clone()).collect(),
+            _ => panic!("expected TreeSource::Kiro"),
+        };
+
+        state.sort_key = spec_viewer::spec::SortKey::Phase;
+        apply_initial_files_sort(&mut state);
+
+        let after: Vec<String> = match &state.root {
+            spec_viewer::spec::TreeSource::Kiro(root) => root.specs.iter().map(|s| s.name.clone()).collect(),
+            _ => panic!("expected TreeSource::Kiro"),
+        };
+        assert_eq!(after, before, "TreeSource::Kiro must be untouched by this Files-only helper");
+    }
+
     // --- task 3.1: resolve_spec_mode extracted priority logic (SSoT) -----
 
     #[test]
@@ -1547,10 +1673,14 @@ mod tests {
     }
 
     fn write_requirements_spec(root: &Path, name: &str, requirements: &str) {
+        write_requirements_spec_with_phase(root, name, "design", requirements);
+    }
+
+    fn write_requirements_spec_with_phase(root: &Path, name: &str, phase: &str, requirements: &str) {
         let dir = root.join("specs").join(name);
         fs::create_dir_all(&dir).unwrap();
         let spec_json = format!(
-            "{{\n  \"name\": \"{name}\",\n  \"created_at\": \"2026-01-01T00:00:00Z\",\n  \"updated_at\": \"2026-01-01T00:00:00Z\",\n  \"language\": \"ko\",\n  \"phase\": \"design\",\n  \"approvals\": {{\n    \"requirements\": {{ \"generated\": true, \"approved\": true }}\n  }}\n}}\n"
+            "{{\n  \"name\": \"{name}\",\n  \"created_at\": \"2026-01-01T00:00:00Z\",\n  \"updated_at\": \"2026-01-01T00:00:00Z\",\n  \"language\": \"ko\",\n  \"phase\": \"{phase}\",\n  \"approvals\": {{\n    \"requirements\": {{ \"generated\": true, \"approved\": true }}\n  }}\n}}\n"
         );
         fs::write(dir.join("spec.json"), spec_json).unwrap();
         fs::write(dir.join("requirements.md"), requirements).unwrap();
@@ -2476,6 +2606,132 @@ gamma trailing line
         assert!(matches!(watch, spec_viewer::watch::Watch::Live(_)));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn handle_switch_mode_to_files_applies_the_current_sort_key() {
+        // spec-viewer-files-mode-sort requirement 2.4: switching into full
+        // mode at runtime applies whatever sort key was active, mirroring
+        // the Kiro direction's own `sort_specs` call.
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("switch_kiro_to_files_sorted");
+        write_requirements_spec(&root, "demo", "# Doc\n");
+        // A separate, unrelated directory as the full-mode scan target --
+        // `handle_switch_mode`'s Files direction scans `start` itself, not
+        // `state.kiro_root`, so this stays decoupled from the `.kiro`-shaped
+        // fixture above (keeps the expected file list simple/flat).
+        let start = scratch_dir("switch_kiro_to_files_sorted_target");
+        fs::write(start.join("z-plain.md"), "# Z\n").unwrap();
+        fs::write(start.join("a-plain.md"), "# A\n").unwrap();
+
+        let mut state = build_state_from(&root, (120, 40));
+        state.sort_key = spec_viewer::spec::SortKey::Phase; // .kiro-only, must normalize to Name
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("handle_switch_mode should succeed");
+
+        match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => {
+                let names: Vec<String> = tree
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(
+                    names,
+                    vec!["a-plain.md", "z-plain.md"],
+                    "expected Name-normalized order applied to the newly-scanned Files tree"
+                );
+            }
+            _ => panic!("expected TreeSource::Files"),
+        }
+        // The raw preference is left untouched (round-trip-safe back to Kiro).
+        assert_eq!(state.sort_key, spec_viewer::spec::SortKey::Phase);
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn switching_kiro_to_files_and_back_preserves_the_original_phase_sort_order() {
+        // spec-viewer-files-mode-sort: a Kiro-mode sort key that Files mode
+        // has no equivalent for (Phase) must survive a full round trip
+        // (Kiro -> Files -> Kiro) both as `state.sort_key` itself (already
+        // covered by `handle_switch_mode_to_files_applies_the_current_sort_key`)
+        // and, more importantly, as the *resulting spec order* once back in
+        // Kiro mode -- not silently fall back to Name order.
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Unlike `temp_kiro_root`'s flat fixtures (used only where `start`
+        // is scanned as a plain directory, never through `find_root`), the
+        // Files -> Kiro leg below goes through the real
+        // `resolve_spec_mode`/`find_root` detection, which requires an
+        // actual `.kiro` subdirectory under `start`.
+        let project_dir = scratch_dir("switch_kiro_files_kiro_roundtrip");
+        let root = project_dir.join(".kiro");
+        fs::create_dir_all(root.join("specs")).unwrap();
+        // Name order (alphabetical) is [alpha, zeta]; phases are chosen so
+        // Phase order is the reverse: "design" < "tasks-approved".
+        write_requirements_spec_with_phase(&root, "alpha", "tasks-approved", "# Alpha\n");
+        write_requirements_spec_with_phase(&root, "zeta", "design", "# Zeta\n");
+        let start = project_dir.clone();
+
+        let mut state = build_state_from(&root, (120, 40));
+        state.sort_key = spec_viewer::spec::SortKey::Phase;
+        spec_viewer::spec::sort_specs(
+            match &mut state.root {
+                spec_viewer::spec::TreeSource::Kiro(spec_root) => &mut spec_root.specs,
+                _ => unreachable!(),
+            },
+            state.sort_key,
+        );
+        let expected_phase_order: Vec<String> = match &state.root {
+            spec_viewer::spec::TreeSource::Kiro(spec_root) => {
+                spec_root.specs.iter().map(|s| s.name.clone()).collect()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            expected_phase_order,
+            vec!["zeta", "alpha"],
+            "sanity check: Phase order must differ from Name order for this test to prove anything"
+        );
+
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        // Leg 1: Kiro -> Files.
+        handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("kiro -> files switch should succeed");
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
+        assert_eq!(state.sort_key, spec_viewer::spec::SortKey::Phase);
+
+        // Leg 2: Files -> Kiro.
+        handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("files -> kiro switch should succeed");
+
+        match &state.root {
+            spec_viewer::spec::TreeSource::Kiro(spec_root) => {
+                let names: Vec<String> = spec_root.specs.iter().map(|s| s.name.clone()).collect();
+                assert_eq!(
+                    names, expected_phase_order,
+                    "round trip through Files mode must not disturb the original Phase-sorted order"
+                );
+            }
+            _ => panic!("expected TreeSource::Kiro after round trip"),
+        }
+        assert_eq!(state.sort_key, spec_viewer::spec::SortKey::Phase);
+
+        fs::remove_dir_all(&project_dir).ok();
     }
 
     #[test]

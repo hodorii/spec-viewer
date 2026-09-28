@@ -49,6 +49,34 @@ impl SortKey {
             _ => None,
         }
     }
+
+    /// Normalize to a key `--all` mode can actually act on
+    /// (spec-viewer-files-mode-sort requirement 1.1, 1.4): `Phase`/
+    /// `Progress` have no meaning without `.kiro` spec metadata (no
+    /// `spec.json`/`tasks.md` in a plain markdown directory), so they fold
+    /// to `Name`; `Name`/`Updated` pass through unchanged. Used both to
+    /// decide what `--all` mode actually sorts by and what its panel title
+    /// displays, so the two can never show one key while applying another.
+    pub fn for_files(self) -> SortKey {
+        match self {
+            SortKey::Phase | SortKey::Progress => SortKey::Name,
+            other => other,
+        }
+    }
+
+    /// Advance through `--all` mode's 2-key cycle (`Name -> Updated ->
+    /// Name`, spec-viewer-files-mode-sort requirement 1.1) -- unlike
+    /// [`SortKey::cycle`]'s `.kiro`-only 4-key cycle. Always normalizes
+    /// through [`SortKey::for_files`] first, so pressing the cycle key
+    /// while some stale `.kiro`-only value is active (e.g. right after a
+    /// runtime mode switch) lands on a sensible member of the 2-key cycle
+    /// rather than silently no-op-ing.
+    pub fn cycle_for_files(self) -> SortKey {
+        match self.for_files() {
+            SortKey::Updated => SortKey::Name,
+            _ => SortKey::Updated,
+        }
+    }
 }
 
 /// A spec's overall completion ratio, from its `Tasks` doc's `Progress` (the
@@ -164,6 +192,28 @@ mod tests {
         assert_eq!(SortKey::Phase.cycle(), SortKey::Updated);
         assert_eq!(SortKey::Updated.cycle(), SortKey::Progress);
         assert_eq!(SortKey::Progress.cycle(), SortKey::Name);
+    }
+
+    // --- for_files / cycle_for_files (spec-viewer-files-mode-sort) --------
+
+    #[test]
+    fn for_files_folds_phase_and_progress_to_name_and_passes_the_rest_through() {
+        assert_eq!(SortKey::Phase.for_files(), SortKey::Name);
+        assert_eq!(SortKey::Progress.for_files(), SortKey::Name);
+        assert_eq!(SortKey::Name.for_files(), SortKey::Name);
+        assert_eq!(SortKey::Updated.for_files(), SortKey::Updated);
+    }
+
+    #[test]
+    fn cycle_for_files_only_toggles_between_name_and_updated() {
+        assert_eq!(SortKey::Name.cycle_for_files(), SortKey::Updated);
+        assert_eq!(SortKey::Updated.cycle_for_files(), SortKey::Name);
+        // A stale `.kiro`-only value (e.g. right after a runtime mode
+        // switch from Kiro to `--all`) normalizes through `for_files`
+        // first, landing on `Updated` -- the same as starting from `Name`
+        // -- rather than silently no-op-ing.
+        assert_eq!(SortKey::Phase.cycle_for_files(), SortKey::Updated);
+        assert_eq!(SortKey::Progress.cycle_for_files(), SortKey::Updated);
     }
 
     #[test]

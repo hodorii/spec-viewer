@@ -672,21 +672,29 @@ fn l2_all_mode_browses_a_plain_markdown_tree_with_fold_select_and_live_edits() {
         .draw(|f| spec_viewer::ui::render(f, &mut state))
         .expect("draw");
 
-    // First frame: both top-level entries visible, "Files" title (not
-    // "Specs"), and the folded "sub" folder's own child not yet visible.
+    // First frame: both top-level entries visible, "Files [<sort key>]"
+    // title (not "Specs"), and the folded "sub" folder's own child not yet
+    // visible.
     let rows = buffer_text(&terminal.backend().buffer().clone());
-    assert!(rows.iter().any(|r| r.contains("Files")), "expected the Files-mode tree title, got:\n{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Files [이름]")),
+        "expected the Files-mode tree title with its sort key (spec-viewer-files-mode-sort), got:\n{rows:?}"
+    );
     assert!(rows.iter().any(|r| r.contains("top.md")));
     assert!(rows.iter().any(|r| r.contains("sub")));
     assert!(
         !rows.iter().any(|r| r.contains("note.md")),
         "folder must start folded, got:\n{rows:?}"
     );
-    // Requirement 1.9: no spec `[phase]` badge anywhere -- `render_files`
-    // never builds the badge/status-symbol/`n/m` spans `render_kiro` does.
-    // (Not asserting against "●"/"○" here: `Tree`'s own scrollbar thumb
-    // legitimately renders "●" on the block border regardless of source.)
-    assert!(!rows.iter().any(|r| r.contains('[')));
+    // Requirement 1.9: no spec `[phase]`-style badge on any *node* row --
+    // `render_files` never builds the badge/status-symbol/`n/m` spans
+    // `render_kiro` does. The title row legitimately has its own
+    // `[<sort key>]` suffix now (spec-viewer-files-mode-sort requirement
+    // 3.1), so this only scans the node rows below it, not the title
+    // itself. (Not asserting against "●"/"○" here: `Tree`'s own scrollbar
+    // thumb legitimately renders "●" on the block border regardless of
+    // source.)
+    assert!(!rows.iter().skip(1).any(|r| r.contains('[')));
 
     // Fold -> unfold: select the folder, press Right to open it.
     state.tree.select(vec![NodeId::Dir(sub_dir.clone())]);
@@ -965,6 +973,86 @@ fn e2e_kiro_groups_are_discovered_recursive_and_steering_badge_is_exclusive() {
         Some(&NodeId::File(root.join("reference/overview.md"))),
         "expected the search to select reference/overview.md"
     );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+// --- task 3.2 (spec-viewer-files-mode-sort): real --all mode sort cycle —
+// requirements 1.1-1.3, 2.1, 2.2, 3.1 ----------------------------------------
+
+#[test]
+fn e2e_all_mode_sort_hotkey_cycles_name_and_updated_and_preserves_fold_and_selection() {
+    let root = std::env::temp_dir().join(format!("spec_viewer_app_flow_all_sort_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    let now = std::time::SystemTime::now();
+    fs::write(root.join("a.md"), "# A\n").unwrap();
+    std::fs::File::open(root.join("a.md"))
+        .unwrap()
+        .set_modified(now - std::time::Duration::from_secs(1000))
+        .unwrap();
+    fs::write(root.join("z.md"), "# Z\n").unwrap();
+    std::fs::File::open(root.join("z.md"))
+        .unwrap()
+        .set_modified(now + std::time::Duration::from_secs(1000))
+        .unwrap();
+    fs::write(root.join("sub/inner.md"), "# Inner\n").unwrap();
+
+    let tree = spec::FsTree::scan(&root);
+    let mut state = AppState::new(
+        TreeSource::Files(tree),
+        root.clone(),
+        (100, 30),
+        WatchStatus::Live,
+        spec_viewer::app::TreeMode::Auto,
+        true,
+    );
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
+
+    // Requirement 3.1 / default order (Name): a.md, sub, z.md.
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(rows.iter().any(|r| r.contains("Files [이름]")), "got:\n{rows:?}");
+    assert!(row_index(&rows, "a.md") < row_index(&rows, "sub"));
+    assert!(row_index(&rows, "sub") < row_index(&rows, "z.md"));
+
+    // Open "sub" and select "a.md" before cycling, to prove 2.1/2.2.
+    state.tree.open(vec![NodeId::Dir(root.join("sub"))]);
+    let selected = vec![NodeId::File(root.join("a.md"))];
+    state.tree.select(selected.clone());
+
+    // `s` -- real keypress -- Name -> Updated (requirement 1.1).
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('s'))));
+    assert_eq!(control, Control::Continue);
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(
+        rows.iter().any(|r| r.contains("Files [최근 갱신]")),
+        "expected the title to switch to the Updated label, got:\n{rows:?}"
+    );
+    // Requirement 1.3: most-recently-modified first among top-level
+    // siblings -- z.md (future mtime) before sub (~now) before a.md (past).
+    assert!(row_index(&rows, "z.md") < row_index(&rows, "sub"));
+    assert!(row_index(&rows, "sub") < row_index(&rows, "a.md"));
+    // Requirement 2.1: "sub" is still open and its child still nested right
+    // after it, unscrambled by the reorder.
+    assert!(rows.iter().any(|r| r.contains("inner.md")));
+    let sub_row = row_index(&rows, "sub");
+    let inner_row = row_index(&rows, "inner.md");
+    assert_eq!(inner_row, sub_row + 1, "inner.md must still be nested immediately after sub");
+    // Requirement 2.2: selection survived the reorder.
+    assert_eq!(state.tree.selected(), selected.as_slice());
+
+    // `s` again -- Updated -> Name (requirement 1.1), back to the original
+    // order and title.
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('s'))));
+    assert_eq!(control, Control::Continue);
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+    assert!(rows.iter().any(|r| r.contains("Files [이름]")));
+    assert!(row_index(&rows, "a.md") < row_index(&rows, "sub"));
+    assert!(row_index(&rows, "sub") < row_index(&rows, "z.md"));
+    assert_eq!(state.tree.selected(), selected.as_slice());
 
     fs::remove_dir_all(&root).ok();
 }

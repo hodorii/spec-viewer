@@ -47,7 +47,8 @@ between full mode and spec mode without restarting.
 
 Flags:
 - `--tree <auto|always|hidden|single>` — tree panel visibility mode (default `auto`)
-- `--sort <name|phase|updated|progress>` — initial spec-tree sort key
+- `--sort <name|phase|updated|progress>` — initial tree sort key (`--all` mode
+  normalizes `phase`/`progress` to `name`, since it has no spec.json/tasks.md)
 - `--no-watch` — disable filesystem watching
 - `--log <path>` — write a log file (rejected if it resolves inside the `.kiro` root)
 - `--diagram-engine <dg|mdview|builtin>` — mermaid graph renderer (see below)
@@ -57,7 +58,9 @@ Keys: `q` quit · `Tab` switch panel · `j`/`k` line scroll · `d`/`u` half-page
 `f`/`PageDown`, `b`/`PageUp` full page · `g`/`Home`, `G`/`End` top/bottom ·
 `[`/`]` prev/next heading · `/` search, `n`/`N` next/prev match · `t` table of
 contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/single) ·
-`s` cycle sort key · `e` edit the displayed file in an external editor (`--editor` >
+`s` cycle sort key (spec mode: name→phase→updated→progress; `--all` mode:
+name↔updated only; the tree panel title shows the active key) ·
+`e` edit the displayed file in an external editor (`--editor` >
 `$VISUAL` > `$EDITOR` > `vi`) · `m` toggle between full mode and spec mode at
 runtime (`--all` only sets which one you start in) · `o`/`c` expand/collapse
 every tree node at once (individual node fold/unfold via `Left`/`Right`/`Enter`

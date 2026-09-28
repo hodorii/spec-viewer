@@ -767,6 +767,34 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn load_snapshot_badge_exclusion_is_by_group_name_not_file_content() {
+        // Requirement 3.1/3.2: even when a non-"steering" group's file
+        // happens to carry `inclusion:` front matter, it must never be
+        // parsed into a badge -- exclusion is keyed by the group's folder
+        // name, not by whether the content looks like a steering doc.
+        let dir = scratch_dir("group_badge_name_not_content");
+        fs::create_dir_all(dir.join("reference")).unwrap();
+        fs::write(
+            dir.join("reference/overview.md"),
+            "---\ninclusion: manual\n---\n# Overview\n",
+        )
+        .unwrap();
+
+        let snapshot = load_snapshot(&dir);
+        let root = spec::build(&snapshot);
+
+        assert_eq!(root.groups.len(), 1);
+        let reference = &root.groups[0];
+        assert_eq!(reference.name(), "reference");
+        assert!(
+            reference.inclusion.is_empty(),
+            "expected no inclusion badge for a non-'steering' group even though its file has inclusion front matter"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     // --- file-info formatting (task 19.3) ------------------------------
 
     #[test]

@@ -63,7 +63,7 @@ pub fn render(
         TreeSource::Kiro(root) => render_kiro(frame, area, root, tree_state, sort_key, search_matches),
         TreeSource::SpecKit(features) => render_spec_kit(frame, area, features, tree_state, search_matches),
         TreeSource::Files(tree) => {
-            render_files(frame, area, tree, tree_state, search_matches, files_tree_cache)
+            render_files(frame, area, tree, tree_state, sort_key, search_matches, files_tree_cache)
         }
     }
 }
@@ -150,6 +150,7 @@ fn render_files(
     area: Rect,
     tree: &FsTree,
     tree_state: &mut TreeState<NodeId>,
+    sort_key: SortKey,
     search_matches: &[Vec<NodeId>],
     cache: &mut Option<FilesTreeItemCache>,
 ) {
@@ -164,9 +165,16 @@ fn render_files(
     }
     let items = &cache.as_ref().expect("just populated above if it was empty").2;
 
+    // spec-viewer-files-mode-sort requirement 3.1: same "Title [키]" format
+    // `render_kiro`'s own title already uses. `entries`' actual order was
+    // already decided elsewhere (`app::cycle_sort`/`resync`/startup) --
+    // this only ever displays the *effective* (`for_files()`-normalized)
+    // key, never a stale `.kiro`-only one, so the label can never say
+    // "단계"/"진행률" while `--all` mode is actually showing Name order.
+    let title = format!("Files [{}]", sort_key.for_files().label());
     let widget = Tree::new(items)
         .expect("paths are unique per level by construction")
-        .block(Block::bordered().title("Files"))
+        .block(Block::bordered().title(title))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
     frame.render_stateful_widget(widget, area, tree_state);
@@ -1093,6 +1101,7 @@ mod tests {
                 path: root.join(format!("f{i:06}.md")),
                 is_dir: false,
                 depth: 1,
+                modified: std::time::SystemTime::UNIX_EPOCH,
             })
             .collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1115,6 +1124,42 @@ mod tests {
             })
             .expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    /// spec-viewer-files-mode-sort requirement 3.1: the Files-mode panel
+    /// title shows the current (effective) sort key, in the same
+    /// `"Title [키]"` format `render_kiro`'s own title already uses -- and
+    /// a stale `.kiro`-only key (`Phase`/`Progress`) always displays as
+    /// `Name`'s label rather than something nonsensical for a plain
+    /// markdown tree.
+    #[test]
+    fn files_panel_title_shows_the_current_sort_key() {
+        let tree = flat_files_tree(1);
+        let source = TreeSource::Files(tree);
+        let mut tree_state: TreeState<NodeId> = TreeState::default();
+        let mut cache: Option<crate::app::FilesTreeItemCache> = None;
+
+        for (key, expected_label) in [
+            (SortKey::Name, "이름"),
+            (SortKey::Updated, "최근 갱신"),
+            (SortKey::Phase, "이름"),
+            (SortKey::Progress, "이름"),
+        ] {
+            let backend = TestBackend::new(100, 40);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render(frame, area, &source, &mut tree_state, key, &[], &mut cache);
+                })
+                .expect("draw");
+            let rows = buffer_text(terminal.backend().buffer());
+            let needle = strip_ws(&format!("Files[{expected_label}]"));
+            assert!(
+                rows.iter().any(|r| strip_ws(r).contains(&needle)),
+                "expected the Files title to show {key:?} as {expected_label:?}, got:\n{rows:?}"
+            );
+        }
     }
 
     /// 1.1/1.2 -> 2.1: a repeated render of an unchanged large `Files` tree

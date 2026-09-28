@@ -12,6 +12,9 @@
 //! boundaries.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use super::SortKey;
 
 /// One directory or markdown-file entry in an [`FsTree`], already filtered
 /// and pruned by [`FsTree::scan`].
@@ -22,6 +25,11 @@ pub struct FsEntry {
     /// Distance below `root` in path components (a direct child of `root`
     /// is depth 1), matching `ignore::WalkBuilder::max_depth`'s own units.
     pub depth: u8,
+    /// Filesystem modification time (spec-viewer-files-mode-sort
+    /// requirement 1.3), used by [`FsTree::sort_entries`]'s `Updated` key.
+    /// `SystemTime::UNIX_EPOCH` when the metadata read failed -- the oldest
+    /// possible value, so that entry sorts last under "most recent first".
+    pub modified: SystemTime,
 }
 
 /// A `--all`-mode directory tree: `root` plus every markdown file beneath
@@ -89,15 +97,23 @@ impl FsTree {
                 .unwrap_or(1)
         };
 
+        let modified_of = |path: &Path| -> SystemTime {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        };
+
         let mut entries: Vec<FsEntry> = kept_dirs
             .into_iter()
             .map(|path| {
                 let depth = depth_of(&path);
-                FsEntry { path, is_dir: true, depth }
+                let modified = modified_of(&path);
+                FsEntry { path, is_dir: true, depth, modified }
             })
             .chain(files.into_iter().map(|path| {
                 let depth = depth_of(&path);
-                FsEntry { path, is_dir: false, depth }
+                let modified = modified_of(&path);
+                FsEntry { path, is_dir: false, depth, modified }
             }))
             .collect();
 
@@ -105,6 +121,92 @@ impl FsTree {
 
         FsTree { root: root.to_path_buf(), entries }
     }
+
+    /// Re-order `entries`' siblings at every nesting level by `key`
+    /// (`SortKey::for_files`-normalized: only `Name`/`Updated` are
+    /// meaningful here) without changing which entry is nested under which
+    /// (spec-viewer-files-mode-sort requirements 1.1-1.3, 2.1). Rebuilds a
+    /// temporary parent/child tree from the flat depth-tagged list (the
+    /// same reconstruction `ui::tree_panel::build_files_items` and
+    /// `app::search::flatten_files` already do), sorts each level's
+    /// children in place, then flattens back in depth-first (pre-order)
+    /// sequence -- preserving the "a directory's whole subtree arrives
+    /// contiguously right after it" invariant those two functions rely on.
+    pub fn sort_entries(&mut self, key: SortKey) {
+        let mut roots = Self::nest(&self.entries);
+        Self::sort_nodes(&mut roots, key.for_files());
+        let mut flat = Vec::with_capacity(self.entries.len());
+        Self::flatten(&roots, &mut flat);
+        self.entries = flat;
+    }
+
+    fn nest(entries: &[FsEntry]) -> Vec<FsTreeNode> {
+        // One stack frame per still-open ancestor directory; closing a
+        // frame appends its finished node to whichever frame is now on top
+        // (or to `roots` if none is).
+        let mut roots: Vec<FsTreeNode> = Vec::new();
+        let mut stack: Vec<(FsEntry, Vec<FsTreeNode>)> = Vec::new();
+
+        fn place(
+            stack: &mut [(FsEntry, Vec<FsTreeNode>)],
+            roots: &mut Vec<FsTreeNode>,
+            node: FsTreeNode,
+        ) {
+            match stack.last_mut() {
+                Some((_, children)) => children.push(node),
+                None => roots.push(node),
+            }
+        }
+
+        for entry in entries.iter().cloned() {
+            while stack.last().is_some_and(|(frame, _)| frame.depth >= entry.depth) {
+                let (frame_entry, children) = stack.pop().unwrap();
+                let node = FsTreeNode { entry: frame_entry, children };
+                place(&mut stack, &mut roots, node);
+            }
+            if entry.is_dir {
+                stack.push((entry, Vec::new()));
+            } else {
+                place(&mut stack, &mut roots, FsTreeNode { entry, children: Vec::new() });
+            }
+        }
+        while let Some((frame_entry, children)) = stack.pop() {
+            let node = FsTreeNode { entry: frame_entry, children };
+            place(&mut stack, &mut roots, node);
+        }
+
+        roots
+    }
+
+    fn sort_nodes(nodes: &mut [FsTreeNode], key: SortKey) {
+        match key {
+            SortKey::Updated => nodes.sort_by(|a, b| {
+                b.entry.modified.cmp(&a.entry.modified).then_with(|| a.entry.path.cmp(&b.entry.path))
+            }),
+            // `Name` (and anything else -- `for_files` already normalized
+            // the caller's key before this is reached).
+            _ => nodes.sort_by(|a, b| a.entry.path.cmp(&b.entry.path)),
+        }
+        for node in nodes.iter_mut() {
+            Self::sort_nodes(&mut node.children, key);
+        }
+    }
+
+    fn flatten(nodes: &[FsTreeNode], out: &mut Vec<FsEntry>) {
+        for node in nodes {
+            out.push(node.entry.clone());
+            Self::flatten(&node.children, out);
+        }
+    }
+}
+
+/// Temporary parent/child reconstruction used only by
+/// [`FsTree::sort_entries`] -- never stored in [`FsTree`] itself, which
+/// keeps the flat depth-tagged `entries` representation `tree_panel`/
+/// `search` already know how to walk.
+struct FsTreeNode {
+    entry: FsEntry,
+    children: Vec<FsTreeNode>,
 }
 
 #[cfg(test)]
@@ -262,6 +364,96 @@ mod tests {
         // "alpha" itself, not scattered.
         assert_eq!(names, vec!["alpha", "alpha/one.md", "beta.md", "zeta.md"]);
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- sort_entries (spec-viewer-files-mode-sort) -----------------------
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        let file = fs::File::open(path).expect("open for set_modified");
+        file.set_modified(time).expect("set_modified");
+    }
+
+    #[test]
+    fn sort_entries_by_name_matches_scans_own_default_order() {
+        // `Name` is what `scan` already produces by default -- re-sorting by
+        // it must be a no-op on the order.
+        let root = scratch_dir("sort_entries_name");
+        fs::create_dir_all(root.join("alpha")).unwrap();
+        fs::write(root.join("alpha/one.md"), "x").unwrap();
+        fs::write(root.join("zeta.md"), "x").unwrap();
+        fs::write(root.join("beta.md"), "x").unwrap();
+
+        let mut tree = FsTree::scan(&root);
+        let before = tree.entries.clone();
+        tree.sort_entries(SortKey::Name);
+
+        assert_eq!(tree.entries, before);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sort_entries_by_updated_orders_siblings_most_recent_first_and_keeps_nesting() {
+        // Requirements 1.3, 2.1: siblings (files and a directory, judged by
+        // its own mtime) reorder by modification time, most recent first --
+        // and the directory's own subtree still arrives immediately after
+        // it, unscrambled.
+        let root = scratch_dir("sort_entries_updated");
+        let now = std::time::SystemTime::now();
+        fs::write(root.join("old.md"), "x").unwrap();
+        set_mtime(&root.join("old.md"), now - std::time::Duration::from_secs(100));
+        fs::write(root.join("new.md"), "x").unwrap();
+        set_mtime(&root.join("new.md"), now + std::time::Duration::from_secs(100));
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/child.md"), "x").unwrap();
+
+        let mut tree = FsTree::scan(&root);
+        tree.sort_entries(SortKey::Updated);
+
+        let names: Vec<String> = tree
+            .entries
+            .iter()
+            .map(|e| e.path.strip_prefix(&root).unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["new.md", "sub", "sub/child.md", "old.md"],
+            "expected most-recently-modified-first siblings with sub/child.md still nested right after sub"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sort_entries_normalizes_kiro_only_keys_to_name() {
+        // `Phase`/`Progress` have no meaning for a plain markdown tree --
+        // `sort_entries` must treat them the same as `Name` rather than
+        // panicking or doing something undefined.
+        let root = scratch_dir("sort_entries_normalize");
+        fs::write(root.join("b.md"), "x").unwrap();
+        fs::write(root.join("a.md"), "x").unwrap();
+
+        let mut tree = FsTree::scan(&root);
+        tree.sort_entries(SortKey::Phase);
+
+        let names: Vec<String> = tree
+            .entries
+            .iter()
+            .map(|e| e.path.strip_prefix(&root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.md", "b.md"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sort_entries_on_an_empty_tree_does_not_panic() {
+        let root = scratch_dir("sort_entries_empty");
+        let mut tree = FsTree::scan(&root);
+        tree.sort_entries(SortKey::Updated);
+        assert!(tree.entries.is_empty());
         fs::remove_dir_all(&root).ok();
     }
 }

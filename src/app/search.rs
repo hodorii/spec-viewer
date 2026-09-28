@@ -109,7 +109,7 @@ pub(super) fn flatten_tree(root: &TreeSource) -> Vec<TreeRow> {
     match root {
         TreeSource::Kiro(root) => flatten_kiro(root),
         TreeSource::SpecKit(features) => flatten_spec_kit(features),
-        TreeSource::Files(tree) => flatten_files(tree),
+        TreeSource::Files(tree) => flatten_files(tree, &[]),
     }
 }
 
@@ -131,15 +131,24 @@ fn flatten_kiro(root: &SpecRoot) -> Vec<TreeRow> {
         }
     }
 
-    // Steering group placed last, matching `tree_panel::render_kiro`.
-    let steering_path = vec![NodeId::SteeringGroup];
-    rows.push((steering_path.clone(), "Steering".to_string()));
-    for doc in &root.steering {
-        let mut path = steering_path.clone();
-        path.push(NodeId::Steering(doc.name.clone()));
-        rows.push((path, doc.name.clone()));
+    // Groups placed last, matching `tree_panel::render_kiro`'s ordering
+    // (spec-viewer-kiro-folder-groups) -- `steering` is just whichever
+    // group happens to be named that, not a dedicated node kind anymore.
+    for group in &root.groups {
+        rows.extend(flatten_kiro_group(group));
     }
 
+    rows
+}
+
+/// One `.kiro` group's rows: its own root `Dir` node first, then everything
+/// inside it via [`flatten_files`], with that root prepended to every row's
+/// path so the full ancestor chain matches what `ui::tree_panel` actually
+/// nests the `TreeItem`s under.
+fn flatten_kiro_group(group: &crate::spec::KiroGroup) -> Vec<TreeRow> {
+    let root_id = NodeId::Dir(group.tree.root.clone());
+    let mut rows = vec![(vec![root_id.clone()], group.name().to_string())];
+    rows.extend(flatten_files(&group.tree, std::slice::from_ref(&root_id)));
     rows
 }
 
@@ -165,7 +174,13 @@ fn flatten_spec_kit(features: &[Spec]) -> Vec<TreeRow> {
 /// Mirrors `ui::tree_panel::build_files_items`'s reconstruction of nested
 /// paths from `FsTree`'s flat, depth-tagged, path-sorted entries, but only
 /// needs each entry's own `(path, name)` — no actual `TreeItem` tree.
-fn flatten_files(tree: &FsTree) -> Vec<TreeRow> {
+///
+/// `prefix` (spec-viewer-kiro-folder-groups) is prepended to every returned
+/// row's path -- the ancestor chain above `tree`'s own root when it is
+/// nested inside a larger tree (a `.kiro` group), so paths line up with
+/// what `ui::tree_panel` actually builds. `--all` mode (a `FsTree` that
+/// *is* the whole tree) passes `&[]`, leaving every path exactly as before.
+fn flatten_files(tree: &FsTree, prefix: &[NodeId]) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     let mut ancestors: Vec<NodeId> = Vec::new();
     let mut depths: Vec<u8> = Vec::new();
@@ -177,7 +192,8 @@ fn flatten_files(tree: &FsTree) -> Vec<TreeRow> {
         }
 
         let id = entry_node_id(entry);
-        let mut path = ancestors.clone();
+        let mut path = prefix.to_vec();
+        path.extend(ancestors.iter().cloned());
         path.push(id.clone());
         rows.push((path, file_name(&entry.path)));
 
@@ -525,18 +541,15 @@ mod tests {
     #[test]
     fn tree_search_matches_steering_doc_names_and_expands_the_group() {
         let mut state = test_state();
+        let steering_root = fixtures_root().join("steering");
+        let steering_group = NodeId::Dir(steering_root.clone());
+        let product_md = NodeId::File(steering_root.join("product.md"));
 
         tree_search(&mut state, "product");
 
-        assert_eq!(
-            state.tree_matches,
-            vec![vec![NodeId::SteeringGroup, NodeId::Steering("product.md".to_string())]]
-        );
-        assert!(state.tree.opened().contains(&vec![NodeId::SteeringGroup]));
-        assert_eq!(
-            state.tree.selected(),
-            [NodeId::SteeringGroup, NodeId::Steering("product.md".to_string())]
-        );
+        assert_eq!(state.tree_matches, vec![vec![steering_group.clone(), product_md.clone()]]);
+        assert!(state.tree.opened().contains(&vec![steering_group.clone()]));
+        assert_eq!(state.tree.selected(), [steering_group, product_md]);
     }
 
     #[test]

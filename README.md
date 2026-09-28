@@ -11,6 +11,13 @@ same progress-badge model — an `n/total` count of completed milestones
 (`.kiro`'s approval gates, or spec-kit's `spec.md`/`plan.md`/`tasks.md`
 presence).
 
+In `.kiro` mode, any subfolder besides `specs/` that contains markdown
+anywhere inside it (`steering/`, or your own `reference/`, `guide/`, ...) is
+picked up automatically and shown as its own recursively browsable tree node
+— no configuration needed. `steering/` keeps its `[always]`/`manual`/
+`fileMatch`/`auto` inclusion badge; every other folder is just a plain
+document tree.
+
 Built for the [Kiro-style spec-driven development](https://github.com/hodorii/agentic-psdd)
 workflow, but the `--all` mode drops the `.kiro`/spec-kit requirement
 entirely and browses any directory of markdown files, so it also works as a

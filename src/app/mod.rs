@@ -555,18 +555,18 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
     }
 }
 
-/// Requirement 2.1/2.2: open every folder-like node (`Spec`, `SteeringGroup`,
-/// `Dir` -- the only `NodeId` variants that can have children; `Doc`/
-/// `Steering`/`File` are leaves and opening them is meaningless) so every
-/// document becomes reachable without manually expanding each ancestor.
-/// Reuses `search::flatten_tree`'s own traversal (SSoT for "every node in
-/// this tree, in path order") rather than re-walking `state.root` itself.
+/// Requirement 2.1/2.2: open every folder-like node (`Spec`, `Dir` -- the
+/// only `NodeId` variants that can have children; `Doc`/`File` are leaves
+/// and opening them is meaningless) so every document becomes reachable
+/// without manually expanding each ancestor. `Dir` covers both `--all`
+/// mode's own folders and every `.kiro` group's root/subfolders
+/// (spec-viewer-kiro-folder-groups) -- there is no separate "group root"
+/// node kind to special-case. Reuses `search::flatten_tree`'s own traversal
+/// (SSoT for "every node in this tree, in path order") rather than
+/// re-walking `state.root` itself.
 fn expand_all(state: &mut AppState) {
     for (path, _label) in search::flatten_tree(&state.root) {
-        if matches!(
-            path.last(),
-            Some(NodeId::Spec(_)) | Some(NodeId::SteeringGroup) | Some(NodeId::Dir(_))
-        ) {
+        if matches!(path.last(), Some(NodeId::Spec(_)) | Some(NodeId::Dir(_))) {
             state.tree.open(path);
         }
     }
@@ -748,8 +748,8 @@ fn copy_selection(state: &mut AppState) {
 /// tree-row math is not reimplemented here), select it and load it into
 /// the doc panel exactly like the `Enter` key does (design.md's mouse
 /// pseudocode: "트리 행이면 선택·문서 로드"), and additionally toggle it
-/// open/closed when it is a folder node (`Spec`/`SteeringGroup` -- the only
-/// two `NodeId` variants with children) -- design.md: "폴더/▶▼ 이면 토글".
+/// open/closed when it is a folder node (`Spec`/`Dir` -- the only `NodeId`
+/// variants with children) -- design.md: "폴더/▶▼ 이면 토글".
 /// A coordinate outside every rendered row (`None`) is a no-op.
 fn handle_tree_click(state: &mut AppState, x: u16, y: u16) {
     let Some(path) = mouse::tree_identifier_at(&state.tree, x, y).map(<[NodeId]>::to_vec) else {
@@ -757,10 +757,7 @@ fn handle_tree_click(state: &mut AppState, x: u16, y: u16) {
     };
     state.tree.select(path.clone());
     load_selected_doc(state);
-    if matches!(
-        path.last(),
-        Some(NodeId::Spec(_)) | Some(NodeId::SteeringGroup) | Some(NodeId::Dir(_))
-    ) {
+    if matches!(path.last(), Some(NodeId::Spec(_)) | Some(NodeId::Dir(_))) {
         state.tree.toggle(path);
     }
 }
@@ -1234,9 +1231,9 @@ fn load_selected_doc(state: &mut AppState) {
     search::clear_search(state);
 
     // Requirement 1.10 "문서 선택 -> 문서 전체 폭": only when something
-    // actually loaded -- selecting a folder-like node (`SteeringGroup`/
-    // `Dir`, resolved to `DocView::Empty`) has nothing to show, so Single
-    // mode stays on the tree rather than switching to a blank doc panel.
+    // actually loaded -- selecting a folder-like node (`Dir`, resolved to
+    // `DocView::Empty`) has nothing to show, so Single mode stays on the
+    // tree rather than switching to a blank doc panel.
     if state.tree_mode == TreeMode::Single {
         state.doc_focus = !matches!(state.doc, DocView::Empty);
         if state.doc_focus {
@@ -1262,10 +1259,13 @@ fn load_selected_doc(state: &mut AppState) {
 /// Resolve a tree-selection path (as returned by `TreeState::selected`) to
 /// the `DocView` it should load (requirements 2.2, 2.6, 1.9). Generic over
 /// `NodeId::Doc`'s position in `spec.docs` via `loader::load_for_selection`'s
-/// own `.find()` — no hardcoded slot ordering here. `Dir`/`File` only ever
-/// occur with `TreeSource::Files` and vice versa (each source only ever
-/// produces its own `NodeId` kinds) — a mismatched combination can't
-/// happen in practice, but still resolves to `Empty` rather than panic.
+/// own `.find()` — no hardcoded slot ordering here. `NodeId::File` now
+/// occurs under both `TreeSource::Files` (`--all` mode) and
+/// `TreeSource::Kiro` (a `.kiro` group's file, spec-viewer-kiro-folder-groups)
+/// — both load the exact same way, straight from the path, regardless of
+/// source. `NodeId::File` under `TreeSource::SpecKit` still can't happen in
+/// practice (spec-kit has no group concept) but still resolves to `Empty`
+/// rather than panic.
 fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView {
     match (root, path.last()) {
         (_, None) => DocView::Empty,
@@ -1281,15 +1281,12 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
                 None => DocView::Empty,
             }
         }
-        (TreeSource::Kiro(root), Some(NodeId::Steering(name))) => {
-            match root.steering.iter().find(|s| &s.name == name) {
-                Some(doc) => loader::load_doc(&doc.path, width),
-                None => DocView::Empty,
-            }
-        }
         // Requirement 1.9: a folder has no "정의" concept -- nothing to show.
-        (_, Some(NodeId::SteeringGroup)) | (_, Some(NodeId::Dir(_))) => DocView::Empty,
-        (TreeSource::Files(_), Some(NodeId::File(path))) => loader::load_doc(path, width),
+        // Covers both `--all` mode's own folders and every `.kiro` group's
+        // root/subfolders (there is no separate "group root" node kind).
+        (_, Some(NodeId::Dir(_))) => DocView::Empty,
+        (TreeSource::Files(_), Some(NodeId::File(path)))
+        | (TreeSource::Kiro(_), Some(NodeId::File(path))) => loader::load_doc(path, width),
         // spec-kit reuses the same `NodeId::Spec`/`NodeId::Doc` kinds as
         // `.kiro` (task 3.2), and `Spec`/`DocEntry` are the shared domain
         // types, so this mirrors the `TreeSource::Kiro` arms above exactly,
@@ -1306,13 +1303,11 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
                 None => DocView::Empty,
             }
         }
-        // Mismatched (source, NodeId kind) combos that can't happen in
-        // practice -- each source only ever produces its own NodeId kinds --
-        // resolve to Empty rather than panic.
-        (TreeSource::Files(_), Some(_))
-        | (TreeSource::Kiro(_), Some(NodeId::File(_)))
-        | (TreeSource::SpecKit(_), Some(NodeId::Steering(_)))
-        | (TreeSource::SpecKit(_), Some(NodeId::File(_))) => DocView::Empty,
+        // Mismatched (source, NodeId kind) combo that can't happen in
+        // practice -- resolves to Empty rather than panic.
+        (TreeSource::Files(_), Some(_)) | (TreeSource::SpecKit(_), Some(NodeId::File(_))) => {
+            DocView::Empty
+        }
     }
 }
 
@@ -1745,12 +1740,13 @@ mod reducer_tests {
 
     #[test]
     fn single_mode_selecting_an_empty_node_does_not_switch_to_doc() {
-        // Requirement 1.9: a folder node (SteeringGroup) resolves to
-        // DocView::Empty -- Single mode has nothing to show, so it must
-        // stay on the tree rather than flipping to a blank doc panel.
+        // Requirement 1.9: a folder node (a `.kiro` group's root `Dir`)
+        // resolves to DocView::Empty -- Single mode has nothing to show, so
+        // it must stay on the tree rather than flipping to a blank doc
+        // panel.
         let mut state = build_state_from(&fixtures_root(), (120, 40));
         update(&mut state, Action::SetTreeMode(TreeMode::Single));
-        state.tree.select(vec![NodeId::SteeringGroup]);
+        state.tree.select(vec![NodeId::Dir(fixtures_root().join("steering"))]);
         key_action(&mut state, KeyCode::Enter);
 
         assert!(!state.doc_focus);
@@ -1805,11 +1801,11 @@ mod reducer_tests {
 
     #[test]
     fn narrow_auto_mode_selecting_an_empty_node_does_not_switch_focus() {
-        // Requirement 1.9: a folder node (SteeringGroup) resolves to
-        // DocView::Empty -- nothing to show, so focus must stay on the tree
-        // rather than flipping to a blank doc panel.
+        // Requirement 1.9: a folder node (a `.kiro` group's root `Dir`)
+        // resolves to DocView::Empty -- nothing to show, so focus must stay
+        // on the tree rather than flipping to a blank doc panel.
         let mut state = build_state_from(&fixtures_root(), (40, 40));
-        state.tree.select(vec![NodeId::SteeringGroup]);
+        state.tree.select(vec![NodeId::Dir(fixtures_root().join("steering"))]);
         key_action(&mut state, KeyCode::Enter);
 
         assert_eq!(state.focus, Panel::Tree);
@@ -3607,8 +3603,9 @@ mod reducer_tests {
     }
 
     /// Every `NodeId` variant that can hold children under `TreeSource::Kiro`
-    /// (`Spec`, `SteeringGroup`) must end up open; leaf nodes (`Doc`,
-    /// `Steering`) are irrelevant to "expand all" and are not asserted on.
+    /// (`Spec`, and every `.kiro` group's root `Dir`) must end up open; leaf
+    /// nodes (`Doc`, `File`) are irrelevant to "expand all" and are not
+    /// asserted on.
     #[test]
     fn expand_all_opens_every_folder_node_and_preserves_selection() {
         let mut state = test_state();
@@ -3625,7 +3622,7 @@ mod reducer_tests {
                 "expected Spec({name}) to be open after ExpandAll"
             );
         }
-        assert!(state.tree.opened().contains(&vec![NodeId::SteeringGroup]));
+        assert!(state.tree.opened().contains(&vec![NodeId::Dir(fixtures_root().join("steering"))]));
         assert_eq!(state.tree.selected(), selected.as_slice());
     }
 

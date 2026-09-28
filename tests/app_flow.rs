@@ -859,3 +859,112 @@ fn e2e_expand_all_and_collapse_all_on_an_empty_files_tree_do_not_panic_or_change
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// --- task 3.2 (spec-viewer-kiro-folder-groups): real .kiro tree with
+// steering + an arbitrary "reference" group, both with nested subfolders —
+// requirements 1.1-1.3, 1.5, 1.6, 2.1-2.4, 3.1, 3.2, 4.1, 4.2, 4.4 ---------
+
+/// A real `.kiro`-shaped scratch tree: one spec, a `steering/` folder with a
+/// direct file (`inclusion: manual` front matter) and a nested one, and an
+/// arbitrary `reference/` folder (no special meaning to spec-viewer) with a
+/// direct file and a nested one -- proving group auto-discovery, recursion,
+/// and the steering-only badge all at once.
+fn kiro_tree_with_groups(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("spec_viewer_app_flow_{name}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_requirements_spec(&dir, "demo-spec", "# Requirements\n");
+
+    fs::create_dir_all(dir.join("steering/sub")).unwrap();
+    fs::write(
+        dir.join("steering/product.md"),
+        "---\ninclusion: manual\n---\n# Product\n",
+    )
+    .unwrap();
+    fs::write(dir.join("steering/sub/nested.md"), "# Nested Steering Doc\n").unwrap();
+
+    fs::create_dir_all(dir.join("reference/api")).unwrap();
+    fs::write(dir.join("reference/overview.md"), "# Overview\n\nREFERENCE_OVERVIEW_MARKER\n").unwrap();
+    fs::write(dir.join("reference/api/endpoints.md"), "# Endpoints\n").unwrap();
+
+    dir
+}
+
+#[test]
+fn e2e_kiro_groups_are_discovered_recursive_and_steering_badge_is_exclusive() {
+    let root = kiro_tree_with_groups("kiro_groups");
+    let mut state = build_state_from(&root, (150, 40));
+
+    let backend = TestBackend::new(150, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+
+    // Requirement 1.1/1.3: both groups show up as their own top-level nodes,
+    // in folder-name order (1.5: reference < steering), alongside the spec.
+    assert!(rows.iter().any(|r| r.contains("demo-spec")), "expected the spec node, got:\n{rows:?}");
+    let reference_row = row_index(&rows, "reference");
+    let steering_row = row_index(&rows, "steering");
+    assert!(reference_row < steering_row, "expected 'reference' before 'steering' (alphabetical, 1.5)");
+    // Nothing is expanded yet.
+    assert!(!rows.iter().any(|r| r.contains("product.md")));
+    assert!(!rows.iter().any(|r| r.contains("overview.md")));
+
+    // `o` -- real keypress, expand-all -- must reveal every group's nested
+    // subfolders too (requirements 2.1, 2.2, 2.3: steering recurses exactly
+    // like any other group), and the individual-node behavior stays
+    // untouched (2.4 is exercised by the pre-existing expand/collapse
+    // tests above, not re-tested here).
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('o'))));
+    assert_eq!(control, Control::Continue);
+    let rows = buffer_text(&terminal.backend().buffer().clone());
+
+    // Requirement 3.1: only the "steering"-named group's files carry the
+    // inclusion badge.
+    assert!(
+        rows.iter().any(|r| r.contains("product.md [manual]")),
+        "expected steering's direct file to carry its inclusion badge, got:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("nested.md [always]")),
+        "expected steering's nested file to also carry a badge (default 'always'), got:\n{rows:?}"
+    );
+    // Requirement 3.2: the "reference" group's files never get a badge.
+    assert!(rows.iter().any(|r| r.contains("overview.md")));
+    assert!(!rows.iter().any(|r| r.contains("overview.md [")));
+    assert!(rows.iter().any(|r| r.contains("endpoints.md")));
+    assert!(!rows.iter().any(|r| r.contains("endpoints.md [")));
+
+    // Requirement 4.1: selecting a nested group file loads its real content.
+    // `endpoints.md`'s row is the tree's file entry -- select it directly by
+    // path via a real Enter press after moving the tree selection there.
+    let endpoints_path = root.join("reference/api/endpoints.md");
+    state.tree.select(vec![
+        NodeId::Dir(root.join("reference")),
+        NodeId::Dir(root.join("reference/api")),
+        NodeId::File(endpoints_path.clone()),
+    ]);
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)));
+    assert_eq!(control, Control::Continue);
+    match &state.doc {
+        DocView::Rendered { path, .. } => assert_eq!(path, &endpoints_path),
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+
+    // Requirement 4.2: name-searching for a group's nested file finds it and
+    // expands/selects it -- same mechanism specs already use.
+    state.tree.select(vec![]);
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('/'))));
+    assert_eq!(control, Control::Continue);
+    for c in "overview".chars() {
+        step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char(c))));
+    }
+    let control = step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)));
+    assert_eq!(control, Control::Continue);
+    assert_eq!(
+        state.tree.selected().last(),
+        Some(&NodeId::File(root.join("reference/overview.md"))),
+        "expected the search to select reference/overview.md"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

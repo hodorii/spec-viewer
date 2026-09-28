@@ -3478,4 +3478,103 @@ gamma trailing line
 
         fs::remove_dir_all(&root).ok();
     }
+
+    // --- task 4.1 (spec-viewer-kiro-folder-groups): edit + watch
+    // integration real confirmation -- requirements 4.3, 4.5 --------------
+
+    #[test]
+    fn kiro_group_file_edit_reloads_through_the_real_editor_pipeline() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("group_edit");
+        fs::create_dir_all(root.join("reference")).unwrap();
+        let target = root.join("reference/overview.md");
+        fs::write(&target, "# Overview\n\nORIGINAL_CONTENT\n").unwrap();
+
+        let mut state = build_state_from(&root, (120, 40));
+        state.tree.select(vec![
+            spec_viewer::spec::NodeId::Dir(root.join("reference")),
+            spec_viewer::spec::NodeId::File(target.clone()),
+        ]);
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+        assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live);
+
+        let script = write_fake_editor(
+            "group_edit",
+            "#!/bin/sh\ncat > \"$1\" <<'EOF'\n# Overview\n\nEDITED_CONTENT\nEOF\nexit 0\n",
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let control = handle_edit_file(
+            &mut terminal,
+            &mut state,
+            target.clone(),
+            Some(script.to_str().unwrap()),
+            true,
+        )
+        .expect("handle_edit_file should succeed");
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        match &state.doc {
+            DocView::Rendered { r, .. } => {
+                assert!(
+                    r.plain.iter().any(|l| l.contains("EDITED_CONTENT")),
+                    "expected the doc panel to reload the editor's write, got: {:?}",
+                    r.plain
+                );
+            }
+            other => panic!("expected Rendered doc, got {other:?}"),
+        }
+
+        fs::remove_dir_all(script.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kiro_group_file_change_on_disk_is_picked_up_by_the_real_watcher() {
+        let root = temp_kiro_root("group_watch");
+        fs::create_dir_all(root.join("reference")).unwrap();
+        let target = root.join("reference/overview.md");
+        fs::write(&target, "# Overview\n\nORIGINAL_CONTENT\n").unwrap();
+
+        let mut state = build_state_from(&root, (120, 40));
+        state.tree.select(vec![
+            spec_viewer::spec::NodeId::Dir(root.join("reference")),
+            spec_viewer::spec::NodeId::File(target.clone()),
+        ]);
+        let width = spec_viewer::app::doc_panel_width(&state);
+        state.doc = spec_viewer::app::loader::load_doc(&target, width);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = spec_viewer::watch::start(&root, tx);
+        assert!(
+            matches!(watch, spec_viewer::watch::Watch::Live(_)),
+            "expected a live watcher on a real temp dir"
+        );
+
+        fs::write(&target, "# Overview\n\nUPDATED_CONTENT\n").expect("edit on disk");
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("expected a real filesystem event for the edited group file");
+
+        let control = spec_viewer::app::update(&mut state, spec_viewer::app::Action::Fs(event));
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+
+        match &state.doc {
+            DocView::Rendered { r, .. } => {
+                assert!(
+                    r.plain.iter().any(|l| l.contains("UPDATED_CONTENT")),
+                    "expected the doc panel to auto-refresh from the real watch event, got: {:?}",
+                    r.plain
+                );
+            }
+            other => panic!("expected Rendered doc, got {other:?}"),
+        }
+
+        drop(watch);
+        fs::remove_dir_all(&root).ok();
+    }
 }

@@ -15,10 +15,12 @@ use ratatui::widgets::Block;
 use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
+use std::path::{Path, PathBuf};
+
 use crate::app::FilesTreeItemCache;
 use crate::spec::{
-    DocEntry, DocKind, DocStatus, FsEntry, FsTree, Inclusion, Milestone, NodeId, SortKey, Spec,
-    SpecRoot, SteeringDoc, TreeSource,
+    DocEntry, DocKind, DocStatus, FsEntry, FsTree, Inclusion, KiroGroup, Milestone, NodeId,
+    SortKey, Spec, SpecRoot, TreeSource,
 };
 
 /// Style patched onto a search-matched node's label (requirement 2.10;
@@ -84,10 +86,14 @@ fn render_kiro(
         .iter()
         .map(|spec| spec_item(spec, search_matches))
         .collect();
-    // Steering group placed last, after every spec node (requirement 2.5
-    // only requires it be a group separate from the specs — it does not
-    // mandate a position — so "last" is a simple, stable choice).
-    items.push(steering_group_item(&root.steering, search_matches));
+    // Groups placed last, after every spec node, in the order
+    // `app::loader::load_snapshot` already sorted them into (requirement
+    // 2.5 only requires each be a group separate from the specs -- it does
+    // not mandate a position -- so "last" is a simple, stable choice;
+    // spec-viewer-kiro-folder-groups requirement 1.5 owns the ordering
+    // itself). `steering` is just whichever group happens to be named
+    // that -- no dedicated position or node kind.
+    items.extend(root.groups.iter().map(|group| kiro_group_item(group, search_matches)));
 
     let title = format!("Specs [{}]", sort_key.label());
     let tree = Tree::new(&items)
@@ -100,10 +106,10 @@ fn render_kiro(
 
 /// Render a spec-kit(`.specify/`+`specs/<NNN-이름>/`) feature list into
 /// `area` (spec-viewer-spec-kit-support requirements 2.1-2.5). Unlike
-/// `.kiro`, spec-kit has no Steering-doc concept (design.md Out-of-Scope),
-/// so no group node is appended after the feature nodes — `render_kiro`'s
-/// trailing `steering_group_item` push is the only structural difference
-/// from that function.
+/// `.kiro`, spec-kit has no group concept at all (design.md Out-of-Scope,
+/// unaffected by spec-viewer-kiro-folder-groups), so no group node is
+/// appended after the feature nodes — `render_kiro`'s trailing group loop
+/// is the only structural difference from that function.
 fn render_spec_kit(
     frame: &mut Frame,
     area: Rect,
@@ -153,7 +159,7 @@ fn render_files(
             if cached_entries == &tree.entries && cached_matches.as_slice() == search_matches
     );
     if !cache_hit {
-        let items = build_files_items(&tree.entries, search_matches);
+        let items = build_files_items(&tree.entries, search_matches, &[], &[]);
         *cache = Some((tree.entries.clone(), search_matches.to_vec(), items));
     }
     let items = &cache.as_ref().expect("just populated above if it was empty").2;
@@ -174,29 +180,45 @@ fn render_files(
 /// longer be that directory's descendant. `entries` being sorted by full
 /// path (see `FsTree`'s own doc comment) is what guarantees a directory's
 /// entire subtree arrives contiguously, right after the directory itself.
+///
+/// `prefix` (spec-viewer-kiro-folder-groups) is the ancestor path above
+/// this tree's own root when it is nested inside a larger tree (a `.kiro`
+/// group) -- prepended to every search-match check so highlighting still
+/// lines up with `app::search::flatten_files`' own paths. `--all` mode (a
+/// `FsTree` that *is* the whole tree) passes `&[]`.
+///
+/// `inclusion` (spec-viewer-kiro-folder-groups requirement 3.1/3.2) is
+/// `(path, Inclusion)` for every file that should carry an inclusion badge
+/// -- non-empty only for the group folder named "steering"; `--all` mode
+/// and every other group pass `&[]`, so no file ever gets a badge there.
 fn build_files_items(
     entries: &[FsEntry],
     search_matches: &[Vec<NodeId>],
+    prefix: &[NodeId],
+    inclusion: &[(PathBuf, Inclusion)],
 ) -> Vec<TreeItem<'static, NodeId>> {
-    let mut stack: Vec<(u8, std::path::PathBuf, Vec<TreeItem<'static, NodeId>>)> =
-        vec![(0, std::path::PathBuf::new(), Vec::new())];
+    let mut stack: Vec<(u8, PathBuf, Vec<TreeItem<'static, NodeId>>)> =
+        vec![(0, PathBuf::new(), Vec::new())];
 
     // The still-open ancestor `NodeId`s above whatever `stack` frame is
-    // being closed/appended to right now -- `stack[1..]` (skipping the
-    // depth-0 root sentinel), each frame's own path turned into its
-    // `NodeId::Dir`. Recomputed on demand rather than tracked incrementally
-    // since this tree is small and it is only needed at highlight-check
-    // time (closing a dir, or appending a leaf).
+    // being closed/appended to right now -- `prefix` first, then
+    // `stack[1..]` (skipping the depth-0 root sentinel), each frame's own
+    // path turned into its `NodeId::Dir`. Recomputed on demand rather than
+    // tracked incrementally since this tree is small and it is only needed
+    // at highlight-check time (closing a dir, or appending a leaf).
     fn ancestors_of(
-        stack: &[(u8, std::path::PathBuf, Vec<TreeItem<'static, NodeId>>)],
+        prefix: &[NodeId],
+        stack: &[(u8, PathBuf, Vec<TreeItem<'static, NodeId>>)],
     ) -> Vec<NodeId> {
-        stack[1..].iter().map(|(_, p, _)| NodeId::Dir(p.clone())).collect()
+        let mut path = prefix.to_vec();
+        path.extend(stack[1..].iter().map(|(_, p, _)| NodeId::Dir(p.clone())));
+        path
     }
 
     for entry in entries {
         while stack.len() > 1 && stack.last().unwrap().0 >= entry.depth {
             let (_, path, children) = stack.pop().unwrap();
-            let mut own_path = ancestors_of(&stack);
+            let mut own_path = ancestors_of(prefix, &stack);
             own_path.push(NodeId::Dir(path.clone()));
             let item = dir_item(&path, children, is_search_match(&own_path, search_matches));
             stack.last_mut().unwrap().2.push(item);
@@ -204,16 +226,20 @@ fn build_files_items(
         if entry.is_dir {
             stack.push((entry.depth, entry.path.clone(), Vec::new()));
         } else {
-            let mut own_path = ancestors_of(&stack);
+            let mut own_path = ancestors_of(prefix, &stack);
             own_path.push(NodeId::File(entry.path.clone()));
-            let item = file_item(&entry.path, is_search_match(&own_path, search_matches));
+            let badge = inclusion
+                .iter()
+                .find(|(path, _)| path == &entry.path)
+                .map(|(_, incl)| *incl);
+            let item = file_item(&entry.path, badge, is_search_match(&own_path, search_matches));
             stack.last_mut().unwrap().2.push(item);
         }
     }
 
     while stack.len() > 1 {
         let (_, path, children) = stack.pop().unwrap();
-        let mut own_path = ancestors_of(&stack);
+        let mut own_path = ancestors_of(prefix, &stack);
         own_path.push(NodeId::Dir(path.clone()));
         let item = dir_item(&path, children, is_search_match(&own_path, search_matches));
         stack.last_mut().unwrap().2.push(item);
@@ -222,7 +248,7 @@ fn build_files_items(
     stack.pop().unwrap().2
 }
 
-fn file_name_label(path: &std::path::Path) -> String {
+fn file_name_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -237,7 +263,7 @@ fn labeled_line(label: String, highlighted: bool) -> Line<'static> {
 }
 
 fn dir_item(
-    path: &std::path::Path,
+    path: &Path,
     children: Vec<TreeItem<'static, NodeId>>,
     highlighted: bool,
 ) -> TreeItem<'static, NodeId> {
@@ -249,11 +275,19 @@ fn dir_item(
     .expect("directory paths are unique by construction")
 }
 
-fn file_item(path: &std::path::Path, highlighted: bool) -> TreeItem<'static, NodeId> {
-    TreeItem::new_leaf(
-        NodeId::File(path.to_path_buf()),
-        labeled_line(file_name_label(path), highlighted),
-    )
+/// `inclusion` (requirement 3.1) appends the same `" [always]"`-style
+/// suffix the old dedicated steering leaf used to; `None` (every other
+/// group, and `--all` mode) renders a plain file name (3.2).
+fn file_item(
+    path: &Path,
+    inclusion: Option<Inclusion>,
+    highlighted: bool,
+) -> TreeItem<'static, NodeId> {
+    let label = match inclusion {
+        Some(incl) => format!("{} [{}]", file_name_label(path), inclusion_str(incl)),
+        None => file_name_label(path),
+    };
+    TreeItem::new_leaf(NodeId::File(path.to_path_buf()), labeled_line(label, highlighted))
 }
 
 /// Format the shared "n/total" milestone-progress style: bold+green when
@@ -441,16 +475,21 @@ fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -
     )
 }
 
-/// Build the top-level "Steering" group node and its children (requirement
-/// 2.5).
-fn steering_group_item(docs: &[SteeringDoc], search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
-    let children: Vec<TreeItem<'static, NodeId>> = docs
-        .iter()
-        .map(|d| steering_item(d, search_matches))
-        .collect();
-    let highlighted = is_search_match(&[NodeId::SteeringGroup], search_matches);
-    TreeItem::new(NodeId::SteeringGroup, labeled_line("Steering".to_string(), highlighted), children)
-        .expect("steering doc names are unique by construction")
+/// Build one auto-discovered `.kiro` group's top node and its recursive
+/// children (spec-viewer-kiro-folder-groups requirements 1.1, 1.3,
+/// 2.1-2.4). The group's own root directory becomes an ordinary `Dir` node
+/// (there is no dedicated "group" node kind -- `steering` used to be one,
+/// `SteeringGroup`, but is now just the group whose folder happens to be
+/// named "steering"); `group.inclusion` only ever carries entries for that
+/// one group (requirement 3.1/3.2), so every other group's files render as
+/// plain names via `build_files_items`'s own `&[]` default there.
+fn kiro_group_item(group: &KiroGroup, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
+    let root_id = NodeId::Dir(group.tree.root.clone());
+    let own_path = vec![root_id.clone()];
+    let highlighted = is_search_match(&own_path, search_matches);
+    let children = build_files_items(&group.tree.entries, search_matches, &own_path, &group.inclusion);
+    TreeItem::new(root_id, labeled_line(group.name().to_string(), highlighted), children)
+        .expect("group entries are unique by construction (FsTree::scan)")
 }
 
 /// Literal front-matter vocabulary for `inclusion` (requirement 2.8) — not
@@ -462,13 +501,6 @@ fn inclusion_str(inclusion: Inclusion) -> &'static str {
         Inclusion::FileMatch => "fileMatch",
         Inclusion::Auto => "auto",
     }
-}
-
-fn steering_item(doc: &SteeringDoc, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
-    let label = format!("{} [{}]", doc.name, inclusion_str(doc.inclusion));
-    let own_path = vec![NodeId::SteeringGroup, NodeId::Steering(doc.name.clone())];
-    let highlighted = is_search_match(&own_path, search_matches);
-    TreeItem::new_leaf(NodeId::Steering(doc.name.clone()), labeled_line(label, highlighted))
 }
 
 #[cfg(test)]
@@ -755,7 +787,7 @@ mod tests {
         };
         let root = SpecRoot {
             specs: vec![spec],
-            steering: Vec::new(),
+            groups: Vec::new(),
         };
 
         let buffer = render_root(root, vec![vec![NodeId::Spec("all-done".to_string())]]);
@@ -770,16 +802,20 @@ mod tests {
     #[test]
     fn steering_group_shows_inclusion_badges() {
         let root = build_root();
-        let buffer = render_root(root, vec![vec![NodeId::SteeringGroup]]);
+        let steering_dir = NodeId::Dir(fixtures_root().join("steering"));
+        let buffer = render_root(root, vec![vec![steering_dir]]);
         let rows = buffer_text(&buffer);
 
         assert!(rows.iter().any(|row| row.contains("product.md [always]")));
         assert!(rows.iter().any(|row| row.contains("tech.md [always]")));
         assert!(rows.iter().any(|row| row.contains("domain-terms.md [manual]")));
 
-        // Steering rows are a group separate from any spec's rows: none of
-        // them should collide with a spec row's phase-badge syntax.
-        let steering_row = row_index(&rows, "Steering");
+        // The group's own row (its label is the real folder name, "steering"
+        // -- spec-viewer-kiro-folder-groups derives it directly rather than
+        // hardcoding a capitalized display string) is separate from any
+        // spec's rows: none of them should collide with a spec row's
+        // phase-badge syntax.
+        let steering_row = row_index(&rows, "steering");
         let product_row = row_index(&rows, "product.md [always]");
         assert!(steering_row < product_row);
     }
@@ -857,8 +893,10 @@ mod tests {
     #[test]
     fn matched_steering_doc_row_gets_the_search_highlight_background() {
         let root = build_root();
-        let matches = vec![vec![NodeId::SteeringGroup, NodeId::Steering("product.md".to_string())]];
-        let buffer = render_root_with_matches(root, vec![vec![NodeId::SteeringGroup]], &matches);
+        let steering_dir = NodeId::Dir(fixtures_root().join("steering"));
+        let product_md = NodeId::File(fixtures_root().join("steering").join("product.md"));
+        let matches = vec![vec![steering_dir.clone(), product_md]];
+        let buffer = render_root_with_matches(root, vec![vec![steering_dir]], &matches);
 
         assert_eq!(cell_bg_at(&buffer, "product.md"), Color::Yellow);
     }
@@ -975,7 +1013,7 @@ mod tests {
             docs: vec![],
             definition: None,
         };
-        let root = SpecRoot { specs: vec![spec], steering: Vec::new() };
+        let root = SpecRoot { specs: vec![spec], groups: Vec::new() };
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 
@@ -1031,7 +1069,7 @@ mod tests {
             docs: vec![],
             definition: None,
         };
-        let root = SpecRoot { specs: vec![spec_a, spec_b], steering: Vec::new() };
+        let root = SpecRoot { specs: vec![spec_a, spec_b], groups: Vec::new() };
         let buffer = render_root(root, vec![]);
         let rows = buffer_text(&buffer);
 

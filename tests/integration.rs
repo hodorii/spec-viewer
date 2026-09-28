@@ -93,8 +93,11 @@ fn root_load_builds_all_fixture_specs_and_flags_broken_json() {
     let model_order: Vec<&str> = model.specs.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(model_order, snapshot_order);
 
-    // Steering docs load alongside the specs.
-    assert_eq!(model.steering.len(), 3);
+    // Steering docs load alongside the specs, as the auto-discovered
+    // "steering"-named group (spec-viewer-kiro-folder-groups).
+    assert_eq!(model.groups.len(), 1);
+    assert_eq!(model.groups[0].name(), "steering");
+    assert_eq!(model.groups[0].inclusion.len(), 3);
 
     // 3.5: a spec whose spec.json fails to parse is still a node in the
     // model (with its document entries intact), only its meta is `Err`.

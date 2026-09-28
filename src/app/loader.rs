@@ -8,13 +8,13 @@
 //! panel (requirements 2.4, 2.6, 3.6, 3.7, 8.1, 8.3, 8.4).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub use crate::spec::{DirSnapshot, FileSnapshot, SpecDirSnapshot};
 
 use crate::markdown;
-use crate::spec::{DocKind, Spec};
+use crate::spec::{DocKind, FsTree, GroupSnapshot, Spec};
 
 use super::{DocView, FileInfo};
 
@@ -36,27 +36,98 @@ fn panel_inner_width(outer: u16) -> u16 {
     outer.saturating_sub(DOC_PANEL_BORDER)
 }
 
-/// Read a `.kiro` root directory (`root/specs/*` and `root/steering/*.md`)
-/// into an in-memory [`DirSnapshot`], suitable for handing to
-/// `spec::build`.
+/// Read a `.kiro` root directory into an in-memory [`DirSnapshot`], suitable
+/// for handing to `spec::build`.
 ///
 /// - Each direct subdirectory of `root/specs` becomes one
 ///   [`SpecDirSnapshot`]; only regular files directly inside it (no
 ///   recursion) become its [`FileSnapshot`]s.
-/// - Each `*.md` file directly inside `root/steering` becomes one
-///   [`FileSnapshot`] in the steering list.
+/// - Every other direct subdirectory of `root` (spec-viewer-kiro-folder-groups
+///   requirements 1.1-1.6) that contains at least one markdown file
+///   anywhere beneath it becomes one [`GroupSnapshot`], scanned recursively
+///   -- see [`read_groups`].
 /// - Dotfiles/dot-directories and nested subdirectories inside a spec dir
 ///   are skipped rather than erroring.
-/// - A missing `root/specs` or `root/steering` is treated as zero entries
-///   for that list, not an error.
+/// - A missing `root/specs` is treated as zero entries, not an error; same
+///   for `root` itself when discovering groups.
 /// - Content is decoded with `String::from_utf8_lossy` (requirement 8.4):
 ///   non-UTF-8 bytes become `U+FFFD`, never an error.
-/// - No sorting is performed here — whatever order `fs::read_dir` yields is
-///   preserved, per `spec::build`'s own "caller decides ordering" contract.
+/// - Spec/spec-file ordering is whatever `fs::read_dir` yields, preserved
+///   per `spec::build`'s own "caller decides ordering" contract; group
+///   ordering is the one exception -- sorted by folder name (1.5).
 pub fn load_snapshot(root: &Path) -> DirSnapshot {
     let specs = read_spec_dirs(&root.join("specs"));
-    let steering = read_steering_files(&root.join("steering"));
-    DirSnapshot { specs, steering }
+    let groups = read_groups(root);
+    DirSnapshot { specs, groups }
+}
+
+/// Auto-discover `.kiro` subfolder groups (spec-viewer-kiro-folder-groups
+/// requirements 1.1-1.6): every direct subdirectory of `root` except
+/// `specs` and dotfiles/dot-directories, scanned recursively via
+/// `FsTree::scan` and kept only when it contains at least one markdown file
+/// somewhere beneath it (an empty `scan` result means none does, 1.2/1.6).
+/// Kept groups are sorted by folder name for a consistent display order
+/// across runs (1.5). The one folder named exactly `steering` also gets
+/// every markdown file's content read up front, so `spec::build` can parse
+/// its `inclusion` front matter (requirement 3.1); every other group's
+/// `steering_contents` stays empty (3.2) -- their file content is loaded
+/// lazily on selection instead, the same way `--all` mode already works.
+fn read_groups(root: &Path) -> Vec<GroupSnapshot> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "specs" || name.starts_with('.') {
+            continue;
+        }
+        candidates.push(entry.path());
+    }
+    // Requirement 1.5: `fs::read_dir` order is not guaranteed -- sort by
+    // full path, which (all candidates sharing `root` as their parent) is
+    // exactly sorting by folder name.
+    candidates.sort();
+
+    candidates
+        .into_iter()
+        .filter_map(|dir| {
+            let tree = FsTree::scan(&dir);
+            if tree.entries.is_empty() {
+                return None;
+            }
+            let steering_contents = if dir.file_name().and_then(|n| n.to_str()) == Some("steering")
+            {
+                read_markdown_contents(&tree)
+            } else {
+                Vec::new()
+            };
+            Some(GroupSnapshot { tree, steering_contents })
+        })
+        .collect()
+}
+
+/// Read every markdown file (`FsEntry` with `is_dir: false`) in `tree` into
+/// `(path, content)` pairs, lossily decoding non-UTF-8 bytes the same way
+/// every other loader in this module does (requirement 8.4). A file that
+/// fails to read (removed mid-scan, permissions) is simply skipped rather
+/// than erroring the whole group.
+fn read_markdown_contents(tree: &FsTree) -> Vec<(PathBuf, String)> {
+    tree.entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| {
+            let bytes = fs::read(&e.path).ok()?;
+            Some((e.path.clone(), String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .collect()
 }
 
 fn read_spec_dirs(specs_dir: &Path) -> Vec<SpecDirSnapshot> {
@@ -106,34 +177,6 @@ fn read_spec_files(dir: &Path) -> Vec<FileSnapshot> {
         }
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let content = String::from_utf8_lossy(&bytes).into_owned();
-        out.push(FileSnapshot { name, path, content });
-    }
-
-    out
-}
-
-fn read_steering_files(steering_dir: &Path) -> Vec<FileSnapshot> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(steering_dir) else {
-        return out;
-    };
-
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".md") {
             continue;
         }
         let path = entry.path();
@@ -565,13 +608,24 @@ mod tests {
             ]
         );
 
-        let mut steering_names: Vec<&str> =
-            snapshot.steering.iter().map(|s| s.name.as_str()).collect();
-        steering_names.sort();
-        assert_eq!(
-            steering_names,
-            vec!["domain-terms.md", "product.md", "tech.md"]
-        );
+        // `tests/fixtures/kiro` has exactly one auto-discovered group:
+        // `steering/`, with the three fixture files inside it.
+        assert_eq!(snapshot.groups.len(), 1);
+        let steering = &snapshot.groups[0];
+        assert_eq!(steering.tree.root.file_name().and_then(|n| n.to_str()), Some("steering"));
+        let mut file_names: Vec<String> = steering
+            .tree
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        file_names.sort();
+        assert_eq!(file_names, vec!["domain-terms.md", "product.md", "tech.md"]);
+        // The `steering` group's content was read up front for `inclusion`
+        // parsing (requirement 3.1) -- every other group would leave this
+        // empty (3.2), but there is no other group in this fixture.
+        assert_eq!(steering.steering_contents.len(), 3);
     }
 
     #[test]
@@ -582,7 +636,9 @@ mod tests {
         let root = spec::build(&snapshot);
 
         assert_eq!(root.specs.len(), expected_spec_count);
-        assert_eq!(root.steering.len(), 3);
+        assert_eq!(root.groups.len(), 1);
+        assert_eq!(root.groups[0].name(), "steering");
+        assert_eq!(root.groups[0].inclusion.len(), 3);
     }
 
     #[test]
@@ -608,12 +664,133 @@ mod tests {
     #[test]
     fn load_snapshot_missing_specs_or_steering_dir_is_not_an_error() {
         let dir = scratch_dir("missing_subdirs");
-        // Neither `specs/` nor `steering/` exists under `dir`.
+        // Neither `specs/` nor any other subfolder exists under `dir`.
 
         let snapshot = load_snapshot(&dir);
 
         assert!(snapshot.specs.is_empty());
-        assert!(snapshot.steering.is_empty());
+        assert!(snapshot.groups.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- group auto-discovery (spec-viewer-kiro-folder-groups) -----------
+
+    #[test]
+    fn load_snapshot_discovers_a_non_steering_group_with_a_nested_subfolder() {
+        // Requirements 1.1, 2.1, 2.2: a folder with no special name (not
+        // "steering"), containing a markdown file two levels down, must
+        // still be discovered and its full recursive structure kept.
+        let dir = scratch_dir("group_reference");
+        fs::create_dir_all(dir.join("reference/api")).unwrap();
+        fs::write(dir.join("reference/api/endpoints.md"), "# Endpoints\n").unwrap();
+
+        let snapshot = load_snapshot(&dir);
+
+        assert_eq!(snapshot.groups.len(), 1);
+        let reference = &snapshot.groups[0];
+        assert_eq!(
+            reference.tree.root.file_name().and_then(|n| n.to_str()),
+            Some("reference")
+        );
+        assert!(
+            reference
+                .tree
+                .entries
+                .iter()
+                .any(|e| e.is_dir && e.path.ends_with("reference/api")),
+            "expected the nested api/ subfolder to be part of the scanned tree"
+        );
+        assert!(
+            reference.tree.entries.iter().any(|e| !e.is_dir && e.path.ends_with("endpoints.md")),
+            "expected endpoints.md two levels down to be found"
+        );
+        // Only "steering" (by name) ever gets its content read eagerly (3.2).
+        assert!(reference.steering_contents.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_ignores_a_folder_with_no_markdown_anywhere() {
+        // Requirement 1.2: a folder that exists but has no markdown file
+        // (directly or nested) must not become a group.
+        let dir = scratch_dir("group_no_markdown");
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/logo.png"), b"not markdown").unwrap();
+
+        let snapshot = load_snapshot(&dir);
+
+        assert!(snapshot.groups.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_excludes_specs_and_dotfiles_from_group_discovery() {
+        // Requirement 1.4: `specs/` itself, however much markdown it holds,
+        // is never also treated as a generic group. Dot-directories are
+        // skipped the same way `read_spec_dirs` already skips dotfiles.
+        let dir = scratch_dir("group_excludes");
+        fs::create_dir_all(dir.join("specs/demo")).unwrap();
+        fs::write(dir.join("specs/demo/requirements.md"), "# Demo\n").unwrap();
+        fs::create_dir_all(dir.join(".hidden")).unwrap();
+        fs::write(dir.join(".hidden/notes.md"), "# Notes\n").unwrap();
+
+        let snapshot = load_snapshot(&dir);
+
+        assert!(snapshot.groups.is_empty());
+        assert_eq!(snapshot.specs.len(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_orders_multiple_groups_by_folder_name() {
+        // Requirements 1.3, 1.5: every markdown-containing folder shows up,
+        // in a consistent (alphabetical) order.
+        let dir = scratch_dir("group_multiple");
+        for name in ["zeta", "alpha", "middle"] {
+            fs::create_dir_all(dir.join(name)).unwrap();
+            fs::write(dir.join(name).join("doc.md"), "# Doc\n").unwrap();
+        }
+
+        let snapshot = load_snapshot(&dir);
+
+        let names: Vec<String> = snapshot
+            .groups
+            .iter()
+            .map(|g| g.tree.root.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_badge_exclusion_is_by_group_name_not_file_content() {
+        // Requirement 3.1/3.2: even when a non-"steering" group's file
+        // happens to carry `inclusion:` front matter, it must never be
+        // parsed into a badge -- exclusion is keyed by the group's folder
+        // name, not by whether the content looks like a steering doc.
+        let dir = scratch_dir("group_badge_name_not_content");
+        fs::create_dir_all(dir.join("reference")).unwrap();
+        fs::write(
+            dir.join("reference/overview.md"),
+            "---\ninclusion: manual\n---\n# Overview\n",
+        )
+        .unwrap();
+
+        let snapshot = load_snapshot(&dir);
+        let root = spec::build(&snapshot);
+
+        assert_eq!(root.groups.len(), 1);
+        let reference = &root.groups[0];
+        assert_eq!(reference.name(), "reference");
+        assert!(
+            reference.inclusion.is_empty(),
+            "expected no inclusion badge for a non-'steering' group even though its file has inclusion front matter"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

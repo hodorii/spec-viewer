@@ -50,7 +50,23 @@ pub fn find_root(start: &Path) -> Option<PathBuf> {
 /// `load_snapshot()` constructs one and hands it to `build()`.
 pub struct DirSnapshot {
     pub specs: Vec<SpecDirSnapshot>,
-    pub steering: Vec<FileSnapshot>,
+    /// One entry per auto-discovered `.kiro` subfolder (`specs` excluded)
+    /// that contains at least one markdown file somewhere beneath it
+    /// (spec-viewer-kiro-folder-groups requirement 1.1-1.6). Discovery and
+    /// ordering are `app::loader::load_snapshot`'s job; `build()` only
+    /// transforms what is already here.
+    pub groups: Vec<GroupSnapshot>,
+}
+
+/// One auto-discovered group's already-scanned recursive tree, plus (only
+/// for the group folder literally named "steering") every markdown file's
+/// raw content, needed to parse its `inclusion` front matter (requirement
+/// 3.1). Every other group's `steering_contents` is always empty --
+/// content for those is loaded lazily on selection, the same way `--all`
+/// mode already works.
+pub struct GroupSnapshot {
+    pub tree: FsTree,
+    pub steering_contents: Vec<(PathBuf, String)>,
 }
 
 /// One spec directory's flat file listing (no recursion — spec directories
@@ -70,18 +86,37 @@ pub struct FileSnapshot {
 }
 
 /// The fully assembled domain model: every spec under `.kiro/specs/` plus
-/// every steering doc under `.kiro/steering/`.
+/// every auto-discovered `.kiro` subfolder group (including `steering`,
+/// spec-viewer-kiro-folder-groups requirements 1.1-1.6, 2.1-2.4).
 pub struct SpecRoot {
     pub specs: Vec<Spec>,
-    pub steering: Vec<SteeringDoc>,
+    pub groups: Vec<KiroGroup>,
 }
 
-/// A single steering document: its display name, path, and parsed
-/// `inclusion` front-matter value (requirement 2.8).
-pub struct SteeringDoc {
-    pub name: String,
-    pub path: PathBuf,
-    pub inclusion: Inclusion,
+/// One auto-discovered `.kiro` subfolder (`specs` excluded), shown as its
+/// own recursive tree in the panel. `steering` is not a distinct type or
+/// variant -- it is just the `KiroGroup` whose folder happens to be named
+/// "steering", which is also the only case `inclusion` is ever non-empty
+/// for (requirement 3.1/3.2). The group's display name is derived from
+/// `tree.root`'s own file name rather than stored separately (SSoT).
+pub struct KiroGroup {
+    pub tree: FsTree,
+    /// `(path, inclusion)` for every markdown file directly known to this
+    /// group when (and only when) [`KiroGroup::name`] is exactly
+    /// `"steering"` (requirement 3.1); always empty otherwise (3.2). Each
+    /// path matches one of `tree.entries`' file entries.
+    pub inclusion: Vec<(PathBuf, Inclusion)>,
+}
+
+impl KiroGroup {
+    /// The group's display name -- the scanned folder's own base name.
+    pub fn name(&self) -> &str {
+        self.tree
+            .root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+    }
 }
 
 /// Parsed `inclusion` front-matter value of a steering doc (requirement 2.8).
@@ -153,11 +188,15 @@ pub enum DocStatus {
 pub enum NodeId {
     Spec(String),
     Doc(String, DocKind),
-    SteeringGroup,
-    Steering(String),
-    /// `--all` mode only (requirement 1.8): a folder, fold/unfold-only.
+    /// A folder, fold/unfold-only: `--all` mode's own tree, or (since
+    /// spec-viewer-kiro-folder-groups) a `.kiro` group's root or any
+    /// directory beneath it -- including what used to be the dedicated
+    /// `SteeringGroup` node, now just `Dir` at that group's own path.
     Dir(PathBuf),
-    /// `--all` mode only (requirement 1.8): a markdown file, loads on select.
+    /// A markdown file, loads on select: `--all` mode's own tree, or (since
+    /// spec-viewer-kiro-folder-groups) a file inside a `.kiro` group --
+    /// including what used to be the dedicated `Steering(String)` leaf, now
+    /// just `File` at that document's own path.
     File(PathBuf),
 }
 
@@ -206,23 +245,27 @@ fn find_file<'a>(files: &'a [FileSnapshot], name: &str) -> Option<&'a FileSnapsh
 /// Assemble a [`SpecRoot`] from an in-memory directory [`DirSnapshot`].
 ///
 /// Pure aggregation only: no filesystem I/O here, and caller-given ordering
-/// of `snapshot.specs` / `snapshot.steering` / each spec's `files` is
+/// of `snapshot.specs` / `snapshot.groups` / each spec's `files` is
 /// preserved (listing-order policy belongs to the real loader, not to this
 /// function) — except for the *output* `Spec.docs` ordering, which this
 /// function does impose (requirement 2.2, 2.3).
 pub fn build(snapshot: &DirSnapshot) -> SpecRoot {
     let specs = snapshot.specs.iter().map(build_spec).collect();
-    let steering = snapshot
-        .steering
-        .iter()
-        .map(|f| SteeringDoc {
-            name: f.name.clone(),
-            path: f.path.clone(),
-            inclusion: inclusion(&f.content),
-        })
-        .collect();
+    let groups = snapshot.groups.iter().map(build_group).collect();
 
-    SpecRoot { specs, steering }
+    SpecRoot { specs, groups }
+}
+
+fn build_group(gs: &GroupSnapshot) -> KiroGroup {
+    let inclusion = gs
+        .steering_contents
+        .iter()
+        .map(|(path, content)| (path.clone(), inclusion(content)))
+        .collect();
+    KiroGroup {
+        tree: gs.tree.clone(),
+        inclusion,
+    }
 }
 
 fn build_spec(sd: &SpecDirSnapshot) -> Spec {
@@ -596,22 +639,38 @@ mod build_tests {
         }
     }
 
+    /// Scans the real `tests/fixtures/kiro/steering/` folder (all three
+    /// fixtures: `product.md`, `tech.md`, `domain-terms.md`) into a
+    /// `GroupSnapshot`, reading every file's content too (as the real
+    /// loader does for a group literally named "steering").
+    fn steering_group_snapshot() -> GroupSnapshot {
+        let dir = fixtures_root().join("steering");
+        let tree = FsTree::scan(&dir);
+        let steering_contents = tree
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| {
+                let content =
+                    fs::read_to_string(&e.path).expect("steering fixture readable UTF-8");
+                (e.path.clone(), content)
+            })
+            .collect();
+        GroupSnapshot { tree, steering_contents }
+    }
+
     /// Build a `DirSnapshot` from real fixtures on disk. `specs` names the
     /// `tests/fixtures/kiro/specs/<name>` directories to include (in the
-    /// given order); when `steering` is true, all three steering fixtures
-    /// (`product.md`, `tech.md`, `domain-terms.md`) are included.
+    /// given order); when `steering` is true, the real `steering/` fixture
+    /// folder is included as a single group.
     fn snapshot_of(specs: &[&str], steering: bool) -> DirSnapshot {
         let specs = specs.iter().map(|s| spec_snapshot(s)).collect();
-        let steering = if steering {
-            let dir = fixtures_root().join("steering");
-            ["product.md", "tech.md", "domain-terms.md"]
-                .iter()
-                .map(|name| read_file_snapshot(&dir.join(name)))
-                .collect()
+        let groups = if steering {
+            vec![steering_group_snapshot()]
         } else {
             Vec::new()
         };
-        DirSnapshot { specs, steering }
+        DirSnapshot { specs, groups }
     }
 
     fn doc<'a>(spec: &'a Spec, kind: &DocKind) -> &'a DocEntry {
@@ -801,18 +860,22 @@ mod build_tests {
         let root = build(&snapshot);
 
         assert_eq!(root.specs.len(), 0);
-        assert_eq!(root.steering.len(), 3);
+        assert_eq!(root.groups.len(), 1);
+        let steering = &root.groups[0];
+        assert_eq!(steering.name(), "steering");
+        assert_eq!(steering.inclusion.len(), 3);
 
         let find = |name: &str| {
-            root.steering
+            steering
+                .inclusion
                 .iter()
-                .find(|s| s.name == name)
+                .find(|(path, _)| path.file_name().and_then(|n| n.to_str()) == Some(name))
                 .unwrap_or_else(|| panic!("expected steering doc {name}"))
         };
 
-        assert_eq!(find("product.md").inclusion, Inclusion::Always);
-        assert_eq!(find("tech.md").inclusion, Inclusion::Always);
-        assert_eq!(find("domain-terms.md").inclusion, Inclusion::Manual);
+        assert_eq!(find("product.md").1, Inclusion::Always);
+        assert_eq!(find("tech.md").1, Inclusion::Always);
+        assert_eq!(find("domain-terms.md").1, Inclusion::Manual);
     }
 
     #[test]

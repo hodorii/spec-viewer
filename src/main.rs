@@ -342,6 +342,36 @@ pub fn resolve_editor(cli_editor: Option<&str>) -> Vec<String> {
     chosen.split_whitespace().map(|s| s.to_string()).collect()
 }
 
+/// spec-viewer-mouse-scroll-freeze (design.md "수정 방식" 1, "모션 추적
+/// 해제"): enables the same mouse reporting modes as
+/// `crossterm::event::EnableMouseCapture` *except* `?1003h` (any-motion
+/// tracking) and `?1015h` (legacy RXVT coordinates, superseded by `?1006h`
+/// SGR and never read by this crate's own parsing). Button press/release
+/// (`?1000h`), drag reporting (`?1002h`), and SGR extended coordinates
+/// (`?1006h`) are unchanged, so every click/drag/wheel gesture (requirements
+/// 9.1-9.7) keeps working exactly as before -- `?1003h` is what streams a
+/// `MouseEventKind::Moved` event for every pixel the pointer crosses even
+/// without a button held, and `handle_mouse`'s `_ => {}` arm has no consumer
+/// for it (confirmed by bugfix.md's source audit), so those events only ever
+/// cost a wasted full-frame render each. Root cause and exact byte sequence
+/// (`crossterm::event::EnableMouseCapture::write_ansi`, crossterm 0.29.0
+/// `src/event.rs`) are in design.md "원인". Used at both of this crate's
+/// mouse-capture-enable call sites (`main`'s startup and `run_editor`'s
+/// post-edit restore) -- the motion flood would otherwise silently return
+/// every time an edit session ends, since `run_editor` re-enables capture
+/// the same way `main` first did.
+///
+/// `DisableMouseCapture` (crossterm's own) is left as-is at every disable
+/// call site unchanged, per design.md: it unconditionally emits the `l`
+/// (reset) form of all five modes, so turning off a mode this function never
+/// turned on is a harmless no-op.
+fn enable_mouse_capture_without_motion_tracking() -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+    stdout.flush()
+}
+
 /// Outcome of [`run_editor`]: whether the caller ([`handle_edit_file`])
 /// should treat this as a successful edit (reload/redraw path, requirement
 /// 3.1/3.3's territory) or a failure to surface to the user (requirement
@@ -394,7 +424,7 @@ fn run_editor<B: ratatui::backend::Backend>(
     let _ = crossterm::terminal::enable_raw_mode();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     if mouse_capture_enabled {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        let _ = enable_mouse_capture_without_motion_tracking();
     }
 
     // Force a full redraw once control returns, regardless of outcome --
@@ -825,11 +855,11 @@ fn main() {
     // 표시줄에 표시 없음": best-effort only -- a terminal that rejects mouse
     // reporting still gets every keyboard feature, silently, with no flag
     // anywhere in `AppState` to track the degraded mode.
-    let mouse_capture_enabled = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableMouseCapture
-    )
-    .is_ok();
+    //
+    // spec-viewer-mouse-scroll-freeze: `enable_mouse_capture_without_motion_tracking`
+    // instead of `crossterm::event::EnableMouseCapture` -- same click/drag/
+    // wheel modes, minus the `?1003h` any-motion stream nothing consumes.
+    let mouse_capture_enabled = enable_mouse_capture_without_motion_tracking().is_ok();
 
     let (tx, rx) = std::sync::mpsc::channel();
     // `tx.clone()`, not `tx` itself: a later runtime mode switch
@@ -3191,6 +3221,44 @@ gamma trailing line
                 close(self.saved_fd);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enable_mouse_capture_without_motion_tracking_omits_motion_and_rxvt_modes() {
+        // spec-viewer-mouse-scroll-freeze design.md 검증 속성 (b): the fix's
+        // whole point is a byte-for-byte difference from crossterm's own
+        // `EnableMouseCapture` (`?1000h?1002h?1003h?1015h?1006h`, confirmed
+        // against crossterm 0.29.0's `write_ansi` in the sibling test below)
+        // -- `?1003h` (any-motion tracking, the actual flood source) and
+        // `?1015h` (legacy RXVT coordinates, unused here) must be gone,
+        // while `?1000h`/`?1002h`/`?1006h` (click, drag, SGR coordinates --
+        // requirements 9.1-9.7) must still be present. Same real-fd-1
+        // capture technique as the test below; see its own comment for why
+        // this can't be asserted via any `TestBackend` buffer.
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let capture_path = scratch_dir("mouse_capture_no_motion").join("stdout-capture.bin");
+        let capture_file = fs::File::create(&capture_path).expect("create capture file");
+        {
+            let _fd_guard = StdoutFdGuard::redirect_to(&capture_file);
+            enable_mouse_capture_without_motion_tracking().expect("write to redirected fd 1");
+        }
+        let captured = fs::read(&capture_path).unwrap_or_default();
+        let captured_text = String::from_utf8_lossy(&captured);
+
+        assert!(captured_text.contains("\x1b[?1000h"), "expected click mode kept, got: {captured_text:?}");
+        assert!(captured_text.contains("\x1b[?1002h"), "expected drag mode kept, got: {captured_text:?}");
+        assert!(captured_text.contains("\x1b[?1006h"), "expected SGR coordinate mode kept, got: {captured_text:?}");
+        assert!(
+            !captured_text.contains("\x1b[?1003h"),
+            "expected any-motion tracking NOT enabled (this is the bug's source), got: {captured_text:?}"
+        );
+        assert!(
+            !captured_text.contains("\x1b[?1015h"),
+            "expected legacy RXVT coordinate mode NOT enabled, got: {captured_text:?}"
+        );
+
+        fs::remove_dir_all(capture_path.parent().unwrap()).ok();
     }
 
     #[cfg(unix)]

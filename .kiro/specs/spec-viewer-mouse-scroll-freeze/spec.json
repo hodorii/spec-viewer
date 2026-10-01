@@ -1,9 +1,9 @@
 {
   "feature_name": "spec-viewer-mouse-scroll-freeze",
   "created_at": "2026-09-18T08:39:33Z",
-  "updated_at": "2026-09-21T00:45:49Z",
+  "updated_at": "2026-10-01T00:00:00Z",
   "language": "ko",
-  "phase": "tasks-generated",
+  "phase": "completed",
   "approvals": {
     "bugfix": {
       "generated": true,
@@ -19,8 +19,8 @@
     },
     "tasks": {
       "generated": true,
-      "approved": false
+      "approved": true
     }
   },
-  "ready_for_implementation": false
+  "ready_for_implementation": true
 }

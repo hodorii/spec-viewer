@@ -2409,6 +2409,51 @@ mod reducer_tests {
     }
 
     #[test]
+    fn pointer_moved_without_a_button_changes_nothing() {
+        // spec-viewer-mouse-scroll-freeze design.md 검증 속성 (a): the whole
+        // bug is that `MouseEventKind::Moved` has no consumer in
+        // `handle_mouse` (it falls into the `_ => {}` arm) yet `step` still
+        // renders a full frame for each one -- streamed at up to hundreds/sec
+        // while the terminal's mouse-motion tracking is enabled. This test
+        // locks in that precondition at the reducer level: a bare `Moved`
+        // (no button held) must be a complete no-op against every piece of
+        // state a gesture could plausibly touch, so nobody reintroduces a
+        // reason to actually handle it here instead of at the terminal-mode
+        // level (`main::enable_mouse_capture_without_motion_tracking`,
+        // requirement 2.2, which stops the flood at the source instead).
+        let mut state = test_state();
+        state.layout = two_panel_layout();
+        state.doc = DocView::Rendered {
+            path: PathBuf::from("inline.md"),
+            r: markdown::render(&"line\n\n".repeat(20), 80),
+            meta: FileInfo::default(),
+        };
+        state.scroll = 5;
+        let before = (
+            state.scroll,
+            state.focus,
+            state.selection.clone(),
+            state.drag.clone(),
+            state.tree.selected().to_vec(),
+        );
+
+        let control = update(&mut state, mouse_action(MouseEventKind::Moved, 42, 7));
+
+        assert_eq!(control, Control::Continue);
+        assert_eq!(
+            (
+                state.scroll,
+                state.focus,
+                state.selection.clone(),
+                state.drag.clone(),
+                state.tree.selected().to_vec(),
+            ),
+            before,
+            "a bare pointer-move event must not change scroll, focus, selection, drag, or tree state"
+        );
+    }
+
+    #[test]
     fn wheel_over_tree_calls_key_down_the_right_number_of_times_regardless_of_focus() {
         // `TreeState::key_down`/`key_up` only move the selection once they
         // know the flattened item list, which is populated by a real

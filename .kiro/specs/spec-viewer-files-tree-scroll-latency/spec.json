@@ -9,10 +9,6 @@
       "generated": true,
       "approved": true
     },
-    "bizProcess": {
-      "generated": false,
-      "approved": false
-    },
     "design": {
       "generated": true,
       "approved": true

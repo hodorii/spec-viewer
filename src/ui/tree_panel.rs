@@ -1164,34 +1164,27 @@ mod tests {
 
     /// 1.1/1.2 -> 2.1: a repeated render of an unchanged large `Files` tree
     /// must reuse the cached `Vec<TreeItem>` build instead of reallocating
-    /// it every call -- the *second* render (cache hit) must be
-    /// substantially cheaper than the *first* (cache miss, has to build).
-    /// A ratio assertion (not an absolute-ms budget) stays robust across
-    /// machine speeds, the same pattern used by
-    /// `spec-viewer-watch-startup-latency`'s regression test.
+    /// it every call -- the cached `Vec<TreeItem>` keeps the same heap
+    /// allocation across an unchanged second render (no timing involved).
     #[test]
     fn files_tree_render_reuses_cached_items_when_unchanged() {
         let tree = flat_files_tree(20_000);
         let mut tree_state: TreeState<NodeId> = TreeState::default();
         let mut cache: Option<crate::app::FilesTreeItemCache> = None;
 
-        let t0 = std::time::Instant::now();
         render_files_source(&tree, &mut tree_state, &[], &mut cache);
-        let first = t0.elapsed();
+        let items_after_first_render = cache.as_ref().expect("cache populated by the first render").2.as_ptr();
 
-        let t1 = std::time::Instant::now();
         let buf = render_files_source(&tree, &mut tree_state, &[], &mut cache);
-        let second = t1.elapsed();
+        let items_after_second_render = cache.as_ref().expect("cache kept by the second render").2.as_ptr();
 
-        assert!(cache.is_some(), "expected the cache to be populated after the first render");
         // Still renders correctly from the cache, not a blank/stale panel.
         let rows = buffer_text(&buf);
         assert!(rows.iter().any(|r| r.contains("f000000.md")), "expected a real entry visible, got:\n{rows:?}");
 
-        assert!(
-            second < first / 2,
-            "expected the cache-hit render ({second:?}) to be well under half the cache-miss \
-             render ({first:?}) -- regression: the Vec<TreeItem> build is not being reused"
+        assert_eq!(
+            items_after_first_render, items_after_second_render,
+            "regression: the Vec<TreeItem> was rebuilt on an unchanged render instead of being reused"
         );
     }
 

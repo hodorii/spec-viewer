@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Kind of document tracked within a spec directory.
@@ -9,7 +10,7 @@ use serde_json::Value;
 /// `spec.json` (`requirements`/`bugfix`/`bizProcess`/`design`/`tasks`).
 /// `Research` and `Other` are not populated by `parse_meta` — they exist for
 /// later document-tree assembly tasks.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DocKind {
     Requirements,
     Bugfix,

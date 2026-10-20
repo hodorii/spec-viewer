@@ -11,6 +11,7 @@
 //! pattern `watch`'s tests already use for this crate's other I/O
 //! boundaries.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -86,9 +87,10 @@ impl FsTree {
             }
         }
 
+        let dirs_with_markdown = ancestor_dirs_of(&files);
         let kept_dirs: Vec<PathBuf> = dirs
             .into_iter()
-            .filter(|d| files.iter().any(|f| f.starts_with(d)))
+            .filter(|d| dirs_with_markdown.contains(d.as_path()))
             .collect();
 
         let depth_of = |path: &Path| -> u8 {
@@ -119,7 +121,9 @@ impl FsTree {
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-        FsTree { root: root.to_path_buf(), entries }
+        let mut tree = FsTree { root: root.to_path_buf(), entries };
+        tree.sort_entries(SortKey::Name);
+        tree
     }
 
     /// Re-order `entries`' siblings at every nesting level by `key`
@@ -184,8 +188,11 @@ impl FsTree {
                 b.entry.modified.cmp(&a.entry.modified).then_with(|| a.entry.path.cmp(&b.entry.path))
             }),
             // `Name` (and anything else -- `for_files` already normalized
-            // the caller's key before this is reached).
-            _ => nodes.sort_by(|a, b| a.entry.path.cmp(&b.entry.path)),
+            // the caller's key before this is reached): folders first, so
+            // sub-folders are not buried between same-level files.
+            _ => nodes.sort_by(|a, b| {
+                b.entry.is_dir.cmp(&a.entry.is_dir).then_with(|| a.entry.path.cmp(&b.entry.path))
+            }),
         }
         for node in nodes.iter_mut() {
             Self::sort_nodes(&mut node.children, key);
@@ -198,6 +205,24 @@ impl FsTree {
             Self::flatten(&node.children, out);
         }
     }
+}
+
+/// Every directory that contains at least one of `files` somewhere beneath
+/// it. Each file walks up its parents only until it meets an ancestor an
+/// earlier file already recorded, so the cost is proportional to the number
+/// of distinct directories rather than directories times files.
+fn ancestor_dirs_of(files: &[PathBuf]) -> HashSet<&Path> {
+    let mut ancestors: HashSet<&Path> = HashSet::new();
+    for file in files {
+        let mut current = file.parent();
+        while let Some(dir) = current {
+            if !ancestors.insert(dir) {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+    ancestors
 }
 
 /// Temporary parent/child reconstruction used only by
@@ -454,6 +479,63 @@ mod tests {
         let mut tree = FsTree::scan(&root);
         tree.sort_entries(SortKey::Updated);
         assert!(tree.entries.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ancestor_dirs_of_collects_every_directory_above_each_file_once() {
+        let files = vec![
+            PathBuf::from("/r/a/b/one.md"),
+            PathBuf::from("/r/a/two.md"),
+            PathBuf::from("/r/c/three.md"),
+        ];
+
+        let ancestors = ancestor_dirs_of(&files);
+
+        let expected: HashSet<&Path> =
+            ["/r/a/b", "/r/a", "/r/c", "/r", "/"].into_iter().map(Path::new).collect();
+        assert_eq!(ancestors, expected);
+    }
+
+    #[test]
+    fn keeps_nested_directories_whose_markdown_sits_only_in_a_deeper_level() {
+        let root = scratch_dir("nested_keep");
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::create_dir_all(root.join("empty/inner")).unwrap();
+        fs::write(root.join("a/b/c/deep.md"), "x").unwrap();
+
+        let tree = FsTree::scan(&root);
+
+        let dirs: Vec<PathBuf> = tree.entries.iter().filter(|e| e.is_dir).map(|e| e.path.clone()).collect();
+        assert_eq!(dirs, vec![root.join("a"), root.join("a/b"), root.join("a/b/c")]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn name_sort_lists_folders_before_files_at_every_level() {
+        let root = scratch_dir("folders_first");
+        fs::create_dir_all(root.join("zeta")).unwrap();
+        fs::create_dir_all(root.join("zeta/inner")).unwrap();
+        fs::write(root.join("alpha.md"), "x").unwrap();
+        fs::write(root.join("zeta/aaa.md"), "x").unwrap();
+        fs::write(root.join("zeta/inner/z.md"), "x").unwrap();
+        let mut tree = FsTree::scan(&root);
+
+        tree.sort_entries(SortKey::Name);
+
+        let order: Vec<PathBuf> = tree
+            .entries
+            .iter()
+            .map(|e| e.path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            order,
+            ["zeta", "zeta/inner", "zeta/inner/z.md", "zeta/aaa.md", "alpha.md"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 }

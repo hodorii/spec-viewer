@@ -811,6 +811,26 @@ fn apply_initial_files_sort(state: &mut spec_viewer::app::AppState) {
     }
 }
 
+/// Seed the in-memory position map from the previous run's store and put
+/// back the cursor for the tree shown at startup; a position pointing at
+/// nodes that no longer exist leaves the default blank start.
+fn restore_saved_tree_position(state: &mut spec_viewer::app::AppState, store_file: Option<&Path>) {
+    let Some(store_file) = store_file else { return };
+    state.remembered_tree_positions = spec_viewer::app::position_store::load(store_file);
+    spec_viewer::app::restore_tree_position(state);
+    if !state.tree.selected().is_empty() {
+        spec_viewer::app::show_selected_doc(state);
+    }
+}
+
+/// Persist the cursor of the tree being shown along with every position
+/// remembered this run. Failing to write is deliberately ignored.
+fn save_tree_positions(state: &mut spec_viewer::app::AppState, store_file: Option<&Path>) {
+    let Some(store_file) = store_file else { return };
+    spec_viewer::app::remember_tree_position(state);
+    let _ = spec_viewer::app::position_store::save(store_file, &state.remembered_tree_positions);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -901,6 +921,11 @@ fn main() {
     state.sort_key = args.sort.into();
     apply_initial_files_sort(&mut state);
 
+    let tree_positions_file = spec_viewer::app::position_store::default_state_file();
+    if file_view_path.is_none() {
+        restore_saved_tree_position(&mut state, tree_positions_file.as_deref());
+    }
+
     if let Some(path) = &file_view_path {
         // The doc panel's own outer width for this state, not the raw
         // terminal width -- a two-panel layout's doc panel is narrower than
@@ -922,6 +947,8 @@ fn main() {
         &tx,
         &mut watch,
     );
+
+    save_tree_positions(&mut state, tree_positions_file.as_deref());
 
     drop(watch);
     if mouse_capture_enabled {
@@ -1334,6 +1361,49 @@ mod tests {
     }
 
     // --- spec-viewer-files-mode-sort: apply_initial_files_sort ------------
+
+    fn files_state_over(root: &Path) -> spec_viewer::app::AppState {
+        let mut tree = spec_viewer::spec::FsTree::scan(root);
+        tree.sort_entries(spec_viewer::spec::SortKey::Name);
+        spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(tree),
+            root.to_path_buf(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_cursor_saved_at_exit_is_restored_by_the_next_run_and_falls_back_when_its_file_is_gone() {
+        use spec_viewer::spec::NodeId;
+        let project = scratch_dir("persisted_cursor_project");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        fs::write(project.join("docs/a.md"), "# A\n").unwrap();
+        let store_file = scratch_dir("persisted_cursor_store").join("state/tree-positions.json");
+        let cursor = vec![NodeId::Dir(project.join("docs")), NodeId::File(project.join("docs/a.md"))];
+
+        let mut first_run = files_state_over(&project);
+        first_run.tree.open(vec![cursor[0].clone()]);
+        first_run.tree.select(cursor.clone());
+        save_tree_positions(&mut first_run, Some(&store_file));
+
+        let mut second_run = files_state_over(&project);
+        restore_saved_tree_position(&mut second_run, Some(&store_file));
+        assert_eq!(second_run.tree.selected(), cursor.as_slice());
+        assert!(matches!(second_run.doc, spec_viewer::app::DocView::Rendered { .. }));
+
+        fs::remove_file(project.join("docs/a.md")).unwrap();
+        fs::write(project.join("docs/b.md"), "# B\n").unwrap();
+        let mut third_run = files_state_over(&project);
+        restore_saved_tree_position(&mut third_run, Some(&store_file));
+        assert!(third_run.tree.selected().is_empty(), "a vanished file falls back to the default start");
+        assert!(matches!(third_run.doc, spec_viewer::app::DocView::Empty));
+
+        fs::remove_dir_all(&project).ok();
+        fs::remove_dir_all(store_file.parent().unwrap().parent().unwrap()).ok();
+    }
 
     #[test]
     fn apply_initial_files_sort_normalizes_kiro_only_sort_key_to_name() {

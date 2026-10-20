@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod keymap;
 pub mod loader;
 pub mod mouse;
+pub mod position_store;
 pub mod search;
 
 pub use clipboard::Clipboard;
@@ -15,6 +16,7 @@ use crate::markdown::Rendered;
 use crate::spec::{FsEntry, NodeId, SortKey, TreeSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tui_tree_widget::{TreeItem, TreeState};
@@ -310,6 +312,20 @@ pub struct AppState {
     /// `ui::tree_panel`'s `--all`-mode `Vec<TreeItem>` build cache (see
     /// [`FilesTreeItemCache`]). `None` until the first `Files`-mode render.
     pub files_tree_cache: Option<FilesTreeItemCache>,
+    /// Cursor and fold state of each tree last left by a mode switch, so
+    /// switching back to the same source kind over the same root restores
+    /// where the user was instead of starting from a blank tree.
+    pub remembered_tree_positions: HashMap<TreePositionKey, RememberedTreePosition>,
+}
+
+/// Which tree a remembered position belongs to: the source kind plus the
+/// disk root it was built from.
+pub type TreePositionKey = (crate::spec::TreeSourceKind, PathBuf);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RememberedTreePosition {
+    pub selected: Vec<NodeId>,
+    pub opened: Vec<Vec<NodeId>>,
 }
 
 /// A doc-panel text selection, in document `(line, col)` coordinates
@@ -383,6 +399,7 @@ impl AppState {
             auto_scroll: None,
             clipboard: Box::new(clipboard::Osc52),
             files_tree_cache: None,
+            remembered_tree_positions: HashMap::new(),
         }
     }
 }
@@ -520,11 +537,15 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
         // as `Control::SwitchMode`'s doc comment describes.
         Action::ToggleSourceMode => Control::SwitchMode,
         Action::ApplySourceSwitch { source, root, watch_status } => {
+            remember_tree_position(state);
             state.root = source;
             state.kiro_root = root;
-            // Requirement 1.6: fold/selection state keys off the old tree's
-            // `NodeId`s, which are meaningless against the new source.
+            // Fold/selection state keys off the old tree's `NodeId`s, which
+            // are meaningless against the new source -- unless this exact
+            // source kind and root was left earlier, in which case its own
+            // position is put back.
             state.tree = TreeState::default();
+            restore_tree_position(state);
             // Requirement 1.7: nothing is selected in the new tree yet, so
             // the doc panel has nothing left to show.
             state.doc = DocView::Empty;
@@ -553,6 +574,46 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             Control::Continue
         }
     }
+}
+
+fn tree_position_key(state: &AppState) -> TreePositionKey {
+    let stable_root = state.kiro_root.canonicalize().unwrap_or_else(|_| state.kiro_root.clone());
+    (state.root.kind(), stable_root)
+}
+
+/// Record where the cursor and folds are in the tree currently shown, under
+/// that tree's source kind and root.
+pub fn remember_tree_position(state: &mut AppState) {
+    let position = RememberedTreePosition {
+        selected: state.tree.selected().to_vec(),
+        opened: state.tree.get_all_opened(),
+    };
+    state.remembered_tree_positions.insert(tree_position_key(state), position);
+}
+
+/// Put back the position remembered for the tree currently shown. Nodes
+/// that no longer exist in the tree are skipped, so a stale record quietly
+/// leaves the default (blank) position instead of selecting nothing real.
+pub fn restore_tree_position(state: &mut AppState) {
+    let Some(position) = state.remembered_tree_positions.get(&tree_position_key(state)).cloned() else {
+        return;
+    };
+    let existing_paths: std::collections::HashSet<Vec<NodeId>> =
+        search::flatten_tree(&state.root).into_iter().map(|(path, _)| path).collect();
+    for opened in position.opened {
+        if existing_paths.contains(&opened) {
+            state.tree.open(opened);
+        }
+    }
+    if existing_paths.contains(&position.selected) {
+        state.tree.select(position.selected);
+    }
+}
+
+/// Load the doc for whatever the tree has selected -- for a position
+/// restored at startup, where no key press has loaded it yet.
+pub fn show_selected_doc(state: &mut AppState) {
+    state.doc = resolve_selection(&state.root, state.tree.selected(), doc_panel_width(state));
 }
 
 /// Requirement 2.1/2.2: open every folder-like node (`Spec`, `Dir` -- the
@@ -3724,6 +3785,93 @@ mod reducer_tests {
         assert_eq!(control, Control::SwitchMode);
         assert_eq!(state.tree.selected(), selected_before.as_slice());
         assert!(state.popup.is_none());
+    }
+
+    fn files_source_at(root: &str) -> TreeSource {
+        let sub = FsEntry {
+            path: PathBuf::from(root).join("sub"),
+            is_dir: true,
+            depth: 1,
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        TreeSource::Files(FsTree { root: PathBuf::from(root), entries: vec![sub] })
+    }
+
+    fn switch_to(state: &mut AppState, source: TreeSource, root: &str) {
+        update(
+            state,
+            Action::ApplySourceSwitch {
+                source,
+                root: PathBuf::from(root),
+                watch_status: WatchStatus::Manual { reason: "restarted".to_string() },
+            },
+        );
+    }
+
+    #[test]
+    fn round_trip_between_modes_restores_the_cursor_and_folds_left_behind() {
+        let mut state = test_state();
+        let spec_path = vec![NodeId::Spec("sample-signup".to_string())];
+        state.tree.open(spec_path.clone());
+        state.tree.select(spec_path.clone());
+        let kiro_root = state.kiro_root.clone();
+        let kiro_source = TreeSource::Kiro(spec::build(&loader::load_snapshot(&fixtures_root())));
+
+        switch_to(&mut state, files_source_at("/tmp/files-root"), "/tmp/files-root");
+        assert!(state.tree.selected().is_empty(), "first visit to files mode starts blank");
+        state.tree.select(vec![NodeId::Dir(PathBuf::from("/tmp/files-root/sub"))]);
+
+        switch_to(&mut state, kiro_source, kiro_root.to_str().unwrap());
+
+        assert_eq!(state.tree.selected(), spec_path.as_slice());
+        assert_eq!(state.tree.get_all_opened(), vec![spec_path]);
+        assert!(matches!(state.doc, DocView::Empty), "the doc panel still resets");
+
+        switch_to(&mut state, files_source_at("/tmp/files-root"), "/tmp/files-root");
+        assert_eq!(state.tree.selected(), [NodeId::Dir(PathBuf::from("/tmp/files-root/sub"))]);
+    }
+
+    #[test]
+    fn restore_skips_remembered_nodes_that_no_longer_exist_in_the_tree() {
+        let mut state = test_state();
+        let existing = vec![NodeId::Spec("sample-signup".to_string())];
+        let vanished = vec![NodeId::Spec("deleted-spec".to_string())];
+        state.remembered_tree_positions.insert(
+            tree_position_key(&state),
+            RememberedTreePosition { selected: vanished.clone(), opened: vec![existing.clone(), vanished] },
+        );
+
+        restore_tree_position(&mut state);
+
+        assert!(state.tree.selected().is_empty(), "a vanished selection falls back to the default");
+        assert_eq!(state.tree.get_all_opened(), vec![existing], "only still-existing folds are reopened");
+    }
+
+    #[test]
+    fn show_selected_doc_loads_the_document_of_a_restored_selection() {
+        let mut state = test_state();
+        let spec_path = vec![NodeId::Spec("sample-signup".to_string())];
+        state.remembered_tree_positions.insert(
+            tree_position_key(&state),
+            RememberedTreePosition { selected: spec_path.clone(), opened: vec![] },
+        );
+
+        restore_tree_position(&mut state);
+        show_selected_doc(&mut state);
+
+        assert_eq!(state.tree.selected(), spec_path.as_slice());
+        assert!(!matches!(state.doc, DocView::Empty));
+    }
+
+    #[test]
+    fn switching_to_a_different_root_of_the_same_kind_discards_the_old_cursor() {
+        let mut state = test_state();
+        switch_to(&mut state, files_source_at("/tmp/files-a"), "/tmp/files-a");
+        state.tree.select(vec![NodeId::Dir(PathBuf::from("/tmp/files-a/sub"))]);
+
+        switch_to(&mut state, files_source_at("/tmp/files-b"), "/tmp/files-b");
+
+        assert!(state.tree.selected().is_empty());
     }
 
     #[test]

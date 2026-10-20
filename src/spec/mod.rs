@@ -9,6 +9,7 @@ pub use meta::{parse_meta, Approval, DocKind, MetaError, SpecMeta};
 pub use progress::{count_progress, Progress};
 pub use sort::{sort_specs, SortKey};
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Locate the `.kiro` root directory starting from `start`.
@@ -184,7 +185,7 @@ pub enum DocStatus {
 
 /// Stable identifier for a tree node, used by the (later) `app`/`ui` layers
 /// to track selection/expansion across rebuilds.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeId {
     Spec(String),
     Doc(String, DocKind),
@@ -213,7 +214,25 @@ pub enum TreeSource {
     Files(FsTree),
 }
 
+/// Which kind of tree a [`TreeSource`] is, without the tree itself -- the
+/// part of a source's identity that is stable across runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeSourceKind {
+    Kiro,
+    SpecKit,
+    Files,
+}
+
 impl TreeSource {
+    pub fn kind(&self) -> TreeSourceKind {
+        match self {
+            TreeSource::Kiro(_) => TreeSourceKind::Kiro,
+            TreeSource::SpecKit(_) => TreeSourceKind::SpecKit,
+            TreeSource::Files(_) => TreeSourceKind::Files,
+        }
+    }
+
     /// `Some` only for `Kiro` -- a small accessor for the (still common)
     /// call sites that only make sense in `.kiro` mode, e.g. `Definition`
     /// lookups by spec name.

@@ -1012,11 +1012,11 @@ fn e2e_all_mode_sort_hotkey_cycles_name_and_updated_and_preserves_fold_and_selec
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).expect("initial draw");
 
-    // Requirement 3.1 / default order (Name): a.md, sub, z.md.
+    // Requirement 3.1 / default order (Name, folders first): sub, a.md, z.md.
     let rows = buffer_text(&terminal.backend().buffer().clone());
     assert!(rows.iter().any(|r| r.contains("Files [이름]")), "got:\n{rows:?}");
-    assert!(row_index(&rows, "a.md") < row_index(&rows, "sub"));
-    assert!(row_index(&rows, "sub") < row_index(&rows, "z.md"));
+    assert!(row_index(&rows, "sub") < row_index(&rows, "a.md"));
+    assert!(row_index(&rows, "a.md") < row_index(&rows, "z.md"));
 
     // Open "sub" and select "a.md" before cycling, to prove 2.1/2.2.
     state.tree.open(vec![NodeId::Dir(root.join("sub"))]);
@@ -1050,8 +1050,8 @@ fn e2e_all_mode_sort_hotkey_cycles_name_and_updated_and_preserves_fold_and_selec
     assert_eq!(control, Control::Continue);
     let rows = buffer_text(&terminal.backend().buffer().clone());
     assert!(rows.iter().any(|r| r.contains("Files [이름]")));
-    assert!(row_index(&rows, "a.md") < row_index(&rows, "sub"));
-    assert!(row_index(&rows, "sub") < row_index(&rows, "z.md"));
+    assert!(row_index(&rows, "sub") < row_index(&rows, "a.md"));
+    assert!(row_index(&rows, "a.md") < row_index(&rows, "z.md"));
     assert_eq!(state.tree.selected(), selected.as_slice());
 
     fs::remove_dir_all(&root).ok();

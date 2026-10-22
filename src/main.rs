@@ -811,6 +811,19 @@ fn apply_initial_files_sort(state: &mut spec_viewer::app::AppState) {
     }
 }
 
+/// Throw away keystrokes still queued when the viewer exits (a repeated or
+/// buffered `q`, trailing mouse reports), so they are not handed to the shell
+/// that gets the terminal back and printed at its prompt. Waits a few
+/// milliseconds for bytes still in flight from the terminal.
+fn discard_pending_input() {
+    const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+    while crossterm::event::poll(IN_FLIGHT_WAIT).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
+        }
+    }
+}
+
 /// Seed the in-memory position map from the previous run's store and put
 /// back the cursor for the tree shown at startup; a position pointing at
 /// nodes that no longer exist leaves the default blank start.
@@ -920,6 +933,7 @@ fn main() {
     // hotkey / a later resync.
     state.sort_key = args.sort.into();
     apply_initial_files_sort(&mut state);
+    state.launch_dir = start.clone();
 
     let tree_positions_file = spec_viewer::app::position_store::default_state_file();
     if file_view_path.is_none() {
@@ -954,6 +968,7 @@ fn main() {
     if mouse_capture_enabled {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     }
+    discard_pending_input();
     ratatui::restore();
 
     if let Err(e) = run_result {

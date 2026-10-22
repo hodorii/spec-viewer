@@ -246,6 +246,11 @@ pub struct AppState {
     /// `Action::Fs`/`Refresh` (requirements 7.3, 7.4, 7.5, 7.6; see
     /// `resync`).
     pub kiro_root: PathBuf,
+    /// The directory the viewer was launched for (the path argument, else
+    /// the working directory). Remembered cursor positions are scoped to it,
+    /// so launching from the same directory returns to the same place no
+    /// matter which `.kiro` root or scan root that launch resolved to.
+    pub launch_dir: PathBuf,
     pub tree_mode: TreeMode,
     pub tree_visible: bool,
     /// `TreeMode::Single` only (requirement 1.10): `false` shows the tree
@@ -319,7 +324,7 @@ pub struct AppState {
 }
 
 /// Which tree a remembered position belongs to: the source kind plus the
-/// disk root it was built from.
+/// directory the viewer was launched for.
 pub type TreePositionKey = (crate::spec::TreeSourceKind, PathBuf);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +382,7 @@ impl AppState {
     ) -> Self {
         AppState {
             root,
+            launch_dir: kiro_root.clone(),
             kiro_root,
             tree_mode,
             tree_visible,
@@ -577,8 +583,8 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
 }
 
 fn tree_position_key(state: &AppState) -> TreePositionKey {
-    let stable_root = state.kiro_root.canonicalize().unwrap_or_else(|_| state.kiro_root.clone());
-    (state.root.kind(), stable_root)
+    let stable_launch_dir = state.launch_dir.canonicalize().unwrap_or_else(|_| state.launch_dir.clone());
+    (state.root.kind(), stable_launch_dir)
 }
 
 /// Record where the cursor and folds are in the tree currently shown, under
@@ -3829,6 +3835,29 @@ mod reducer_tests {
 
         switch_to(&mut state, files_source_at("/tmp/files-root"), "/tmp/files-root");
         assert_eq!(state.tree.selected(), [NodeId::Dir(PathBuf::from("/tmp/files-root/sub"))]);
+    }
+
+    #[test]
+    fn remembered_position_follows_the_launch_directory_not_the_tree_root() {
+        let spec_path = vec![NodeId::Spec("sample-signup".to_string())];
+        let mut launched_from_project = test_state();
+        launched_from_project.launch_dir = PathBuf::from("/work/project");
+        launched_from_project.tree.select(spec_path.clone());
+        remember_tree_position(&mut launched_from_project);
+        let saved = launched_from_project.remembered_tree_positions.clone();
+
+        let mut same_launch_other_root = test_state();
+        same_launch_other_root.launch_dir = PathBuf::from("/work/project");
+        same_launch_other_root.kiro_root = PathBuf::from("/work/project/nested/.kiro");
+        same_launch_other_root.remembered_tree_positions = saved.clone();
+        restore_tree_position(&mut same_launch_other_root);
+        assert_eq!(same_launch_other_root.tree.selected(), spec_path.as_slice());
+
+        let mut other_launch_same_root = test_state();
+        other_launch_same_root.launch_dir = PathBuf::from("/work/elsewhere");
+        other_launch_same_root.remembered_tree_positions = saved;
+        restore_tree_position(&mut other_launch_same_root);
+        assert!(other_launch_same_root.tree.selected().is_empty());
     }
 
     #[test]

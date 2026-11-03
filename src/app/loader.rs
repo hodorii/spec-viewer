@@ -184,7 +184,8 @@ fn read_spec_files(dir: &Path) -> Vec<FileSnapshot> {
             continue;
         };
         let content = String::from_utf8_lossy(&bytes).into_owned();
-        out.push(FileSnapshot { name, path, content });
+        let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        out.push(FileSnapshot { name, path, content, modified });
     }
 
     out
@@ -270,6 +271,12 @@ pub fn format_modified(modified: SystemTime) -> String {
         .unwrap_or(0);
     let (y, mo, d, h, mi) = local_ymd_hms(secs);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// `modified`'s local calendar date as `YYYY-MM-DD` -- the date part of
+/// [`format_modified`], for places too narrow for the time of day.
+pub fn format_modified_date(modified: SystemTime) -> String {
+    format_modified(modified).chars().take(10).collect()
 }
 
 /// Local civil time for `secs` since the epoch: `localtime_r`'s answer on
@@ -865,6 +872,23 @@ mod tests {
             [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15].contains(&i)
                 == b.is_ascii_digit()
         }));
+    }
+
+    #[test]
+    fn format_modified_date_is_the_date_part_of_format_modified() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+        let full = format_modified(modified);
+
+        assert_eq!(format_modified_date(modified), &full[..10]);
+    }
+
+    #[test]
+    fn load_snapshot_records_each_spec_file_modified_time() {
+        let snapshot = load_snapshot(&fixtures_root());
+
+        let files = snapshot.specs.iter().flat_map(|spec| spec.files.iter());
+        assert!(files.clone().count() > 0);
+        assert!(files.into_iter().all(|file| file.modified.is_some()));
     }
 
     #[test]

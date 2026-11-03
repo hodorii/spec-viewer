@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::spec::progress::count_progress;
 use crate::spec::{DocEntry, DocKind, DocStatus, Milestone, Spec};
@@ -115,13 +116,19 @@ fn sorted_file_names(dir: &Path) -> Vec<String> {
 
 /// A plain existence-only `DocEntry` for one canonical (non-`tasks.md`) file.
 fn plain_doc_entry(dir: &Path, filename: &str) -> DocEntry {
+    let path = dir.join(filename);
     DocEntry {
         kind: DocKind::Other(filename.to_string()),
-        path: dir.join(filename),
+        modified: modified_of(&path),
+        path,
         exists: true,
         status: DocStatus::NotTracked,
         progress: None,
     }
+}
+
+fn modified_of(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// `tasks.md`'s `DocEntry`: the one exception to read-only existence checks
@@ -135,6 +142,7 @@ fn tasks_doc_entry(dir: &Path) -> DocEntry {
         .and_then(|content| count_progress(&content));
     DocEntry {
         kind: DocKind::Other("tasks.md".to_string()),
+        modified: modified_of(&path),
         path,
         exists: true,
         status: DocStatus::NotTracked,
@@ -160,9 +168,11 @@ fn build_feature(dir: &Path) -> Spec {
     let contracts_dir = dir.join("contracts");
     if contracts_dir.is_dir() {
         for filename in sorted_file_names(&contracts_dir) {
+            let path = contracts_dir.join(&filename);
             docs.push(DocEntry {
                 kind: DocKind::Other(format!("contracts/{filename}")),
-                path: contracts_dir.join(&filename),
+                modified: modified_of(&path),
+                path,
                 exists: true,
                 status: DocStatus::NotTracked,
                 progress: None,
@@ -239,6 +249,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn spec_kit_doc_entries_carry_the_modified_time_of_their_files() {
+        let tmp = TempDir::new("modified_time");
+        let feature = tmp.path().join("001-feature");
+        fs::create_dir_all(feature.join("contracts")).unwrap();
+        for relative in ["spec.md", "tasks.md", "notes.md", "contracts/api.md"] {
+            fs::write(feature.join(relative), "# x\n").unwrap();
+        }
+        let expected = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for relative in ["spec.md", "tasks.md", "notes.md", "contracts/api.md"] {
+            fs::File::open(feature.join(relative)).unwrap().set_modified(expected).unwrap();
+        }
+
+        let spec = build_feature(&feature);
+
+        assert_eq!(spec.docs.len(), 4);
+        assert!(spec.docs.iter().all(|doc| doc.modified == Some(expected)), "docs: {:?}", spec.docs.iter().map(|d| (d.path.clone(), d.modified)).collect::<Vec<_>>());
     }
 
     #[test]

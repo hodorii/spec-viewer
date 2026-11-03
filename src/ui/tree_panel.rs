@@ -477,6 +477,14 @@ fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -
         }
     }
 
+    if let Some(modified) = entry.modified {
+        let date_style = base_style.add_modifier(Modifier::DIM);
+        spans.push(Span::styled(
+            format!("  {}", crate::app::loader::format_modified_date(modified)),
+            highlight(date_style),
+        ));
+    }
+
     TreeItem::new_leaf(
         NodeId::Doc(spec_name.to_string(), entry.kind.clone()),
         Line::from(spans),
@@ -790,6 +798,7 @@ mod tests {
                 exists: true,
                 status: DocStatus::NotTracked,
                 progress: Some(Progress { done: 5, total: 5 }),
+                modified: None,
             }],
             definition: None,
         };
@@ -1061,6 +1070,7 @@ mod tests {
                 exists: true,
                 status: DocStatus::Approved,
                 progress: None,
+                modified: None,
             }],
             definition: None,
         };
@@ -1090,6 +1100,104 @@ mod tests {
 
         let (b_modifier, _) = cell_style_at(&buffer, "1/3");
         assert!(!b_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn doc_row_shows_the_last_modified_date_after_the_status_and_filename_only_when_known() {
+        let spec_with_docs = |name: &str, modified: Option<std::time::SystemTime>| Spec {
+            name: name.to_string(),
+            dir: PathBuf::from("/does/not/matter").join(name),
+            kiro_meta: None,
+            milestones: vec![],
+            warning: None,
+            docs: vec![DocEntry {
+                kind: DocKind::Design,
+                path: PathBuf::from("/does/not/matter/design.md"),
+                exists: modified.is_some(),
+                status: DocStatus::Approved,
+                progress: None,
+                modified,
+            }],
+            definition: None,
+        };
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+        let expected_date = crate::app::loader::format_modified_date(modified);
+        let root = SpecRoot {
+            specs: vec![spec_with_docs("dated", Some(modified)), spec_with_docs("undated", None)],
+            groups: Vec::new(),
+        };
+        let open = vec![
+            vec![NodeId::Spec("dated".to_string())],
+            vec![NodeId::Spec("undated".to_string())],
+        ];
+
+        let rows = buffer_text(&render_root(root, open));
+
+        let dated_row = rows.iter().find(|r| r.contains("design.md") && r.contains(&expected_date));
+        assert!(dated_row.is_some_and(|r| r.find("design.md") < r.find(&expected_date)), "got:\n{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("design.md")).count(),
+            2,
+            "both docs keep their rows"
+        );
+        assert_eq!(rows.iter().filter(|r| r.contains(&expected_date)).count(), 1, "an unknown date shows nothing");
+    }
+
+    #[test]
+    fn tasks_row_puts_the_dim_date_after_progress_and_search_highlight_covers_it() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+        let expected_date = crate::app::loader::format_modified_date(modified);
+        let spec = Spec {
+            name: "dated".to_string(),
+            dir: PathBuf::from("/does/not/matter/dated"),
+            kiro_meta: None,
+            milestones: vec![],
+            warning: None,
+            docs: vec![DocEntry {
+                kind: DocKind::Tasks,
+                path: PathBuf::from("/does/not/matter/tasks.md"),
+                exists: true,
+                status: DocStatus::Approved,
+                progress: Some(crate::spec::Progress { done: 2, total: 5 }),
+                modified: Some(modified),
+            }],
+            definition: None,
+        };
+        let spec_path = vec![NodeId::Spec("dated".to_string())];
+        let doc_path = vec![spec_path[0].clone(), NodeId::Doc("dated".to_string(), DocKind::Tasks)];
+
+        let buffer = render_root_with_matches(
+            SpecRoot { specs: vec![spec], groups: Vec::new() },
+            vec![spec_path],
+            std::slice::from_ref(&doc_path),
+        );
+
+        let rows = buffer_text(&buffer);
+        let row = rows.iter().find(|r| r.contains("tasks.md")).expect("tasks row");
+        assert!(row.find("2/5") < row.find(&expected_date), "date must follow progress, got {row:?}");
+        let (date_modifier, _) = cell_style_at(&buffer, &expected_date);
+        assert!(date_modifier.contains(Modifier::DIM), "the date is dimmed");
+        let (name_modifier, _) = cell_style_at(&buffer, "tasks.md");
+        assert!(!name_modifier.contains(Modifier::DIM), "the filename is not dimmed");
+        assert_eq!(cell_bg_at(&buffer, &expected_date), SEARCH_MATCH_BG, "search highlight covers the date");
+        assert_eq!(cell_bg_at(&buffer, "tasks.md"), SEARCH_MATCH_BG);
+    }
+
+    #[test]
+    fn spec_kit_doc_row_shows_the_last_modified_date() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+        let expected_date = crate::app::loader::format_modified_date(modified);
+        let mut doc = spec_kit_doc("spec.md");
+        doc.modified = Some(modified);
+        let feature = spec_kit_feature("001-dated", 1, 3, vec![doc, spec_kit_doc("plan.md")]);
+
+        let buffer = render_spec_kit_root(vec![feature], vec![vec![NodeId::Spec("001-dated".to_string())]]);
+
+        let rows = buffer_text(&buffer);
+        let spec_row = rows.iter().find(|r| r.contains("spec.md")).expect("spec.md row");
+        assert!(spec_row.find("spec.md") < spec_row.find(&expected_date), "got {spec_row:?}");
+        let plan_row = rows.iter().find(|r| r.contains("plan.md")).expect("plan.md row");
+        assert!(!plan_row.contains(&expected_date), "a doc without a known date shows none");
     }
 
     // --- spec-viewer-files-tree-scroll-latency ---------------------------
@@ -1275,6 +1383,7 @@ mod tests {
             exists: true,
             status: DocStatus::NotTracked,
             progress: None,
+            modified: None,
         }
     }
 

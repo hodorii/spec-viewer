@@ -3861,6 +3861,56 @@ mod reducer_tests {
     }
 
     #[test]
+    fn refresh_updates_a_doc_date_after_an_edit_and_clears_it_after_a_delete_without_writing_files() {
+        let kiro_root = std::env::temp_dir().join(format!("spec_viewer_doc_date_refresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&kiro_root);
+        let spec_dir = kiro_root.join("specs/dated");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("spec.json"), "{}").unwrap();
+        let design_file = spec_dir.join("design.md");
+        std::fs::write(&design_file, "# d\n").unwrap();
+        let set_modified = |secs: u64| {
+            std::fs::File::open(&design_file)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        let design_modified = |state: &AppState| match &state.root {
+            TreeSource::Kiro(root) => root.specs[0]
+                .docs
+                .iter()
+                .find(|doc| doc.kind == DocKind::Design)
+                .map(|doc| (doc.exists, doc.modified))
+                .unwrap(),
+            _ => panic!("expected a Kiro tree"),
+        };
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(&spec_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+            names.sort();
+            names
+        };
+
+        set_modified(1_700_000_000);
+        let root = spec::build(&loader::load_snapshot(&kiro_root));
+        let mut state = AppState::new(TreeSource::Kiro(root), kiro_root.clone(), (120, 40), WatchStatus::Live, TreeMode::Auto, true);
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(design_modified(&state), (true, at(1_700_000_000)));
+        let listing_before = listing();
+
+        set_modified(1_800_000_000);
+        update(&mut state, Action::Refresh);
+        assert_eq!(design_modified(&state), (true, at(1_800_000_000)), "an edit shows the new date");
+
+        std::fs::remove_file(&design_file).unwrap();
+        update(&mut state, Action::Refresh);
+        assert_eq!(design_modified(&state), (false, None), "a deleted doc loses its date");
+
+        std::fs::write(&design_file, "# d\n").unwrap();
+        assert_eq!(listing(), listing_before, "refreshing never adds or removes files");
+        std::fs::remove_dir_all(&kiro_root).ok();
+    }
+
+    #[test]
     fn restore_skips_remembered_nodes_that_no_longer_exist_in_the_tree() {
         let mut state = test_state();
         let existing = vec![NodeId::Spec("sample-signup".to_string())];

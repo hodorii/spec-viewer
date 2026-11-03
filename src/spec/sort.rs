@@ -165,6 +165,7 @@ mod tests {
                 exists: true,
                 status: DocStatus::NotTracked,
                 progress: progress.map(|(done, total)| Progress { done, total }),
+                modified: None,
             }],
             definition: None,
         }

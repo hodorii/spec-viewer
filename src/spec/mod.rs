@@ -11,6 +11,7 @@ pub use sort::{sort_specs, SortKey};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Locate the `.kiro` root directory starting from `start`.
 ///
@@ -84,6 +85,7 @@ pub struct FileSnapshot {
     pub name: String,
     pub path: PathBuf,
     pub content: String,
+    pub modified: Option<SystemTime>,
 }
 
 /// The fully assembled domain model: every spec under `.kiro/specs/` plus
@@ -169,6 +171,9 @@ pub struct DocEntry {
     pub exists: bool,
     pub status: DocStatus,
     pub progress: Option<Progress>,
+    /// Last-modified time of the document file; `None` when it does not
+    /// exist or its timestamp cannot be read.
+    pub modified: Option<SystemTime>,
 }
 
 /// Approval/tracking status of a single document node (requirements 3.2,
@@ -316,6 +321,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
         exists: first_file.is_some(),
         status: first_status,
         progress: None,
+        modified: first_file.and_then(|f| f.modified),
     });
 
     let definition = first_file.and_then(|f| definition(&f.content));
@@ -329,6 +335,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
         exists: biz_process_file.is_some(),
         status: biz_process_status,
         progress: None,
+        modified: biz_process_file.and_then(|f| f.modified),
     });
 
     // Slot 3: Design (always emitted).
@@ -340,6 +347,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
         exists: design_file.is_some(),
         status: design_status,
         progress: None,
+        modified: design_file.and_then(|f| f.modified),
     });
 
     // Slot 4: Tasks (always emitted; carries the only real `progress`).
@@ -351,6 +359,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
         exists: tasks_file.is_some(),
         status: tasks_status,
         progress: tasks_file.and_then(|f| count_progress(&f.content)),
+        modified: tasks_file.and_then(|f| f.modified),
     });
 
     // Slot 5: Research — only emitted if research.md actually exists.
@@ -361,6 +370,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
             exists: true,
             status: DocStatus::NotTracked,
             progress: None,
+            modified: find_file(&sd.files, "research.md").and_then(|f| f.modified),
         });
     }
 
@@ -378,6 +388,7 @@ fn build_spec(sd: &SpecDirSnapshot) -> Spec {
             exists: true,
             status: DocStatus::NotTracked,
             progress: None,
+            modified: f.modified,
         });
     }
 
@@ -639,6 +650,7 @@ mod build_tests {
             name,
             path: path.to_path_buf(),
             content,
+            modified: None,
         }
     }
 
@@ -940,6 +952,7 @@ mod milestone_tests {
                 name: "spec.json".to_string(),
                 path: PathBuf::from("/does/not/matter/spec.json"),
                 content: json.to_string(),
+                modified: None,
             }],
         }
     }
@@ -953,6 +966,41 @@ mod milestone_tests {
             "tasks": {"generated": true, "approved": true}
         }
     }"#;
+
+    #[test]
+    fn build_carries_each_file_modified_time_to_its_doc_entry_and_leaves_missing_docs_empty() {
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let file = |name: &str, modified: Option<SystemTime>| FileSnapshot {
+            name: name.to_string(),
+            path: PathBuf::from("/does/not/matter").join(name),
+            content: String::new(),
+            modified,
+        };
+        let snapshot = DirSnapshot {
+            specs: vec![SpecDirSnapshot {
+                name: "dated".to_string(),
+                dir: PathBuf::from("/does/not/matter"),
+                files: vec![
+                    file("requirements.md", at(100)),
+                    file("design.md", at(200)),
+                    file("research.md", at(300)),
+                    file("notes.md", at(400)),
+                ],
+            }],
+            groups: Vec::new(),
+        };
+
+        let root = build(&snapshot);
+
+        let docs = &root.specs[0].docs;
+        let modified_of = |kind: DocKind| docs.iter().find(|d| d.kind == kind).expect("doc slot").modified;
+        assert_eq!(modified_of(DocKind::Requirements), at(100));
+        assert_eq!(modified_of(DocKind::Design), at(200));
+        assert_eq!(modified_of(DocKind::Research), at(300));
+        assert_eq!(modified_of(DocKind::Other("notes.md".to_string())), at(400));
+        assert_eq!(modified_of(DocKind::BizProcess), None, "an absent doc has no date");
+        assert_eq!(modified_of(DocKind::Tasks), None, "an absent doc has no date");
+    }
 
     #[test]
     fn all_gates_approved_but_not_completed_phase_yields_four_of_four() {

@@ -23,6 +23,11 @@ use crate::spec::{
     SortKey, Spec, SpecRoot, TreeSource,
 };
 
+/// Columns a document row loses to the panel border (2), the tree indent
+/// of one level (2) and its fold marker (2) -- what is left of the panel's
+/// outer width is what the row's own text may use.
+const DOC_ROW_CHROME_WIDTH: usize = 6;
+
 /// Style patched onto a search-matched node's label (requirement 2.10;
 /// same "Yellow bg" convention `doc_panel`'s own search highlight uses for
 /// a non-current match -- the *current* match additionally sits under the
@@ -81,10 +86,11 @@ fn render_kiro(
     sort_key: SortKey,
     search_matches: &[Vec<NodeId>],
 ) {
+    let panel_width = area.width;
     let mut items: Vec<TreeItem<'static, NodeId>> = root
         .specs
         .iter()
-        .map(|spec| spec_item(spec, search_matches))
+        .map(|spec| spec_item(spec, search_matches, panel_width))
         .collect();
     // Groups placed last, after every spec node, in the order
     // `app::loader::load_snapshot` already sorted them into (requirement
@@ -117,9 +123,10 @@ fn render_spec_kit(
     tree_state: &mut TreeState<NodeId>,
     search_matches: &[Vec<NodeId>],
 ) {
+    let panel_width = area.width;
     let items: Vec<TreeItem<'static, NodeId>> = features
         .iter()
-        .map(|spec| feature_item(spec, search_matches))
+        .map(|spec| feature_item(spec, search_matches, panel_width))
         .collect();
 
     let tree = Tree::new(&items)
@@ -343,7 +350,7 @@ fn milestone_badge_spans(
 }
 
 /// Build the `TreeItem` for one spec node and its document children.
-fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
+fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>], panel_width: u16) -> TreeItem<'static, NodeId> {
     let own_path = vec![NodeId::Spec(spec.name.clone())];
     let highlighted = is_search_match(&own_path, search_matches);
     let highlight = |style: Style| {
@@ -360,7 +367,7 @@ fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, N
     let children: Vec<TreeItem<'static, NodeId>> = spec
         .docs
         .iter()
-        .map(|entry| doc_item(&spec.name, entry, search_matches))
+        .map(|entry| doc_item(&spec.name, entry, search_matches, panel_width))
         .collect();
 
     TreeItem::new(NodeId::Spec(spec.name.clone()), Line::from(spans), children)
@@ -379,7 +386,7 @@ fn spec_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, N
 /// whole run (`AppState.root` is fixed at startup and only ever rebuilt as
 /// the same variant on refresh -- see `app::mod::resync`), so `.kiro` and
 /// spec-kit node ids never coexist and can never collide.
-fn feature_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
+fn feature_item(spec: &Spec, search_matches: &[Vec<NodeId>], panel_width: u16) -> TreeItem<'static, NodeId> {
     let own_path = vec![NodeId::Spec(spec.name.clone())];
     let highlighted = is_search_match(&own_path, search_matches);
     let highlight = |style: Style| {
@@ -396,7 +403,7 @@ fn feature_item(spec: &Spec, search_matches: &[Vec<NodeId>]) -> TreeItem<'static
     let children: Vec<TreeItem<'static, NodeId>> = spec
         .docs
         .iter()
-        .map(|entry| doc_item(&spec.name, entry, search_matches))
+        .map(|entry| doc_item(&spec.name, entry, search_matches, panel_width))
         .collect();
 
     TreeItem::new(NodeId::Spec(spec.name.clone()), Line::from(spans), children)
@@ -429,7 +436,12 @@ fn doc_filename(kind: &DocKind) -> String {
 }
 
 /// Build the `TreeItem` for one document node.
-fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -> TreeItem<'static, NodeId> {
+fn doc_item(
+    spec_name: &str,
+    entry: &DocEntry,
+    search_matches: &[Vec<NodeId>],
+    panel_width: u16,
+) -> TreeItem<'static, NodeId> {
     let symbol = status_symbol(entry.status);
     let filename = doc_filename(&entry.kind);
 
@@ -479,10 +491,15 @@ fn doc_item(spec_name: &str, entry: &DocEntry, search_matches: &[Vec<NodeId>]) -
 
     if let Some(modified) = entry.modified {
         let date_style = base_style.add_modifier(Modifier::DIM);
-        spans.push(Span::styled(
-            format!("  {}", crate::app::loader::format_modified_date(modified)),
-            highlight(date_style),
-        ));
+        let with_time = format!("  {}", crate::app::loader::format_modified_timestamp(modified));
+        let row_width_with_time = Line::from(spans.clone()).width() + with_time.chars().count();
+        let fits_with_time = row_width_with_time + DOC_ROW_CHROME_WIDTH <= usize::from(panel_width);
+        let text = if fits_with_time {
+            with_time
+        } else {
+            format!("  {}", crate::app::loader::format_modified_date(modified))
+        };
+        spans.push(Span::styled(text, highlight(date_style)));
     }
 
     TreeItem::new_leaf(
@@ -1198,6 +1215,53 @@ mod tests {
         assert!(spec_row.find("spec.md") < spec_row.find(&expected_date), "got {spec_row:?}");
         let plan_row = rows.iter().find(|r| r.contains("plan.md")).expect("plan.md row");
         assert!(!plan_row.contains(&expected_date), "a doc without a known date shows none");
+    }
+
+    #[test]
+    fn doc_row_shows_the_time_of_day_only_when_the_whole_row_fits_the_tree_panel() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080 + 7);
+        let stamp = crate::app::loader::format_modified_timestamp(modified);
+        let (date, time_of_day) = stamp.split_at(10);
+        let spec = || Spec {
+            name: "dated".to_string(),
+            dir: PathBuf::from("/does/not/matter/dated"),
+            kiro_meta: None,
+            milestones: vec![],
+            warning: None,
+            docs: vec![DocEntry {
+                kind: DocKind::Requirements,
+                path: PathBuf::from("/does/not/matter/requirements.md"),
+                exists: true,
+                status: DocStatus::Approved,
+                progress: None,
+                modified: Some(modified),
+            }],
+            definition: None,
+        };
+        let render_at_width = |width: u16| {
+            let backend = TestBackend::new(width, 10);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut tree_state: TreeState<NodeId> = TreeState::default();
+            tree_state.open(vec![NodeId::Spec("dated".to_string())]);
+            let source = TreeSource::Kiro(SpecRoot { specs: vec![spec()], groups: Vec::new() });
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render(frame, area, &source, &mut tree_state, SortKey::Name, &[], &mut None);
+                })
+                .expect("draw");
+            buffer_text(terminal.backend().buffer())
+        };
+        let row_of = |rows: &[String]| rows.iter().find(|r| r.contains("requirements.md")).cloned().expect("row");
+
+        let wide = row_of(&render_at_width(44));
+        assert!(wide.contains(&stamp), "44 columns shows date and time, got {wide:?}");
+        assert!(wide.find(date) < wide.find(time_of_day.trim()), "time follows the date, got {wide:?}");
+
+        let narrow = row_of(&render_at_width(43));
+        assert!(narrow.contains(date), "43 columns still shows the date, got {narrow:?}");
+        assert!(narrow.trim_end_matches(|c: char| c == ' ' || c == '│').ends_with(date), "43 columns ends the row at the date, not a clipped time, got {narrow:?}");
+        assert!(narrow.contains("requirements.md"), "the name is never cut, got {narrow:?}");
     }
 
     // --- spec-viewer-files-tree-scroll-latency ---------------------------

@@ -279,6 +279,17 @@ pub fn format_modified_date(modified: SystemTime) -> String {
     format_modified(modified).chars().take(10).collect()
 }
 
+/// `modified` as `YYYY-MM-DD HH:MM:SS` in the local timezone. The seconds
+/// are the UTC seconds: every timezone offset is a whole number of minutes,
+/// so the second hand reads the same everywhere.
+pub fn format_modified_timestamp(modified: SystemTime) -> String {
+    let secs = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}:{:02}", format_modified(modified), secs % 60)
+}
+
 /// Local civil time for `secs` since the epoch: `localtime_r`'s answer on
 /// unix, the UTC conversion below otherwise (or on any libc failure).
 #[cfg(unix)]
@@ -880,6 +891,18 @@ mod tests {
         let full = format_modified(modified);
 
         assert_eq!(format_modified_date(modified), &full[..10]);
+    }
+
+    #[test]
+    fn format_modified_timestamp_appends_two_digit_seconds_to_the_minute_precision_string() {
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+
+        for seconds in [0u64, 7, 59] {
+            let stamp = format_modified_timestamp(base + std::time::Duration::from_secs(seconds));
+            assert_eq!(&stamp[..16], format_modified(base), "got {stamp:?}");
+            assert_eq!(stamp.len(), 19, "got {stamp:?}");
+            assert_eq!(&stamp[16..], format!(":{seconds:02}"), "got {stamp:?}");
+        }
     }
 
     #[test]

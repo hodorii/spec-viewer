@@ -1,9 +1,9 @@
 {
   "feature_name": "spec-viewer-doc-modified-date",
   "created_at": "2026-11-03T15:22:58Z",
-  "updated_at": "2026-11-03T15:43:51Z",
+  "updated_at": "2026-11-05T00:00:00Z",
   "language": "ko",
-  "phase": "tasks-generated",
+  "phase": "completed",
   "approvals": {
     "requirements": {
       "generated": true,

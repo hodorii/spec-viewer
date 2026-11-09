@@ -1,8 +1,10 @@
 pub mod clipboard;
+pub mod doc_cache;
 pub mod keymap;
 pub mod loader;
 pub mod mouse;
 pub mod position_store;
+pub mod rescan;
 pub mod search;
 
 pub use clipboard::Clipboard;
@@ -98,6 +100,7 @@ pub fn doc_panel_width(state: &AppState) -> u16 {
 /// transition (task 5.4) applied to already-displayed content when a live
 /// file-delete event arrives. It is included here because design.md's
 /// `app::DocView` type declares it for that later task to use.
+#[derive(Clone)]
 pub enum DocView {
     Empty,
     Rendered { path: PathBuf, r: Rendered, meta: FileInfo },
@@ -234,6 +237,13 @@ pub enum Popup {
     Message(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RescanMode {
+    #[default]
+    Sync,
+    Background,
+}
+
 /// The single application state struct threaded through `update` (design.md
 /// "app — State & Reducer").
 pub struct AppState {
@@ -269,6 +279,10 @@ pub struct AppState {
     /// `cycle_sort`/`resync`, the only two places that keep the two in
     /// sync at runtime).
     pub sort_key: SortKey,
+    /// `Sync` rescans inside `update` (what every test relies on);
+    /// `Background` hands the scan to `rescan` and keeps input responsive.
+    pub rescan_mode: RescanMode,
+    pub rescan: rescan::RescanCoordinator,
     pub focus: Panel,
     pub doc: DocView,
     pub scroll: usize,
@@ -321,6 +335,9 @@ pub struct AppState {
     /// switching back to the same source kind over the same root restores
     /// where the user was instead of starting from a blank tree.
     pub remembered_tree_positions: HashMap<TreePositionKey, RememberedTreePosition>,
+    /// Rendered documents reused when the same file is selected again.
+    /// Refresh and resize reloads bypass it so they always show the latest.
+    pub doc_cache: doc_cache::DocCache,
 }
 
 /// Which tree a remembered position belongs to: the source kind plus the
@@ -389,6 +406,8 @@ impl AppState {
             doc_focus: false,
             tree: TreeState::default(),
             sort_key: SortKey::default(),
+            rescan_mode: RescanMode::Sync,
+            rescan: rescan::RescanCoordinator::default(),
             focus: Panel::Tree,
             doc: DocView::Empty,
             scroll: 0,
@@ -406,6 +425,7 @@ impl AppState {
             clipboard: Box::new(clipboard::Osc52),
             files_tree_cache: None,
             remembered_tree_positions: HashMap::new(),
+            doc_cache: doc_cache::DocCache::default(),
         }
     }
 }
@@ -499,18 +519,20 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             resize_and_preserve_position(state, w, h);
             Control::Continue
         }
-        Action::Fs(_) => {
-            // Debounce/selective diffing is explicitly out of scope (design.md
-            // "watch — FsWatcher"): any change under `.kiro` triggers one full
-            // resync rather than inspecting which paths changed.
-            resync(state);
+        Action::Fs(event) => {
+            // Only a plain edit of the one open document can skip the tree
+            // scan; everything else may have changed structure or badges.
+            match is_partial_refresh_target(state, &event.paths) {
+                Some(path) if refresh_open_doc_only(state, &path) => {}
+                _ => request_rescan(state),
+            }
             Control::Continue
         }
         Action::Refresh => {
             // Manual refresh (requirement 7.6) — same full resync as a live
             // Fs event, dispatched here for anything that sends the `Action`
             // directly rather than going through the `r`-key binding.
-            resync(state);
+            request_rescan(state);
             Control::Continue
         }
         Action::ToggleTree => {
@@ -544,6 +566,8 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
         Action::ToggleSourceMode => Control::SwitchMode,
         Action::ApplySourceSwitch { source, root, watch_status } => {
             remember_tree_position(state);
+            // A scan started against the old root must never land on the new one.
+            state.rescan.invalidate();
             state.root = source;
             state.kiro_root = root;
             // Fold/selection state keys off the old tree's `NodeId`s, which
@@ -619,7 +643,8 @@ pub fn restore_tree_position(state: &mut AppState) {
 /// Load the doc for whatever the tree has selected -- for a position
 /// restored at startup, where no key press has loaded it yet.
 pub fn show_selected_doc(state: &mut AppState) {
-    state.doc = resolve_selection(&state.root, state.tree.selected(), doc_panel_width(state));
+    let width = doc_panel_width(state);
+    state.doc = resolve_selection(&state.root, state.tree.selected(), width, &mut state.doc_cache);
 }
 
 /// Requirement 2.1/2.2: open every folder-like node (`Spec`, `Dir` -- the
@@ -1305,7 +1330,7 @@ fn jump_heading(state: &mut AppState, forward: bool) {
 fn load_selected_doc(state: &mut AppState) {
     let path = state.tree.selected().to_vec();
     let width = doc_panel_width(state);
-    state.doc = resolve_selection(&state.root, &path, width);
+    state.doc = resolve_selection(&state.root, &path, width, &mut state.doc_cache);
     state.scroll = 0;
     search::clear_search(state);
 
@@ -1345,7 +1370,12 @@ fn load_selected_doc(state: &mut AppState) {
 /// source. `NodeId::File` under `TreeSource::SpecKit` still can't happen in
 /// practice (spec-kit has no group concept) but still resolves to `Empty`
 /// rather than panic.
-fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView {
+fn resolve_selection(
+    root: &TreeSource,
+    path: &[NodeId],
+    width: u16,
+    doc_cache: &mut doc_cache::DocCache,
+) -> DocView {
     match (root, path.last()) {
         (_, None) => DocView::Empty,
         (TreeSource::Kiro(root), Some(NodeId::Spec(name))) => {
@@ -1356,7 +1386,9 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
         }
         (TreeSource::Kiro(root), Some(NodeId::Doc(name, kind))) => {
             match root.specs.iter().find(|s| &s.name == name) {
-                Some(spec) => loader::load_for_selection(spec, Some(kind), width),
+                Some(spec) => loader::load_for_selection_with(spec, Some(kind), width, |path, width| {
+                    doc_cache.load(path, width)
+                }),
                 None => DocView::Empty,
             }
         }
@@ -1365,7 +1397,7 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
         // root/subfolders (there is no separate "group root" node kind).
         (_, Some(NodeId::Dir(_))) => DocView::Empty,
         (TreeSource::Files(_), Some(NodeId::File(path)))
-        | (TreeSource::Kiro(_), Some(NodeId::File(path))) => loader::load_doc(path, width),
+        | (TreeSource::Kiro(_), Some(NodeId::File(path))) => doc_cache.load(path, width),
         // spec-kit reuses the same `NodeId::Spec`/`NodeId::Doc` kinds as
         // `.kiro` (task 3.2), and `Spec`/`DocEntry` are the shared domain
         // types, so this mirrors the `TreeSource::Kiro` arms above exactly,
@@ -1378,7 +1410,9 @@ fn resolve_selection(root: &TreeSource, path: &[NodeId], width: u16) -> DocView 
         }
         (TreeSource::SpecKit(features), Some(NodeId::Doc(name, kind))) => {
             match features.iter().find(|s| &s.name == name) {
-                Some(spec) => loader::load_for_selection(spec, Some(kind), width),
+                Some(spec) => loader::load_for_selection_with(spec, Some(kind), width, |path, width| {
+                    doc_cache.load(path, width)
+                }),
                 None => DocView::Empty,
             }
         }
@@ -1423,6 +1457,37 @@ fn reload_current_doc(state: &AppState, width: u16) -> Option<DocView> {
     }
 }
 
+/// Scan `root` from disk into a freshly built tree of `kind`, already
+/// sorted by `sort_key`. Shared by the synchronous `resync` and the
+/// background rescan worker so both always produce the same tree.
+pub(crate) fn scan_tree_source(
+    kind: crate::spec::TreeSourceKind,
+    root: &Path,
+    sort_key: SortKey,
+) -> TreeSource {
+    use crate::spec::TreeSourceKind;
+    let mut tree = match kind {
+        TreeSourceKind::Kiro => {
+            TreeSource::Kiro(crate::spec::build(&loader::load_snapshot(root)))
+        }
+        TreeSourceKind::Files => TreeSource::Files(crate::spec::FsTree::scan(root)),
+        TreeSourceKind::SpecKit => TreeSource::SpecKit(crate::spec::spec_kit::build(root)),
+    };
+    sort_tree_source(&mut tree, sort_key);
+    tree
+}
+
+/// A rebuild starts back at the scanner's own order, so the sort the user
+/// had active must be re-applied or a live file change would silently reset
+/// it. spec-kit has no sort.
+fn sort_tree_source(tree: &mut TreeSource, sort_key: SortKey) {
+    match tree {
+        TreeSource::Kiro(spec_root) => crate::spec::sort_specs(&mut spec_root.specs, sort_key),
+        TreeSource::Files(files) => files.sort_entries(sort_key),
+        TreeSource::SpecKit(_) => {}
+    }
+}
+
 /// Re-read `state.kiro_root` from disk and rebuild `state.root` in place
 /// (requirements 7.3, 7.4: metadata/structure changes are picked up on any
 /// `Action::Fs`/`Action::Refresh`), the same way for every `TreeSource`
@@ -1435,31 +1500,40 @@ fn reload_current_doc(state: &AppState, width: u16) -> Option<DocView> {
 /// root (set by `main::resolve_source`, task 4) -- the same field `.kiro`
 /// mode stores its own root in, just pointing at a different directory.
 fn resync(state: &mut AppState) {
-    state.root = match &state.root {
-        TreeSource::Kiro(_) => {
-            let snapshot = loader::load_snapshot(&state.kiro_root);
-            let mut root = crate::spec::build(&snapshot);
-            // Requirement 2.9: a rebuild from disk starts back at
-            // `spec::build`'s own (filesystem-order) ordering -- re-apply
-            // whatever sort the user had active so a live file change
-            // (7.1-7.4) doesn't silently reset it.
-            crate::spec::sort_specs(&mut root.specs, state.sort_key);
-            TreeSource::Kiro(root)
-        }
-        TreeSource::Files(_) => {
-            let mut tree = crate::spec::FsTree::scan(&state.kiro_root);
-            // spec-viewer-files-mode-sort requirement 2.3: a rebuild from
-            // disk starts back at `scan`'s own (path-order) ordering --
-            // re-apply whatever sort the user had active, mirroring the
-            // `Kiro` branch above.
-            tree.sort_entries(state.sort_key);
-            TreeSource::Files(tree)
-        }
-        TreeSource::SpecKit(_) => {
-            TreeSource::SpecKit(crate::spec::spec_kit::build(&state.kiro_root))
-        }
-    };
+    let tree = scan_tree_source(state.root.kind(), &state.kiro_root, state.sort_key);
+    apply_rescan_result(state, tree);
+}
+
+/// Either rescan right now (`Sync`) or queue the scan and return at once
+/// (`Background`) so key presses are not held up by a slow disk walk.
+fn request_rescan(state: &mut AppState) {
+    match state.rescan_mode {
+        RescanMode::Sync => resync(state),
+        RescanMode::Background => state.rescan.request(rescan::RescanRequest {
+            kind: state.root.kind(),
+            root: state.kiro_root.clone(),
+            sort_key: state.sort_key,
+        }),
+    }
+}
+
+/// Install a freshly scanned tree. The sort is re-applied with the key active
+/// *now*, because the user may have cycled it while the scan was running.
+pub fn apply_rescan_result(state: &mut AppState, mut tree: TreeSource) {
+    sort_tree_source(&mut tree, state.sort_key);
+    state.root = tree;
     refresh_current_doc(state);
+}
+
+/// Pick up a finished background scan. Returns whether the screen changed.
+pub fn poll_rescan(state: &mut AppState) -> bool {
+    match state.rescan.poll() {
+        Some(tree) => {
+            apply_rescan_result(state, tree);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Re-resolve whatever is currently selected against the freshly rebuilt
@@ -1486,12 +1560,96 @@ fn refresh_current_doc(state: &mut AppState) {
         state.doc = new_view;
     }
 
-    // Requirement 7.2: preserve scroll position; if the document shrank,
-    // land on its new last line instead of out of bounds. Meaningless for
-    // non-Rendered/Definition views (`rendered_of` returns None), left as-is.
+    clamp_scroll_into_doc(state);
+}
+
+/// Preserve scroll position; if the document shrank, land on
+/// its new last line instead of out of bounds. Meaningless for
+/// non-Rendered/Definition views (`rendered_of` returns None), left as-is.
+fn clamp_scroll_into_doc(state: &mut AppState) {
     if let Some(r) = rendered_of(&state.doc) {
         let max = r.plain.len().saturating_sub(1);
         state.scroll = state.scroll.min(max);
+    }
+}
+
+/// Files whose edits change badges or progress, so the tree must be rescanned.
+const FULL_RESCAN_FILE_NAMES: [&str; 2] = ["spec.json", "tasks.md"];
+
+fn is_same_file(changed: &Path, open: &Path) -> bool {
+    // The watcher reports canonical paths while the tree may hold the
+    // spelling it was scanned with.
+    changed == open
+        || matches!((changed.canonicalize(), open.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The open document's path when a change event touches only that one plain
+/// rendered document and nothing but its own row could be affected.
+pub fn is_partial_refresh_target(state: &AppState, paths: &[PathBuf]) -> Option<PathBuf> {
+    let DocView::Rendered { path: open_path, .. } = &state.doc else {
+        return None;
+    };
+    if paths.is_empty() || !paths.iter().all(|changed| is_same_file(changed, open_path)) {
+        return None;
+    }
+    let name = open_path.file_name().and_then(|name| name.to_str())?;
+    if FULL_RESCAN_FILE_NAMES.contains(&name) || !open_path.exists() {
+        return None;
+    }
+    Some(open_path.clone())
+}
+
+/// Re-read just `path` and patch its tree row's date. Returns false, leaving
+/// the state untouched, when that cannot be done so the caller rescans.
+fn refresh_open_doc_only(state: &mut AppState, path: &Path) -> bool {
+    let fresh = loader::load_doc(path, doc_panel_width(state));
+    let DocView::Rendered { meta, .. } = &fresh else {
+        return false;
+    };
+    if !patch_tree_modified(&mut state.root, path, meta.modified) {
+        return false;
+    }
+    state.doc_cache.invalidate(path);
+    state.doc = fresh;
+    clamp_scroll_into_doc(state);
+    true
+}
+
+fn patch_fs_entry_modified(tree: &mut crate::spec::FsTree, path: &Path, modified: SystemTime) -> bool {
+    match tree.entries.iter_mut().find(|entry| entry.path == path) {
+        Some(entry) => {
+            entry.modified = modified;
+            true
+        }
+        None => false,
+    }
+}
+
+fn patch_spec_doc_modified(specs: &mut [crate::spec::Spec], path: &Path, modified: SystemTime) -> bool {
+    let doc = specs
+        .iter_mut()
+        .flat_map(|spec| spec.docs.iter_mut())
+        .find(|doc| doc.path == path);
+    match doc {
+        Some(doc) => {
+            doc.modified = Some(modified);
+            true
+        }
+        None => false,
+    }
+}
+
+fn patch_tree_modified(root: &mut TreeSource, path: &Path, modified: SystemTime) -> bool {
+    match root {
+        TreeSource::Files(tree) => patch_fs_entry_modified(tree, path, modified),
+        TreeSource::SpecKit(specs) => patch_spec_doc_modified(specs, path, modified),
+        TreeSource::Kiro(spec_root) => {
+            patch_spec_doc_modified(&mut spec_root.specs, path, modified)
+                || spec_root
+                    .groups
+                    .iter_mut()
+                    .any(|group| patch_fs_entry_modified(&mut group.tree, path, modified))
+        }
     }
 }
 
@@ -1556,6 +1714,7 @@ mod reducer_tests {
     use crate::spec::{self, DocKind, FsTree};
     use crossterm::event::KeyModifiers;
     use std::fs;
+    use std::sync::Arc;
     use std::path::{Path, PathBuf};
 
     fn fixtures_root() -> PathBuf {
@@ -3133,6 +3292,41 @@ mod reducer_tests {
     }
 
     #[test]
+    fn reselecting_the_same_doc_after_moving_away_does_not_read_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = temp_kiro_root("reselect_reads");
+        write_spec(&root, "alpha", "requirements", "# Alpha\n");
+        write_spec(&root, "beta", "requirements", "# Beta\n");
+        let mut state = build_state_from(&root, (120, 40));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        state.doc_cache = doc_cache::DocCache::with_reader(Box::new(move |path, width| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            loader::load_doc(path, width)
+        }));
+        let select_requirements = |state: &mut AppState, name: &str| {
+            state.tree.select(vec![
+                NodeId::Spec(name.to_string()),
+                NodeId::Doc(name.to_string(), DocKind::Requirements),
+            ]);
+            key_action(state, KeyCode::Enter);
+        };
+
+        select_requirements(&mut state, "alpha");
+        select_requirements(&mut state, "beta");
+        let reads_before_return = reads.load(Ordering::SeqCst);
+        select_requirements(&mut state, "alpha");
+
+        assert_eq!(reads_before_return, 2);
+        assert_eq!(reads.load(Ordering::SeqCst), reads_before_return);
+        assert!(matches!(state.doc, DocView::Rendered { .. }));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn resolve_selection_spec_kit_doc_returns_rendered_view() {
         let specs_dir = temp_spec_kit_specs_dir("doc_selection");
         write_spec_kit_feature(&specs_dir, "001-login", "# Login Spec\n\nbody text\n");
@@ -4094,5 +4288,534 @@ mod reducer_tests {
         assert!(state.tree.opened().is_empty());
         assert_eq!(update(&mut state, Action::CollapseAll), Control::Continue);
         assert!(state.tree.opened().is_empty());
+    }
+
+    // --- background rescan ------
+
+    /// A scan that blocks until the returned sender releases it, then reads
+    /// the disk as it is *at that moment* -- no clock involved.
+    fn gated_scan() -> (Arc<dyn Fn(&rescan::RescanRequest) -> TreeSource + Send + Sync>, std::sync::mpsc::Sender<()>) {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let scan = Arc::new(move |request: &rescan::RescanRequest| {
+            let _ = gate.lock().unwrap().recv();
+            scan_tree_source(request.kind, &request.root, request.sort_key)
+        });
+        (scan, release)
+    }
+
+    fn background_state(root: &Path) -> (AppState, std::sync::mpsc::Sender<()>) {
+        let mut state = build_state_from(root, (120, 40));
+        let (scan, release) = gated_scan();
+        state.rescan = rescan::RescanCoordinator::with_scan(scan);
+        state.rescan_mode = RescanMode::Background;
+        (state, release)
+    }
+
+    fn apply_when_finished(state: &mut AppState) {
+        for _ in 0..50_000_000u64 {
+            if poll_rescan(state) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("background rescan never finished");
+    }
+
+    #[test]
+    fn background_fs_event_returns_at_once_and_input_is_handled_before_the_result_lands() {
+        let root = temp_kiro_root("bg_input");
+        write_spec(&root, "alpha", "design", "# A\n\nbody\n");
+        write_spec(&root, "beta", "design", "# B\n\nbody\n");
+        let (mut state, release) = background_state(&root);
+        state.focus = Panel::Doc;
+        state.doc = DocView::Rendered {
+            path: root.join("specs/alpha/requirements.md"),
+            r: markdown::render(&"line\n\n".repeat(20), 80),
+            meta: FileInfo::default(),
+        };
+        state.scroll = 3;
+
+        let names_before = spec_names(&state);
+        write_spec(&root, "gamma", "design", "# G\n\nbody\n");
+        assert_eq!(update(&mut state, fs_event()), Control::Continue);
+        assert!(state.rescan.is_scanning());
+
+        key_action(&mut state, KeyCode::Down);
+        assert_eq!(state.scroll, 4);
+        assert_eq!(spec_names(&state), names_before, "tree must not change before the scan lands");
+        assert!(!poll_rescan(&mut state));
+
+        release.send(()).unwrap();
+        apply_when_finished(&mut state);
+        assert_eq!(spec_names(&state), vec!["alpha", "beta", "gamma"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn background_result_keeps_selection_folds_and_scroll() {
+        let root = temp_kiro_root("bg_keep");
+        let long: String = (0..60).map(|i| format!("line {i}\n\n")).collect();
+        write_spec(&root, "alpha", "design", &long);
+        let (mut state, release) = background_state(&root);
+        state.sort_key = SortKey::Phase;
+        let selected = vec![
+            NodeId::Spec("alpha".to_string()),
+            NodeId::Doc("alpha".to_string(), DocKind::Requirements),
+        ];
+        state.tree.open(vec![NodeId::Spec("alpha".to_string())]);
+        state.tree.select(selected.clone());
+        key_action(&mut state, KeyCode::Enter);
+        state.scroll = 10;
+
+        write_spec(&root, "beta", "design", "# B\n");
+        update(&mut state, Action::Refresh);
+        release.send(()).unwrap();
+        apply_when_finished(&mut state);
+
+        assert_eq!(state.sort_key, SortKey::Phase);
+        assert_eq!(state.tree.selected().to_vec(), selected);
+        assert!(state.tree.opened().contains(&vec![NodeId::Spec("alpha".to_string())]));
+        assert_eq!(state.scroll, 10);
+        assert!(matches!(state.doc, DocView::Rendered { .. }));
+        assert_eq!(spec_names(&state), vec!["alpha", "beta"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_sort_key_changed_during_the_scan_decides_the_applied_order() {
+        let root = temp_kiro_root("bg_sort");
+        write_spec(&root, "alpha", "implementation", "# A\n");
+        write_spec(&root, "beta", "design", "# B\n");
+        let (mut state, release) = background_state(&root);
+        assert_eq!(state.sort_key, SortKey::Name);
+
+        update(&mut state, fs_event());
+        state.sort_key = SortKey::Phase;
+        release.send(()).unwrap();
+        apply_when_finished(&mut state);
+
+        assert_eq!(spec_names(&state), vec!["beta", "alpha"], "phase order, not the requested name order");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_document_deleted_during_the_scan_shows_as_deleted_once_applied() {
+        let root = temp_kiro_root("bg_deleted");
+        write_spec(&root, "demo", "design", "# Demo\n\nbody\n");
+        let (mut state, release) = background_state(&root);
+        let selected = vec![
+            NodeId::Spec("demo".to_string()),
+            NodeId::Doc("demo".to_string(), DocKind::Requirements),
+        ];
+        state.tree.select(selected.clone());
+        key_action(&mut state, KeyCode::Enter);
+        let path = match &state.doc {
+            DocView::Rendered { path, .. } => path.clone(),
+            other => panic!("expected Rendered, got {other:?}"),
+        };
+
+        update(&mut state, fs_event());
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(state.doc, DocView::Rendered { .. }), "nothing changes before the scan lands");
+        release.send(()).unwrap();
+        apply_when_finished(&mut state);
+
+        assert!(matches!(&state.doc, DocView::Deleted(p) if p == &path));
+        assert_eq!(state.tree.selected().to_vec(), selected);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_source_switch_discards_the_result_of_a_scan_from_the_old_root() {
+        let old_root = temp_kiro_root("bg_switch_old");
+        write_spec(&old_root, "old-spec", "design", "# Old\n");
+        let new_root = temp_kiro_root("bg_switch_new");
+        write_spec(&new_root, "new-spec", "design", "# New\n");
+        let (mut state, release) = background_state(&old_root);
+
+        update(&mut state, fs_event());
+        let new_tree = scan_tree_source(spec::TreeSourceKind::Kiro, &new_root, SortKey::Name);
+        update(
+            &mut state,
+            Action::ApplySourceSwitch {
+                source: new_tree,
+                root: new_root.clone(),
+                watch_status: WatchStatus::Live,
+            },
+        );
+        assert!(!state.rescan.is_scanning());
+        release.send(()).unwrap();
+        // The abandoned scan is allowed to finish; its tree must still never land.
+        for _ in 0..200 {
+            assert!(!poll_rescan(&mut state));
+            std::thread::yield_now();
+        }
+        assert_eq!(spec_names(&state), vec!["new-spec"]);
+        assert_eq!(state.kiro_root, new_root);
+        fs::remove_dir_all(&old_root).ok();
+        fs::remove_dir_all(&new_root).ok();
+    }
+
+    #[test]
+    fn default_sync_mode_still_rescans_inside_update() {
+        let root = temp_kiro_root("sync_default");
+        write_spec(&root, "alpha", "design", "# A\n");
+        let mut state = build_state_from(&root, (120, 40));
+        assert_eq!(state.rescan_mode, RescanMode::Sync);
+        write_spec(&root, "beta", "design", "# B\n");
+        update(&mut state, Action::Refresh);
+        assert_eq!(spec_names(&state), vec!["alpha", "beta"]);
+        assert!(!state.rescan.is_scanning());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- partial refresh of the open document ------------------------------
+
+    fn fixed_modified() -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000)
+    }
+
+    fn write_with_modified(path: &Path, body: &str, modified: SystemTime) {
+        fs::write(path, body).unwrap();
+        fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+    }
+
+    fn open_rendered(state: &mut AppState, path: &Path) {
+        state.doc = loader::load_doc(path, doc_panel_width(state));
+        assert!(matches!(state.doc, DocView::Rendered { .. }));
+    }
+
+    fn doc_mentions(state: &AppState, needle: &str) -> bool {
+        rendered_of(&state.doc).is_some_and(|r| r.plain.iter().any(|line| line.contains(needle)))
+    }
+
+    fn fs_event_for(paths: Vec<PathBuf>) -> Action {
+        Action::Fs(crate::watch::FsEvent { paths })
+    }
+
+    fn tree_modified(state: &AppState, path: &Path) -> Option<SystemTime> {
+        match &state.root {
+            TreeSource::Files(tree) => tree.entries.iter().find(|e| e.path == path).map(|e| e.modified),
+            TreeSource::SpecKit(specs) => specs
+                .iter()
+                .flat_map(|s| s.docs.iter())
+                .find(|d| d.path == path)
+                .and_then(|d| d.modified),
+            TreeSource::Kiro(root) => root
+                .specs
+                .iter()
+                .flat_map(|s| s.docs.iter())
+                .find(|d| d.path == path)
+                .and_then(|d| d.modified),
+        }
+    }
+
+    /// Background state whose scan is gated, so "a rescan was requested" is
+    /// the coordinator's own in-flight flag rather than anything timed.
+    fn gated_background(mut state: AppState) -> (AppState, std::sync::mpsc::Sender<()>) {
+        let (scan, release) = gated_scan();
+        state.rescan = rescan::RescanCoordinator::with_scan(scan);
+        state.rescan_mode = RescanMode::Background;
+        (state, release)
+    }
+
+    #[test]
+    fn partial_refresh_kiro_reads_only_the_doc_and_patches_its_row() {
+        let root = temp_kiro_root("partial_kiro");
+        write_spec(&root, "alpha", "design", "# A\n\nold text\n");
+        let path = root.join("specs/alpha/requirements.md");
+        let (mut state, release) = gated_background(build_state_from(&root, (120, 40)));
+        open_rendered(&mut state, &path);
+        let tree_before = tree_modified(&state, &path);
+        write_spec(&root, "beta", "design", "# B\n");
+        write_with_modified(&path, "# A\n\nfresh text\n", fixed_modified());
+
+        update(&mut state, fs_event_for(vec![path.clone()]));
+
+        assert!(!state.rescan.is_scanning(), "a plain edit must not request a rescan");
+        assert!(doc_mentions(&state, "fresh text"));
+        assert_ne!(tree_before, Some(fixed_modified()));
+        assert_eq!(tree_modified(&state, &path), Some(fixed_modified()));
+        assert_eq!(spec_names(&state), vec!["alpha"], "tree structure must not be rescanned");
+        drop(release);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_refresh_is_the_same_in_sync_mode() {
+        let root = temp_kiro_root("partial_sync");
+        write_spec(&root, "alpha", "design", "# A\n\nold text\n");
+        let path = root.join("specs/alpha/requirements.md");
+        let mut state = build_state_from(&root, (120, 40));
+        open_rendered(&mut state, &path);
+        write_spec(&root, "beta", "design", "# B\n");
+        write_with_modified(&path, "# A\n\nfresh text\n", fixed_modified());
+
+        update(&mut state, fs_event_for(vec![path.clone()]));
+
+        assert!(doc_mentions(&state, "fresh text"));
+        assert_eq!(spec_names(&state), vec!["alpha"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_refresh_spec_kit_patches_the_doc_row() {
+        let specs_dir = temp_spec_kit_specs_dir("partial_spec_kit");
+        write_spec_kit_feature(&specs_dir, "001-login", "# Login\n\nold text\n");
+        let path = specs_dir.join("001-login/spec.md");
+        let (mut state, release) = gated_background(build_spec_kit_state_from(&specs_dir, (120, 40)));
+        open_rendered(&mut state, &path);
+        write_spec_kit_feature(&specs_dir, "002-other", "# Other\n");
+        write_with_modified(&path, "# Login\n\nfresh text\n", fixed_modified());
+
+        update(&mut state, fs_event_for(vec![path.clone()]));
+
+        assert!(!state.rescan.is_scanning());
+        assert!(doc_mentions(&state, "fresh text"));
+        assert_eq!(tree_modified(&state, &path), Some(fixed_modified()));
+        match &state.root {
+            TreeSource::SpecKit(features) => assert_eq!(features.len(), 1),
+            _ => panic!("expected TreeSource::SpecKit"),
+        }
+        drop(release);
+        fs::remove_dir_all(&specs_dir).ok();
+    }
+
+    #[test]
+    fn partial_refresh_files_mode_patches_the_entry() {
+        let root = temp_files_root("partial_files");
+        write_with_modified(&root.join("note.md"), "# N\n\nold text\n", SystemTime::UNIX_EPOCH);
+        let path = root.join("note.md");
+        let (mut state, release) = gated_background(build_files_state_from(&root, (120, 40)));
+        open_rendered(&mut state, &path);
+        fs::write(root.join("later.md"), "x").unwrap();
+        write_with_modified(&path, "# N\n\nfresh text\n", fixed_modified());
+
+        update(&mut state, fs_event_for(vec![path.clone()]));
+
+        assert!(!state.rescan.is_scanning());
+        assert!(doc_mentions(&state, "fresh text"));
+        assert_eq!(tree_modified(&state, &path), Some(fixed_modified()));
+        assert_eq!(files_names(&state), vec!["note.md"]);
+        drop(release);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_refresh_accepts_a_differently_spelled_path_of_the_same_file() {
+        let root = temp_kiro_root("partial_spelling");
+        write_spec(&root, "alpha", "design", "# A\n");
+        let path = root.join("specs/alpha/requirements.md");
+        let mut state = build_state_from(&root, (120, 40));
+        open_rendered(&mut state, &path);
+        let spelled_differently = root.join("specs/alpha/../alpha/requirements.md");
+
+        assert_eq!(is_partial_refresh_target(&state, &[spelled_differently]), Some(path));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn events_that_may_change_structure_or_badges_still_rescan() {
+        let root = temp_kiro_root("partial_denied");
+        write_spec(&root, "alpha", "design", "# A\n");
+        write_spec(&root, "beta", "design", "# B\n");
+        fs::write(root.join("specs/alpha/tasks.md"), "- [ ] 1. t\n").unwrap();
+        let open_path = root.join("specs/alpha/requirements.md");
+        let other_path = root.join("specs/beta/requirements.md");
+        let spec_json = root.join("specs/alpha/spec.json");
+        let tasks_md = root.join("specs/alpha/tasks.md");
+
+        let cases: Vec<(&str, PathBuf, Vec<PathBuf>)> = vec![
+            ("mixed paths", open_path.clone(), vec![open_path.clone(), other_path.clone()]),
+            ("other path only", open_path.clone(), vec![other_path.clone()]),
+            ("spec.json", spec_json.clone(), vec![spec_json.clone()]),
+            ("tasks.md", tasks_md.clone(), vec![tasks_md.clone()]),
+            ("no paths", open_path.clone(), vec![]),
+        ];
+        for (label, shown, paths) in cases {
+            let (mut state, release) = gated_background(build_state_from(&root, (120, 40)));
+            state.doc = loader::load_doc(&shown, 80);
+            assert_eq!(is_partial_refresh_target(&state, &paths), None, "{label}");
+            update(&mut state, fs_event_for(paths));
+            assert!(state.rescan.is_scanning(), "{label} must rescan");
+            drop(release);
+        }
+
+        let (mut state, release) = gated_background(build_state_from(&root, (120, 40)));
+        open_rendered(&mut state, &open_path);
+        update(&mut state, Action::Refresh);
+        assert!(state.rescan.is_scanning(), "manual refresh must rescan");
+        drop(release);
+
+        let (mut state, release) = gated_background(build_state_from(&root, (120, 40)));
+        let TreeSource::Kiro(spec_root) = &state.root else { panic!("expected Kiro") };
+        state.doc = loader::load_definition(&spec_root.specs[0], 80);
+        assert!(matches!(state.doc, DocView::Definition { .. }));
+        update(&mut state, fs_event_for(vec![open_path.clone()]));
+        assert!(state.rescan.is_scanning(), "definition view must rescan");
+        drop(release);
+
+        let (mut state, release) = gated_background(build_state_from(&root, (120, 40)));
+        open_rendered(&mut state, &open_path);
+        fs::remove_file(&open_path).unwrap();
+        assert_eq!(is_partial_refresh_target(&state, &[open_path.clone()]), None);
+        update(&mut state, fs_event_for(vec![open_path.clone()]));
+        assert!(state.rescan.is_scanning(), "deleted file must rescan");
+        drop(release);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_doc_missing_from_the_tree_falls_back_to_a_rescan() {
+        let root = temp_files_root("partial_unlisted");
+        fs::write(root.join("known.md"), "# K\n").unwrap();
+        let (mut state, release) = gated_background(build_files_state_from(&root, (120, 40)));
+        let unlisted = root.join("unlisted.md");
+        fs::write(&unlisted, "# U\n").unwrap();
+        open_rendered(&mut state, &unlisted);
+
+        update(&mut state, fs_event_for(vec![unlisted]));
+
+        assert!(state.rescan.is_scanning());
+        drop(release);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_refresh_clamps_scroll_into_a_shrunken_doc() {
+        let root = temp_kiro_root("partial_shrink");
+        let long: String = (0..40).map(|i| format!("paragraph {i}\n\n")).collect();
+        write_spec(&root, "alpha", "design", &long);
+        let path = root.join("specs/alpha/requirements.md");
+        let mut state = build_state_from(&root, (120, 40));
+        open_rendered(&mut state, &path);
+        state.scroll = 30;
+        write_with_modified(&path, "only one paragraph\n", fixed_modified());
+
+        update(&mut state, fs_event_for(vec![path]));
+
+        let last_line = rendered_of(&state.doc).unwrap().plain.len() - 1;
+        assert_eq!(state.scroll, last_line);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reselecting_after_a_partial_refresh_never_shows_the_stale_cache() {
+        let root = temp_kiro_root("partial_cache");
+        write_spec(&root, "alpha", "design", "aaaa\n");
+        write_spec(&root, "beta", "design", "# B\n");
+        let path = root.join("specs/alpha/requirements.md");
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut state = build_state_from(&root, (120, 40));
+        let select = |state: &mut AppState, name: &str| {
+            state.tree.select(vec![
+                NodeId::Spec(name.to_string()),
+                NodeId::Doc(name.to_string(), DocKind::Requirements),
+            ]);
+            key_action(state, KeyCode::Enter);
+        };
+        select(&mut state, "alpha");
+        assert!(doc_mentions(&state, "aaaa"));
+
+        // Same size and timestamp: only an explicit invalidation can tell.
+        write_with_modified(&path, "bbbb\n", original_modified);
+        update(&mut state, fs_event_for(vec![path]));
+        select(&mut state, "beta");
+        select(&mut state, "alpha");
+
+        assert!(doc_mentions(&state, "bbbb"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- scan, cache and partial refresh never write to the watched dir ----
+
+    /// Path, size, modification time and bytes of every file and directory,
+    /// so a created, resized, touched or rewritten entry all show up.
+    type DirSnapshot = std::collections::BTreeMap<PathBuf, (u64, Option<SystemTime>, Vec<u8>)>;
+
+    fn snapshot_dir(root: &Path) -> DirSnapshot {
+        fn walk(dir: &Path, into: &mut DirSnapshot) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let stat = fs::metadata(&path).unwrap();
+                let bytes = if stat.is_file() { fs::read(&path).unwrap() } else { Vec::new() };
+                into.insert(path.clone(), (stat.len(), stat.modified().ok(), bytes));
+                if stat.is_dir() {
+                    walk(&path, into);
+                }
+            }
+        }
+        let mut snapshot = DirSnapshot::new();
+        walk(root, &mut snapshot);
+        snapshot
+    }
+
+    /// Background Refresh, an Fs-driven rescan, cache miss and hit on
+    /// selection, and a partial refresh of the open doc (which is the selected one,
+    /// because a partial refresh only re-reads the document on screen).
+    fn exercise_read_paths(state: &mut AppState, release: &std::sync::mpsc::Sender<()>, selection: Vec<NodeId>, open_path: &Path) {
+        update(state, Action::Refresh);
+        assert!(state.rescan.is_scanning());
+        release.send(()).unwrap();
+        apply_when_finished(state);
+
+        update(state, fs_event());
+        assert!(state.rescan.is_scanning());
+        release.send(()).unwrap();
+        apply_when_finished(state);
+
+        state.tree.select(selection.clone());
+        show_selected_doc(state);
+        assert!(matches!(state.doc, DocView::Rendered { .. }), "first selection is a cache miss");
+        state.tree.select(vec![]);
+        show_selected_doc(state);
+        state.tree.select(selection);
+        show_selected_doc(state);
+        assert!(matches!(state.doc, DocView::Rendered { .. }), "re-selection is a cache hit");
+
+        update(state, fs_event_for(vec![open_path.to_path_buf()]));
+        assert!(doc_mentions(state, "edited before the snapshot"));
+    }
+
+    #[test]
+    fn rescan_cache_and_partial_refresh_leave_a_kiro_directory_untouched() {
+        let root = temp_kiro_root("read_only_kiro");
+        write_spec(&root, "alpha", "design", "# A\n\nbody\n");
+        write_spec(&root, "beta", "design", "# B\n\nbody\n");
+        fs::write(root.join("steering/product.md"), "# P\n").unwrap();
+        let open_path = root.join("specs/alpha/requirements.md");
+        let (mut state, release) = background_state(&root);
+        open_rendered(&mut state, &open_path);
+        write_with_modified(&open_path, "# A\n\nedited before the snapshot\n", fixed_modified());
+
+        let before = snapshot_dir(&root);
+        exercise_read_paths(
+            &mut state,
+            &release,
+            vec![NodeId::Spec("alpha".to_string()), NodeId::Doc("alpha".to_string(), DocKind::Requirements)],
+            &open_path,
+        );
+
+        assert_eq!(snapshot_dir(&root), before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rescan_cache_and_partial_refresh_leave_a_files_directory_untouched() {
+        let root = temp_files_root("read_only_files");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        write_with_modified(&root.join("note.md"), "# N\n\nbody\n", SystemTime::UNIX_EPOCH);
+        write_with_modified(&root.join("sub/other.md"), "# O\n\nbody\n", SystemTime::UNIX_EPOCH);
+        let open_path = root.join("note.md");
+        let (mut state, release) = gated_background(build_files_state_from(&root, (120, 40)));
+        open_rendered(&mut state, &open_path);
+        write_with_modified(&open_path, "# N\n\nedited before the snapshot\n", fixed_modified());
+
+        let before = snapshot_dir(&root);
+        exercise_read_paths(&mut state, &release, vec![NodeId::File(open_path.clone())], &open_path);
+
+        assert_eq!(snapshot_dir(&root), before);
+        fs::remove_dir_all(&root).ok();
     }
 }

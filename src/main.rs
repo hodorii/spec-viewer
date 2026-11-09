@@ -199,6 +199,21 @@ pub fn step<B: ratatui::backend::Backend>(
     Ok(control)
 }
 
+/// A scan thread that panics costs one refresh (the coordinator catches it),
+/// but the default hook would still write the message over the TUI screen.
+/// Only that thread is silenced; every other panic reaches the previous hook
+/// (which restores the terminal before reporting).
+fn silence_scan_thread_panics() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_scan_thread = std::thread::current().name()
+            == Some(spec_viewer::app::rescan::SCAN_THREAD_NAME);
+        if !is_scan_thread {
+            previous_hook(info);
+        }
+    }));
+}
+
 fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut spec_viewer::app::AppState,
@@ -210,6 +225,8 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     tx: &std::sync::mpsc::Sender<spec_viewer::watch::FsEvent>,
     watch: &mut spec_viewer::watch::Watch,
 ) -> std::io::Result<()> {
+    state.rescan_mode = spec_viewer::app::RescanMode::Background;
+
     // Draw once before waiting on any event: without this, the screen stays
     // blank until the first keypress or fs event arrives, since every draw
     // below is gated on receiving one first (found via a real-terminal smoke
@@ -218,6 +235,13 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal.draw(|f| spec_viewer::ui::render(f, state))?;
 
     loop {
+        // Checked on every pass -- including after an input poll that timed
+        // out -- so a finished scan shows up without waiting for a key. Only
+        // a real result redraws, which keeps an idle viewer from repainting.
+        if spec_viewer::app::poll_rescan(state) {
+            terminal.draw(|f| spec_viewer::ui::render(f, state))?;
+        }
+
         if let Ok(fs_event) = rx.try_recv() {
             if step(terminal, state, spec_viewer::app::Action::Fs(fs_event))?
                 == spec_viewer::app::Control::Quit
@@ -287,7 +311,8 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                     break;
                 }
             }
-            if applied_any {
+            let is_rescan_applied = spec_viewer::app::poll_rescan(state);
+            if applied_any || is_rescan_applied {
                 terminal.draw(|f| spec_viewer::ui::render(f, state))?;
             }
             if quit {
@@ -879,6 +904,7 @@ fn main() {
     };
 
     let mut terminal = ratatui::init();
+    silence_scan_thread_panics();
     let size = terminal
         .size()
         .map(|s| (s.width, s.height))

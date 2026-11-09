@@ -28,6 +28,36 @@ use crate::spec::{
 /// outer width is what the row's own text may use.
 const DOC_ROW_CHROME_WIDTH: usize = 6;
 
+/// The leading `2 +` is the two spaces separating the date from the row.
+const DATE_TIME_STAGE_WIDTH: usize = 2 + 19;
+const DATE_STAGE_WIDTH: usize = 2 + 10;
+const MONTH_DAY_STAGE_WIDTH: usize = 2 + 5;
+
+/// How much of a document's modified date its row shows, widest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateStage {
+    DateTime,
+    Date,
+    MonthDay,
+    Hidden,
+}
+
+/// The first (widest) date stage whose text still fits after the row's own
+/// text (`row_width_without_date`) and the panel chrome, so the document
+/// name and progress are never cut.
+fn pick_date_stage(row_width_without_date: usize, panel_width: u16) -> DateStage {
+    let available = usize::from(panel_width).saturating_sub(row_width_without_date + DOC_ROW_CHROME_WIDTH);
+    if available >= DATE_TIME_STAGE_WIDTH {
+        DateStage::DateTime
+    } else if available >= DATE_STAGE_WIDTH {
+        DateStage::Date
+    } else if available >= MONTH_DAY_STAGE_WIDTH {
+        DateStage::MonthDay
+    } else {
+        DateStage::Hidden
+    }
+}
+
 /// Style patched onto a search-matched node's label (requirement 2.10;
 /// same "Yellow bg" convention `doc_panel`'s own search highlight uses for
 /// a non-current match -- the *current* match additionally sits under the
@@ -491,15 +521,16 @@ fn doc_item(
 
     if let Some(modified) = entry.modified {
         let date_style = base_style.add_modifier(Modifier::DIM);
-        let with_time = format!("  {}", crate::app::loader::format_modified_timestamp(modified));
-        let row_width_with_time = Line::from(spans.clone()).width() + with_time.chars().count();
-        let fits_with_time = row_width_with_time + DOC_ROW_CHROME_WIDTH <= usize::from(panel_width);
-        let text = if fits_with_time {
-            with_time
-        } else {
-            format!("  {}", crate::app::loader::format_modified_date(modified))
+        let row_width_without_date = Line::from(spans.clone()).width();
+        let text = match pick_date_stage(row_width_without_date, panel_width) {
+            DateStage::DateTime => Some(crate::app::loader::format_modified_timestamp(modified)),
+            DateStage::Date => Some(crate::app::loader::format_modified_date(modified)),
+            DateStage::MonthDay => Some(crate::app::loader::format_modified_month_day(modified)),
+            DateStage::Hidden => None,
         };
-        spans.push(Span::styled(text, highlight(date_style)));
+        if let Some(text) = text {
+            spans.push(Span::styled(format!("  {text}"), highlight(date_style)));
+        }
     }
 
     TreeItem::new_leaf(
@@ -1217,12 +1248,13 @@ mod tests {
         assert!(!plan_row.contains(&expected_date), "a doc without a known date shows none");
     }
 
-    #[test]
-    fn doc_row_shows_the_time_of_day_only_when_the_whole_row_fits_the_tree_panel() {
-        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080 + 7);
-        let stamp = crate::app::loader::format_modified_timestamp(modified);
-        let (date, time_of_day) = stamp.split_at(10);
-        let spec = || Spec {
+    const NARROW_DATE_TEST_SECS: u64 = 1_789_498_080 + 7;
+
+    /// Rendered text rows of a one-doc (`requirements.md`) kiro tree drawn
+    /// into a panel `width` columns wide.
+    fn render_dated_requirements_rows_at_width(width: u16) -> Vec<String> {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(NARROW_DATE_TEST_SECS);
+        let spec = Spec {
             name: "dated".to_string(),
             dir: PathBuf::from("/does/not/matter/dated"),
             kiro_meta: None,
@@ -1238,30 +1270,72 @@ mod tests {
             }],
             definition: None,
         };
-        let render_at_width = |width: u16| {
-            let backend = TestBackend::new(width, 10);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            let mut tree_state: TreeState<NodeId> = TreeState::default();
-            tree_state.open(vec![NodeId::Spec("dated".to_string())]);
-            let source = TreeSource::Kiro(SpecRoot { specs: vec![spec()], groups: Vec::new() });
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    render(frame, area, &source, &mut tree_state, SortKey::Name, &[], &mut None);
-                })
-                .expect("draw");
-            buffer_text(terminal.backend().buffer())
-        };
-        let row_of = |rows: &[String]| rows.iter().find(|r| r.contains("requirements.md")).cloned().expect("row");
+        let backend = TestBackend::new(width, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut tree_state: TreeState<NodeId> = TreeState::default();
+        tree_state.open(vec![NodeId::Spec("dated".to_string())]);
+        let source = TreeSource::Kiro(SpecRoot { specs: vec![spec], groups: Vec::new() });
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render(frame, area, &source, &mut tree_state, SortKey::Name, &[], &mut None);
+            })
+            .expect("draw");
+        buffer_text(terminal.backend().buffer())
+    }
 
-        let wide = row_of(&render_at_width(44));
+    fn requirements_row_at_width(width: u16) -> String {
+        render_dated_requirements_rows_at_width(width)
+            .into_iter()
+            .find(|r| r.contains("requirements.md"))
+            .expect("row")
+    }
+
+    fn row_text_without_border(row: &str) -> &str {
+        row.trim_end_matches(|c: char| c == ' ' || c == '│')
+    }
+
+    #[test]
+    fn doc_row_shows_the_time_of_day_only_when_the_whole_row_fits_the_tree_panel() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(NARROW_DATE_TEST_SECS);
+        let stamp = crate::app::loader::format_modified_timestamp(modified);
+        let (date, time_of_day) = stamp.split_at(10);
+
+        let wide = requirements_row_at_width(44);
         assert!(wide.contains(&stamp), "44 columns shows date and time, got {wide:?}");
         assert!(wide.find(date) < wide.find(time_of_day.trim()), "time follows the date, got {wide:?}");
 
-        let narrow = row_of(&render_at_width(43));
+        let narrow = requirements_row_at_width(43);
         assert!(narrow.contains(date), "43 columns still shows the date, got {narrow:?}");
-        assert!(narrow.trim_end_matches(|c: char| c == ' ' || c == '│').ends_with(date), "43 columns ends the row at the date, not a clipped time, got {narrow:?}");
+        assert!(row_text_without_border(&narrow).ends_with(date), "43 columns ends the row at the date, not a clipped time, got {narrow:?}");
         assert!(narrow.contains("requirements.md"), "the name is never cut, got {narrow:?}");
+    }
+
+    // Boundary width = chrome 6 + row text 17 + stage width.
+    #[test]
+    fn doc_row_date_stage_steps_down_at_each_boundary_width() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(NARROW_DATE_TEST_SECS);
+        let stamp = crate::app::loader::format_modified_timestamp(modified);
+        let date = &stamp[..10];
+        let month_day = &date[5..];
+
+        let date_time_row = requirements_row_at_width(44);
+        assert!(row_text_without_border(&date_time_row).ends_with(&stamp), "44: date and time, got {date_time_row:?}");
+
+        let date_row = requirements_row_at_width(35);
+        assert!(row_text_without_border(&date_row).ends_with(date), "35: full date, got {date_row:?}");
+        assert!(!date_row.contains(&stamp[10..]), "35: no time of day, got {date_row:?}");
+
+        let month_day_row = requirements_row_at_width(34);
+        assert!(row_text_without_border(&month_day_row).ends_with(month_day), "34: MM-DD, got {month_day_row:?}");
+        assert!(!month_day_row.contains(date), "34: not the full date, got {month_day_row:?}");
+
+        let month_day_row = requirements_row_at_width(30);
+        assert!(row_text_without_border(&month_day_row).ends_with(month_day), "30: MM-DD, got {month_day_row:?}");
+
+        let hidden_row = requirements_row_at_width(29);
+        assert!(!hidden_row.contains(month_day), "29: no date at all, got {hidden_row:?}");
+        assert!(row_text_without_border(&hidden_row).ends_with("requirements.md"), "29: the name ends the row, got {hidden_row:?}");
     }
 
     // --- spec-viewer-files-tree-scroll-latency ---------------------------

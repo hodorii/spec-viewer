@@ -40,11 +40,14 @@ pub enum SpanStyle {
 #[derive(Clone, Copy)]
 pub enum LineStyle { Heading(u8), Quote, ListItem(u16), Table, Plain }
 
+#[derive(Clone)]
 pub struct HeadingAnchor { pub level: u8, pub text: String, pub line: usize }
 
 /// 각주 하나 — 문서 끝에 모아 출력한다(요구사항 10.5). `index` 는 첫 참조 순서(1-based).
+#[derive(Clone)]
 pub struct Footnote { pub index: usize, pub name: String, pub text: String }
 
+#[derive(Clone)]
 pub struct Rendered {
     pub lines: Vec<Line>,
     pub plain: Vec<String>,

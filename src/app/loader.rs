@@ -279,6 +279,12 @@ pub fn format_modified_date(modified: SystemTime) -> String {
     format_modified(modified).chars().take(10).collect()
 }
 
+/// `modified`'s local month and day as `MM-DD` -- the tail of
+/// [`format_modified_date`], for places too narrow for the year.
+pub fn format_modified_month_day(modified: SystemTime) -> String {
+    format_modified_date(modified).chars().skip(5).collect()
+}
+
 /// `modified` as `YYYY-MM-DD HH:MM:SS` in the local timezone. The seconds
 /// are the UTC seconds: every timezone offset is a whole number of minutes,
 /// so the second hand reads the same everywhere.
@@ -410,10 +416,21 @@ pub fn load_definition(spec: &Spec, width: u16) -> DocView {
 /// taken from an existing entry), this degrades gracefully to
 /// [`DocView::Missing`] at a synthetic path rather than panicking.
 pub fn load_for_selection(spec: &Spec, kind: Option<&DocKind>, width: u16) -> DocView {
+    load_for_selection_with(spec, kind, width, load_doc)
+}
+
+/// [`load_for_selection`] with the document reader supplied by the caller, so
+/// a cache can sit between the selection and the file read.
+pub fn load_for_selection_with(
+    spec: &Spec,
+    kind: Option<&DocKind>,
+    width: u16,
+    mut read_doc: impl FnMut(&Path, u16) -> DocView,
+) -> DocView {
     match kind {
         None => load_definition(spec, width),
         Some(k) => match spec.docs.iter().find(|d| &d.kind == k) {
-            Some(entry) => load_doc(&entry.path, width),
+            Some(entry) => read_doc(&entry.path, width),
             None => DocView::Missing(spec.dir.join(format!("{k:?}"))),
         },
     }
@@ -883,6 +900,14 @@ mod tests {
             [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15].contains(&i)
                 == b.is_ascii_digit()
         }));
+    }
+
+    #[test]
+    fn format_modified_month_day_is_the_date_without_its_year() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_498_080);
+        let date = format_modified_date(modified);
+        assert_eq!(format_modified_month_day(modified), &date[5..]);
+        assert_eq!(format_modified_month_day(modified).len(), 5);
     }
 
     #[test]

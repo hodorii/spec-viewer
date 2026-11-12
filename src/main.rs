@@ -214,6 +214,108 @@ fn silence_scan_thread_panics() {
     }));
 }
 
+/// Folder-scoped watching is what keeps start cost independent of how many
+/// folders a Files tree holds; the spec sources are small enough to watch whole.
+fn watch_scope_for(source: &spec_viewer::spec::TreeSource) -> spec_viewer::watch::WatchScope {
+    match source {
+        spec_viewer::spec::TreeSource::Files(_) => spec_viewer::watch::WatchScope::OpenedDirs,
+        _ => spec_viewer::watch::WatchScope::Recursive,
+    }
+}
+
+fn start_watch_for(
+    source: &spec_viewer::spec::TreeSource,
+    root: &Path,
+    tx: &std::sync::mpsc::Sender<spec_viewer::watch::FsEvent>,
+    is_watch_disabled: bool,
+) -> spec_viewer::watch::Watch {
+    if is_watch_disabled {
+        spec_viewer::watch::manual("--no-watch")
+    } else {
+        spec_viewer::watch::start_scoped(root, tx.clone(), watch_scope_for(source))
+    }
+}
+
+/// What the last folder sync was computed from; an unchanged key means the
+/// desired folder set cannot have changed, so the loop skips recomputing it.
+#[derive(Default)]
+struct WatchDirSyncKey {
+    opened: std::collections::HashSet<Vec<spec_viewer::spec::NodeId>>,
+    open_doc_path: Option<PathBuf>,
+}
+
+impl WatchDirSyncKey {
+    fn of(state: &spec_viewer::app::AppState) -> Self {
+        Self {
+            opened: state.tree.opened().clone(),
+            open_doc_path: open_doc_path(state),
+        }
+    }
+
+    fn matches(&self, state: &spec_viewer::app::AppState) -> bool {
+        self.open_doc_path == open_doc_path(state) && &self.opened == state.tree.opened()
+    }
+}
+
+fn open_doc_path(state: &spec_viewer::app::AppState) -> Option<PathBuf> {
+    match &state.doc {
+        spec_viewer::app::DocView::Rendered { path, .. } => Some(path.clone()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct WatchDirSync {
+    last_key: Option<WatchDirSyncKey>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WatchDirSyncOutcome {
+    Skipped,
+    Synced { newly_registered: usize, is_rescan_requested: bool },
+}
+
+/// Brings the watched folders in line with what is on screen. `has_hint` says
+/// something other than the key changed (a rescan landed or an fs event was
+/// handled), which is what retries failed registrations and re-registers
+/// recreated folders.
+fn reconcile_watch_dirs(
+    state: &mut spec_viewer::app::AppState,
+    watch: &mut spec_viewer::watch::Watch,
+    sync: &mut WatchDirSync,
+    has_hint: bool,
+) -> WatchDirSyncOutcome {
+    let spec_viewer::watch::Watch::Live(live) = watch else {
+        return WatchDirSyncOutcome::Skipped;
+    };
+    let is_key_unchanged = sync.last_key.as_ref().is_some_and(|key| key.matches(state));
+    if is_key_unchanged && !has_hint {
+        return WatchDirSyncOutcome::Skipped;
+    }
+    let newly_registered = live.sync_dirs(&spec_viewer::app::desired_watch_dirs(state));
+    sync.last_key = Some(WatchDirSyncKey::of(state));
+    // One rescan covers every folder added in this pass, closing the window
+    // in which their changes went unseen.
+    let is_rescan_requested = newly_registered > 0;
+    if is_rescan_requested {
+        spec_viewer::app::request_catch_up_rescan(state);
+    }
+    WatchDirSyncOutcome::Synced { newly_registered, is_rescan_requested }
+}
+
+/// First sync after a watch starts: the tree was just scanned, so folders
+/// registered here need no catch-up rescan.
+fn sync_baseline_watch_dirs(
+    state: &spec_viewer::app::AppState,
+    watch: &mut spec_viewer::watch::Watch,
+    sync: &mut WatchDirSync,
+) {
+    if let spec_viewer::watch::Watch::Live(live) = watch {
+        live.sync_dirs(&spec_viewer::app::desired_watch_dirs(state));
+    }
+    sync.last_key = Some(WatchDirSyncKey::of(state));
+}
+
 fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut spec_viewer::app::AppState,
@@ -234,21 +336,34 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     // immediately on open, not after the user's first input).
     terminal.draw(|f| spec_viewer::ui::render(f, state))?;
 
+    // The watch starts before the restored tree position exists, so folders
+    // restored as open are registered here rather than by a later change.
+    let mut watch_dir_sync = WatchDirSync::default();
+    sync_baseline_watch_dirs(state, watch, &mut watch_dir_sync);
+    let mut has_watch_dir_sync_hint = false;
+
     loop {
         // Checked on every pass -- including after an input poll that timed
         // out -- so a finished scan shows up without waiting for a key. Only
         // a real result redraws, which keeps an idle viewer from repainting.
         if spec_viewer::app::poll_rescan(state) {
+            has_watch_dir_sync_hint = true;
             terminal.draw(|f| spec_viewer::ui::render(f, state))?;
         }
 
         if let Ok(fs_event) = rx.try_recv() {
+            has_watch_dir_sync_hint = true;
             if step(terminal, state, spec_viewer::app::Action::Fs(fs_event))?
                 == spec_viewer::app::Control::Quit
             {
                 break;
             }
         }
+
+        // Outside the input branch so every way of opening a folder or a
+        // document (keys, mouse, restore, search) is picked up the same way.
+        reconcile_watch_dirs(state, watch, &mut watch_dir_sync, has_watch_dir_sync_hint);
+        has_watch_dir_sync_hint = false;
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             // Apply every already-queued input event (an `update`, no
@@ -312,6 +427,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                 }
             }
             let is_rescan_applied = spec_viewer::app::poll_rescan(state);
+            has_watch_dir_sync_hint |= is_rescan_applied;
             if applied_any || is_rescan_applied {
                 terminal.draw(|f| spec_viewer::ui::render(f, state))?;
             }
@@ -330,6 +446,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                 if control == spec_viewer::app::Control::Quit {
                     break;
                 }
+                sync_baseline_watch_dirs(state, watch, &mut watch_dir_sync);
             }
         } else if state.auto_scroll.is_some() {
             // Poll timed out with no input at all -- deliver a Tick so
@@ -604,11 +721,7 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
         }
     };
 
-    let new_watch = if args.no_watch {
-        spec_viewer::watch::manual("--no-watch")
-    } else {
-        spec_viewer::watch::start(&root, tx.clone())
-    };
+    let new_watch = start_watch_for(&source, &root, tx, args.no_watch);
     let watch_status = match &new_watch {
         spec_viewer::watch::Watch::Live(_) => spec_viewer::app::WatchStatus::Live,
         spec_viewer::watch::Watch::Manual(reason) => spec_viewer::app::WatchStatus::Manual {
@@ -925,11 +1038,7 @@ fn main() {
     // (`handle_switch_mode`) restarts the watch against a new root and needs
     // its own sender to hand to `watch::start` again, so `tx` must survive
     // this first call rather than being consumed by it.
-    let mut watch = if args.no_watch {
-        spec_viewer::watch::manual("--no-watch")
-    } else {
-        spec_viewer::watch::start(&root, tx.clone())
-    };
+    let mut watch = start_watch_for(&source, &root, &tx, args.no_watch);
     let watch_status = match &watch {
         spec_viewer::watch::Watch::Live(_) => spec_viewer::app::WatchStatus::Live,
         spec_viewer::watch::Watch::Manual(reason) => spec_viewer::app::WatchStatus::Manual {
@@ -4011,5 +4120,254 @@ gamma trailing line
 
         drop(watch);
         fs::remove_dir_all(&root).ok();
+    }
+
+    // --- spec-viewer-watch-opened-dirs: loop sync and catch-up ----------
+
+    fn files_state_with_background_rescan(root: &Path) -> spec_viewer::app::AppState {
+        let mut state = spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree::scan(root)),
+            root.to_path_buf(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        );
+        state.rescan_mode = spec_viewer::app::RescanMode::Background;
+        state
+    }
+
+    fn start_files_watch(state: &spec_viewer::app::AppState, root: &Path) -> spec_viewer::watch::Watch {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The receiver is leaked on purpose: a dropped one would make the
+        // debouncer's sends fail for the whole test.
+        std::mem::forget(rx);
+        start_watch_for(&state.root, root, &tx, false)
+    }
+
+    fn open_dir(state: &mut spec_viewer::app::AppState, dir: &Path) {
+        state.tree.open(vec![spec_viewer::spec::NodeId::Dir(dir.to_path_buf())]);
+    }
+
+    fn watched_dirs_of(watch: &spec_viewer::watch::Watch) -> std::collections::BTreeSet<PathBuf> {
+        match watch {
+            spec_viewer::watch::Watch::Live(live) => live.watched_dirs().clone(),
+            spec_viewer::watch::Watch::Manual(reason) => panic!("expected Live, got Manual({reason})"),
+        }
+    }
+
+    fn canonical(paths: &[&Path]) -> std::collections::BTreeSet<PathBuf> {
+        paths.iter().map(|p| p.canonicalize().unwrap()).collect()
+    }
+
+    fn make_files_root(name: &str, subdirs: &[&str]) -> PathBuf {
+        let root = scratch_dir(name);
+        for sub in subdirs {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn reconcile_registers_expanded_folders_and_requests_one_rescan() {
+        let root = make_files_root("reconcile_expand", &["a", "b"]);
+        let mut state = files_state_with_background_rescan(&root);
+        let mut watch = start_files_watch(&state, &root);
+        let mut sync = WatchDirSync::default();
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+
+        open_dir(&mut state, &root.join("a"));
+        open_dir(&mut state, &root.join("b"));
+        let outcome = reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false);
+
+        assert_eq!(
+            outcome,
+            WatchDirSyncOutcome::Synced { newly_registered: 2, is_rescan_requested: true },
+            "two folders added together must still ask for a single rescan"
+        );
+        assert_eq!(
+            watched_dirs_of(&watch),
+            canonical(&[&root, &root.join("a"), &root.join("b")])
+        );
+        assert!(state.rescan.is_scanning(), "the catch-up rescan must have been queued");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_skips_syncing_when_nothing_changed() {
+        let root = make_files_root("reconcile_idle", &["a"]);
+        let mut state = files_state_with_background_rescan(&root);
+        let mut watch = start_files_watch(&state, &root);
+        let mut sync = WatchDirSync::default();
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+
+        // A folder opened behind the tracker's back would be registered by a
+        // sync, so it staying unregistered proves no sync ran.
+        assert_eq!(
+            reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false),
+            WatchDirSyncOutcome::Skipped
+        );
+        assert_eq!(watched_dirs_of(&watch), canonical(&[&root]));
+
+        open_dir(&mut state, &root.join("a"));
+        reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false);
+        assert_eq!(
+            reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false),
+            WatchDirSyncOutcome::Skipped,
+            "a second pass with the same opened set must not sync again"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_syncs_again_on_a_hint_without_requesting_a_rescan_when_nothing_is_new() {
+        let root = make_files_root("reconcile_hint", &["a"]);
+        let mut state = files_state_with_background_rescan(&root);
+        let mut watch = start_files_watch(&state, &root);
+        let mut sync = WatchDirSync::default();
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+
+        assert_eq!(
+            reconcile_watch_dirs(&mut state, &mut watch, &mut sync, true),
+            WatchDirSyncOutcome::Synced { newly_registered: 0, is_rescan_requested: false }
+        );
+        assert!(!state.rescan.is_scanning());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_syncs_when_only_the_open_document_changes() {
+        let root = make_files_root("reconcile_doc", &["a"]);
+        fs::write(root.join("a/note.md"), "# note\n").unwrap();
+        let mut state = files_state_with_background_rescan(&root);
+        let mut watch = start_files_watch(&state, &root);
+        let mut sync = WatchDirSync::default();
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+
+        state.doc = spec_viewer::app::loader::load_doc(&root.join("a/note.md"), 80);
+        let outcome = reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false);
+
+        assert_eq!(
+            outcome,
+            WatchDirSyncOutcome::Synced { newly_registered: 1, is_rescan_requested: true }
+        );
+        assert_eq!(watched_dirs_of(&watch), canonical(&[&root, &root.join("a")]));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn baseline_sync_registers_restored_open_folders_without_a_rescan() {
+        let root = make_files_root("baseline_restored", &["a", "b"]);
+        let mut state = files_state_with_background_rescan(&root);
+        let mut watch = start_files_watch(&state, &root);
+        open_dir(&mut state, &root.join("a"));
+        open_dir(&mut state, &root.join("b"));
+        let mut sync = WatchDirSync::default();
+
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+
+        assert_eq!(
+            watched_dirs_of(&watch),
+            canonical(&[&root, &root.join("a"), &root.join("b")])
+        );
+        assert!(!state.rescan.is_scanning(), "the baseline must not queue a rescan");
+        assert_eq!(
+            reconcile_watch_dirs(&mut state, &mut watch, &mut sync, false),
+            WatchDirSyncOutcome::Skipped,
+            "the baseline must also seed the key"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kiro_source_starts_recursive_and_reconcile_does_nothing() {
+        let root = temp_kiro_root("reconcile_kiro");
+        write_requirements_spec(&root, "demo", "# Doc\n");
+        let mut state = build_state_from(&root, (120, 40));
+        state.rescan_mode = spec_viewer::app::RescanMode::Background;
+        let mut watch = start_files_watch(&state, &root);
+        let mut sync = WatchDirSync::default();
+
+        match &watch {
+            spec_viewer::watch::Watch::Live(live) => {
+                assert_eq!(live.scope(), spec_viewer::watch::WatchScope::Recursive)
+            }
+            spec_viewer::watch::Watch::Manual(reason) => panic!("expected Live, got {reason}"),
+        }
+        sync_baseline_watch_dirs(&state, &mut watch, &mut sync);
+        let outcome = reconcile_watch_dirs(&mut state, &mut watch, &mut sync, true);
+
+        assert_eq!(
+            outcome,
+            WatchDirSyncOutcome::Synced { newly_registered: 0, is_rescan_requested: false }
+        );
+        assert!(!state.rescan.is_scanning());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_is_skipped_for_a_manual_watch() {
+        let root = make_files_root("reconcile_manual", &["a"]);
+        let mut state = files_state_with_background_rescan(&root);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = start_watch_for(&state.root, &root, &tx, true);
+        let mut sync = WatchDirSync::default();
+
+        assert!(matches!(watch, spec_viewer::watch::Watch::Manual(_)));
+        open_dir(&mut state, &root.join("a"));
+        assert_eq!(
+            reconcile_watch_dirs(&mut state, &mut watch, &mut sync, true),
+            WatchDirSyncOutcome::Skipped
+        );
+        assert!(!state.rescan.is_scanning());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn switching_from_kiro_to_files_starts_the_watch_scoped_to_opened_folders() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_kiro_root("switch_scope_to_files");
+        write_requirements_spec(&root, "demo", "# Doc\n");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let mut state = build_state_from(&root, (120, 40));
+        let args = args_with_path(Some(root.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+
+        handle_switch_mode(&mut terminal, &mut state, &root, &args, &tx, &mut watch)
+            .expect("switch should succeed");
+
+        match &watch {
+            spec_viewer::watch::Watch::Live(live) => {
+                assert_eq!(live.scope(), spec_viewer::watch::WatchScope::OpenedDirs);
+                assert_eq!(live.watched_dirs(), &canonical(&[&root]));
+            }
+            spec_viewer::watch::Watch::Manual(reason) => panic!("expected Live, got {reason}"),
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn switching_from_files_to_kiro_starts_the_watch_recursive() {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = scratch_dir("switch_scope_to_kiro");
+        fs::create_dir_all(start.join(".kiro/specs")).unwrap();
+        let mut state = files_state_with_background_rescan(&start);
+        let args = args_with_path(Some(start.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+
+        handle_switch_mode(&mut terminal, &mut state, &start, &args, &tx, &mut watch)
+            .expect("switch should succeed");
+
+        match &watch {
+            spec_viewer::watch::Watch::Live(live) => {
+                assert_eq!(live.scope(), spec_viewer::watch::WatchScope::Recursive)
+            }
+            spec_viewer::watch::Watch::Manual(reason) => panic!("expected Live, got {reason}"),
+        }
+        fs::remove_dir_all(&start).ok();
     }
 }

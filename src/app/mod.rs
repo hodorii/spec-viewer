@@ -664,6 +664,38 @@ fn expand_all(state: &mut AppState) {
     }
 }
 
+/// Folders whose direct children a live watch must report while the Files
+/// tree is shown: the scan root, every folder the user can currently see
+/// opened, and the folder of the open document.
+pub fn desired_watch_dirs(state: &AppState) -> std::collections::BTreeSet<PathBuf> {
+    let TreeSource::Files(tree) = &state.root else {
+        return std::collections::BTreeSet::new();
+    };
+    let opened = state.tree.opened();
+    let mut dirs: std::collections::BTreeSet<PathBuf> = opened
+        .iter()
+        .filter(|node_path| is_visibly_opened_dir(node_path, opened))
+        .filter_map(|node_path| match node_path.last() {
+            Some(NodeId::Dir(dir)) => Some(dir.clone()),
+            _ => None,
+        })
+        .collect();
+    dirs.insert(tree.root.clone());
+    if let DocView::Rendered { path, .. } = &state.doc {
+        if let Some(parent) = path.parent() {
+            dirs.insert(parent.to_path_buf());
+        }
+    }
+    dirs
+}
+
+/// A folder is on screen only if every ancestor is open too; collapsing a
+/// parent leaves its children's ids in `opened`, so the id alone proves nothing.
+fn is_visibly_opened_dir(node_path: &[NodeId], opened: &std::collections::HashSet<Vec<NodeId>>) -> bool {
+    matches!(node_path.last(), Some(NodeId::Dir(_)))
+        && (1..node_path.len()).all(|prefix_len| opened.contains(&node_path[..prefix_len]))
+}
+
 /// Requirements 1.1, 1.3: the file `Action::Edit` may open, if any. Only
 /// `DocView::Rendered` names a real, currently-displayed file on disk --
 /// every other variant (empty panel, a spec's definition summary, or one of
@@ -1515,6 +1547,12 @@ fn request_rescan(state: &mut AppState) {
             sort_key: state.sort_key,
         }),
     }
+}
+
+/// Rescan once to cover changes made while a newly watched folder was still
+/// unwatched; the coordinator folds it into a scan already in flight.
+pub fn request_catch_up_rescan(state: &mut AppState) {
+    request_rescan(state);
 }
 
 /// Install a freshly scanned tree. The sort is re-applied with the key active
@@ -4817,5 +4855,110 @@ mod reducer_tests {
 
         assert_eq!(snapshot_dir(&root), before);
         fs::remove_dir_all(&root).ok();
+    }
+
+    // --- desired watch dirs -----------------------------------------------
+
+    fn dir_entry(path: &str, depth: u8) -> FsEntry {
+        FsEntry { path: PathBuf::from(path), is_dir: true, depth, modified: SystemTime::UNIX_EPOCH }
+    }
+
+    /// root/a/b and root/c, as a Files-mode state with nothing open.
+    fn nested_files_state() -> AppState {
+        let tree = FsTree {
+            root: PathBuf::from("/w"),
+            entries: vec![dir_entry("/w/a", 1), dir_entry("/w/a/b", 2), dir_entry("/w/c", 1)],
+        };
+        AppState::new(TreeSource::Files(tree), PathBuf::from("/w"), (120, 40), WatchStatus::Live, TreeMode::Auto, true)
+    }
+
+    fn dir_id_path(dirs: &[&str]) -> Vec<NodeId> {
+        dirs.iter().map(|d| NodeId::Dir(PathBuf::from(d))).collect()
+    }
+
+    fn paths(dirs: &[&str]) -> std::collections::BTreeSet<PathBuf> {
+        dirs.iter().map(PathBuf::from).collect()
+    }
+
+    fn show_file(state: &mut AppState, path: &str) {
+        state.doc = DocView::Rendered {
+            path: PathBuf::from(path),
+            r: markdown::render("x\n", 80),
+            meta: FileInfo::default(),
+        };
+    }
+
+    #[test]
+    fn desired_watch_dirs_is_only_the_root_when_nothing_is_open() {
+        let state = nested_files_state();
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w"]));
+    }
+
+    #[test]
+    fn desired_watch_dirs_adds_an_opened_folder() {
+        let mut state = nested_files_state();
+        state.tree.open(dir_id_path(&["/w/a"]));
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a"]));
+    }
+
+    #[test]
+    fn desired_watch_dirs_skips_folders_under_a_collapsed_ancestor() {
+        let mut state = nested_files_state();
+        state.tree.open(dir_id_path(&["/w/a"]));
+        state.tree.open(dir_id_path(&["/w/a", "/w/a/b"]));
+        state.tree.close(&dir_id_path(&["/w/a"]));
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w"]), "b stays in opened but is hidden");
+
+        state.tree.open(dir_id_path(&["/w/a"]));
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a", "/w/a/b"]));
+    }
+
+    #[test]
+    fn desired_watch_dirs_keeps_the_open_documents_folder_even_when_collapsed() {
+        let mut state = nested_files_state();
+        show_file(&mut state, "/w/a/b/doc.md");
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a/b"]));
+
+        show_file(&mut state, "/w/c/other.md");
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/c"]), "only the open document changed");
+    }
+
+    #[test]
+    fn desired_watch_dirs_ignores_non_rendered_docs() {
+        let mut state = nested_files_state();
+        state.doc = DocView::Missing(PathBuf::from("/w/a/gone.md"));
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w"]));
+    }
+
+    #[test]
+    fn desired_watch_dirs_is_empty_for_kiro_and_spec_kit_sources() {
+        let mut state = test_state();
+        update(&mut state, Action::ExpandAll);
+        show_file(&mut state, "/somewhere/doc.md");
+        assert!(desired_watch_dirs(&state).is_empty());
+
+        state.root = TreeSource::SpecKit(vec![]);
+        assert!(desired_watch_dirs(&state).is_empty());
+    }
+
+    #[test]
+    fn desired_watch_dirs_after_expand_all_includes_every_folder() {
+        let mut state = nested_files_state();
+        update(&mut state, Action::ExpandAll);
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a", "/w/a/b", "/w/c"]));
+    }
+
+    #[test]
+    fn desired_watch_dirs_after_restoring_a_position_includes_the_restored_folders() {
+        let mut state = nested_files_state();
+        state.remembered_tree_positions.insert(
+            tree_position_key(&state),
+            RememberedTreePosition {
+                selected: vec![],
+                opened: vec![dir_id_path(&["/w/a"]), dir_id_path(&["/w/a", "/w/a/b"])],
+            },
+        );
+        restore_tree_position(&mut state);
+        assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a", "/w/a/b"]));
     }
 }

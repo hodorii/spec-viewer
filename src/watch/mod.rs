@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn opened_dirs_start_time_does_not_scale_with_subdirectory_count() {
         use std::time::Instant;
-        const SUBDIR_COUNT: usize = 5_000;
+        const SUBDIR_COUNT: usize = 20_000;
         let small = scratch_dir("start-small");
         let large = scratch_dir("start-large");
         for i in 0..SUBDIR_COUNT {
@@ -313,7 +313,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&small);
         let _ = std::fs::remove_dir_all(&large);
 
-        let allowed = (small_elapsed * 10).max(Duration::from_millis(50));
+        let allowed = (small_elapsed * 10).max(Duration::from_millis(40));
         assert!(
             large_elapsed <= allowed,
             "{SUBDIR_COUNT}-subdir start took {large_elapsed:?}, small took {small_elapsed:?}"

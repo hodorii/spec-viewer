@@ -14,6 +14,7 @@ use std::time::SystemTime;
 pub use crate::spec::{DirSnapshot, FileSnapshot, SpecDirSnapshot};
 
 use crate::markdown;
+use crate::spec::methodology::MethodologySettings;
 use crate::spec::{DocKind, FsTree, GroupSnapshot, Spec};
 
 use super::{DocView, FileInfo};
@@ -433,6 +434,30 @@ pub fn load_for_selection_with(
             Some(entry) => read_doc(&entry.path, width),
             None => DocView::Missing(spec.dir.join(format!("{k:?}"))),
         },
+    }
+}
+
+/// Settings file location relative to the kiro root.
+const METHODOLOGY_SETTINGS_RELATIVE_PATH: &str = "settings/spec-viewer.json";
+
+/// Reads `<kiro_root>/settings/spec-viewer.json` over the defaults. A missing
+/// file is the normal case and is silent; an unreadable or malformed one falls
+/// back to the defaults with a warning for the caller to show.
+pub fn load_methodology_settings(kiro_root: &Path) -> (MethodologySettings, Option<String>) {
+    let path = kiro_root.join(METHODOLOGY_SETTINGS_RELATIVE_PATH);
+    let json = match fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (MethodologySettings::kiro_default(), None);
+        }
+        Err(error) => {
+            let warning = format!("cannot read {}: {error}", path.display());
+            return (MethodologySettings::kiro_default(), Some(warning));
+        }
+    };
+    match MethodologySettings::parse_overrides(&json) {
+        Ok(settings) => (settings, None),
+        Err(error) => (MethodologySettings::kiro_default(), Some(error.to_string())),
     }
 }
 
@@ -971,6 +996,51 @@ mod tests {
             other => panic!("expected Rendered, got {other:?}"),
         }
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn write_settings(root: &Path, json: &str) {
+        fs::create_dir_all(root.join("settings")).unwrap();
+        fs::write(root.join("settings/spec-viewer.json"), json).unwrap();
+    }
+
+    #[test]
+    fn missing_settings_file_gives_defaults_without_warning() {
+        let dir = scratch_dir("settings_missing");
+        let (settings, warning) = load_methodology_settings(&dir);
+        assert_eq!(settings, MethodologySettings::kiro_default());
+        assert_eq!(warning, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn partial_settings_file_keeps_the_other_defaults() {
+        let dir = scratch_dir("settings_partial");
+        write_settings(&dir, r#"{"task_list_file":"plan.md"}"#);
+        let (settings, warning) = load_methodology_settings(&dir);
+        assert_eq!(settings.task_list_file, "plan.md");
+        assert_eq!(settings.tags, MethodologySettings::kiro_default().tags);
+        assert_eq!(warning, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_settings_file_gives_defaults_and_a_warning() {
+        let dir = scratch_dir("settings_malformed");
+        write_settings(&dir, "{ not json");
+        let (settings, warning) = load_methodology_settings(&dir);
+        assert_eq!(settings, MethodologySettings::kiro_default());
+        assert!(warning.expect("warning").contains("invalid methodology settings JSON"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_settings_path_gives_defaults_and_a_warning() {
+        let dir = scratch_dir("settings_unreadable");
+        fs::create_dir_all(dir.join("settings/spec-viewer.json")).unwrap();
+        let (settings, warning) = load_methodology_settings(&dir);
+        assert_eq!(settings, MethodologySettings::kiro_default());
+        assert!(warning.is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

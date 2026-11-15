@@ -350,6 +350,13 @@ fn apply_pending_updates_and_reconcile<B: ratatui::backend::Backend>(
     Ok(spec_viewer::app::Control::Continue)
 }
 
+/// Shows the document named on the command line through the shared install
+/// point, so a task list opened this way looks the same as one selected in the tree.
+fn show_startup_file_view(state: &mut spec_viewer::app::AppState, path: &Path) {
+    let view = spec_viewer::app::loader::load_doc(path, spec_viewer::app::doc_panel_width(state));
+    spec_viewer::app::install_doc(state, view);
+}
+
 fn is_files_source(state: &spec_viewer::app::AppState) -> bool {
     matches!(state.root, spec_viewer::spec::TreeSource::Files(_))
 }
@@ -801,11 +808,47 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
     // scratch regardless; this ordering avoids even that gap.
     *watch = new_watch;
 
-    step(
-        terminal,
+    let control = spec_viewer::app::update(
         state,
         spec_viewer::app::Action::ApplySourceSwitch { source, root, watch_status },
-    )
+    );
+    // After the switch, which clears any popup: the settings belong to the new
+    // source and their warning must survive until the redraw below.
+    apply_methodology_settings(state);
+    terminal.draw(|f| spec_viewer::ui::render(f, state))?;
+    Ok(control)
+}
+
+/// Methodology settings exist only for a `.kiro` source, read from that
+/// source's own folder; a broken file keeps the defaults and is reported
+/// as a message popup.
+fn apply_methodology_settings(state: &mut spec_viewer::app::AppState) {
+    state.methodology = None;
+    if !matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)) {
+        return;
+    }
+    let (settings, warning) = spec_viewer::app::loader::load_methodology_settings(&state.kiro_root);
+    state.methodology = Some(settings);
+    if let Some(warning) = warning {
+        state.popup = Some(spec_viewer::app::Popup::Message(format!(
+            "방법론 설정 오류, 기본값으로 계속합니다: {warning}"
+        )));
+    }
+}
+
+/// The state both startup and the tests start from: `AppState::new` plus the
+/// settings of the source it was given.
+fn initial_state(
+    source: spec_viewer::spec::TreeSource,
+    root: PathBuf,
+    size: (u16, u16),
+    watch_status: spec_viewer::app::WatchStatus,
+    tree_mode: spec_viewer::app::TreeMode,
+    tree_visible: bool,
+) -> spec_viewer::app::AppState {
+    let mut state = spec_viewer::app::AppState::new(source, root, size, watch_status, tree_mode, tree_visible);
+    apply_methodology_settings(&mut state);
+    state
 }
 
 /// What kind of tree source startup resolved to, plus everything `main()`
@@ -1120,14 +1163,7 @@ fn main() {
 
     let tree_visible = spec_viewer::app::initial_tree_visible(tree_mode, is_file, size.0);
 
-    let mut state = spec_viewer::app::AppState::new(
-        source,
-        root.clone(),
-        size,
-        watch_status,
-        tree_mode,
-        tree_visible,
-    );
+    let mut state = initial_state(source, root.clone(), size, watch_status, tree_mode, tree_visible);
     // `resolve_source` already sorted the built `SpecRoot` by this same key
     // -- this just keeps `state.sort_key` in sync with it for the `s`
     // hotkey / a later resync.
@@ -1145,7 +1181,7 @@ fn main() {
         // terminal width -- a two-panel layout's doc panel is narrower than
         // the terminal, and `size.0` here wrapped text past the panel's
         // right border, silently dropping clipped lines (tasks.md 20.1).
-        state.doc = spec_viewer::app::loader::load_doc(path, spec_viewer::app::doc_panel_width(&state));
+        show_startup_file_view(&mut state, path);
     }
 
     // `watch` (holding the live Debouncer, if any) must outlive the loop
@@ -4586,6 +4622,17 @@ gamma trailing line
     }
 
     #[test]
+    fn a_task_list_named_on_the_command_line_starts_as_the_structured_view() {
+        let kiro_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kiro-tasks-view");
+        let mut state = build_state_from(&kiro_root, (120, 40));
+        let task_list = kiro_root.join("specs/tasks-view-sample/tasks.md");
+
+        show_startup_file_view(&mut state, &task_list);
+
+        assert!(state.tasks_view.is_some(), "the startup file view must go through the shared install point");
+    }
+
+    #[test]
     fn loop_pass_shows_a_finished_background_rescan() {
         let root = make_files_root("loop_pass_poll", &["a"]);
         let mut state = files_state_with_background_rescan(&root);
@@ -4725,6 +4772,165 @@ gamma trailing line
             }
             spec_viewer::watch::Watch::Manual(reason) => panic!("expected Live, got {reason}"),
         }
+        fs::remove_dir_all(&start).ok();
+    }
+
+    // --- methodology settings follow the source: start and every switch ---
+
+    const SPEC_JSON_FOR_SETTINGS_TESTS: &str = "{\n  \"name\": \"demo\",\n  \"created_at\": \"2026-01-01T00:00:00Z\",\n  \"updated_at\": \"2026-01-01T00:00:00Z\",\n  \"language\": \"ko\",\n  \"phase\": \"tasks-generated\",\n  \"approvals\": {}\n}\n";
+
+    /// A `.kiro` folder whose only spec keeps its task list in `plan.md`.
+    fn kiro_root_with_renamed_task_list(name: &str, settings_json: Option<&str>) -> PathBuf {
+        let kiro_root = scratch_dir(name).join(".kiro");
+        let spec_dir = kiro_root.join("specs/demo");
+        fs::create_dir_all(&spec_dir).unwrap();
+        fs::write(spec_dir.join("spec.json"), SPEC_JSON_FOR_SETTINGS_TESTS).unwrap();
+        fs::write(spec_dir.join("plan.md"), "# 계획\n\n- [ ] 1. 첫 작업\n  - _Requirements: 1.1_\n").unwrap();
+        fs::write(spec_dir.join("tasks.md"), "# 작업\n\n- [ ] 1. 다른 작업\n").unwrap();
+        if let Some(json) = settings_json {
+            fs::create_dir_all(kiro_root.join("settings")).unwrap();
+            fs::write(kiro_root.join("settings/spec-viewer.json"), json).unwrap();
+        }
+        kiro_root
+    }
+
+    fn kiro_source_of(kiro_root: &Path) -> spec_viewer::spec::TreeSource {
+        let snapshot = spec_viewer::app::load_snapshot(kiro_root);
+        spec_viewer::spec::TreeSource::Kiro(spec_viewer::spec::build(&snapshot))
+    }
+
+    fn initial_state_for(kiro_root: &Path) -> spec_viewer::app::AppState {
+        initial_state(
+            kiro_source_of(kiro_root),
+            kiro_root.to_path_buf(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        )
+    }
+
+    fn open_doc_with_enter(state: &mut spec_viewer::app::AppState, file_name: &str) {
+        state.tree.select(vec![
+            NodeId::Spec("demo".to_string()),
+            NodeId::Doc("demo".to_string(), DocKind::Other(file_name.to_string())),
+        ]);
+        spec_viewer::app::update(state, Action::Key(key(KeyCode::Enter)));
+    }
+
+    const RENAME_TASK_LIST_SETTINGS: &str = "{\"task_list_file\": \"plan.md\"}";
+
+    #[test]
+    fn startup_applies_the_settings_file_so_the_renamed_task_list_is_structured() {
+        let kiro_root = kiro_root_with_renamed_task_list("start_renamed", Some(RENAME_TASK_LIST_SETTINGS));
+        let mut state = initial_state_for(&kiro_root);
+
+        open_doc_with_enter(&mut state, "plan.md");
+
+        assert!(state.tasks_view.is_some(), "the configured file must be the structured task list");
+        assert_eq!(state.popup, None);
+        fs::remove_dir_all(kiro_root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn startup_without_a_settings_file_keeps_tasks_md_structured_and_plan_md_plain() {
+        let kiro_root = kiro_root_with_renamed_task_list("start_default", None);
+        let mut state = initial_state_for(&kiro_root);
+
+        open_doc_with_enter(&mut state, "plan.md");
+        assert!(state.tasks_view.is_none());
+        state.tree.select(vec![
+            NodeId::Spec("demo".to_string()),
+            NodeId::Doc("demo".to_string(), DocKind::Tasks),
+        ]);
+        spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Enter)));
+        assert!(state.tasks_view.is_some());
+        assert_eq!(state.popup, None);
+        fs::remove_dir_all(kiro_root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_broken_settings_file_falls_back_to_defaults_and_the_warning_is_on_the_first_frame() {
+        let kiro_root = kiro_root_with_renamed_task_list("start_broken", Some("{ not json"));
+        let mut state = initial_state_for(&kiro_root);
+
+        assert_eq!(
+            state.methodology,
+            Some(spec_viewer::spec::methodology::MethodologySettings::kiro_default())
+        );
+        let Some(Popup::Message(message)) = state.popup.clone() else {
+            panic!("expected a message popup, got {:?}", state.popup);
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|f| spec_viewer::ui::render(f, &mut state)).unwrap();
+        assert!(message.contains("invalid methodology settings JSON"), "message: {message}");
+        assert!(buffer_contains(terminal.backend().buffer(), "invalid methodology"));
+        fs::remove_dir_all(kiro_root.parent().unwrap()).ok();
+    }
+
+    fn switch_mode_once(state: &mut spec_viewer::app::AppState, start: &Path) {
+        let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let args = args_with_path(Some(start.to_path_buf()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        handle_switch_mode(&mut terminal, state, start, &args, &tx, &mut watch).expect("switch should succeed");
+    }
+
+    fn files_state_at(dir: &Path) -> spec_viewer::app::AppState {
+        spec_viewer::app::AppState::new(
+            spec_viewer::spec::TreeSource::Files(spec_viewer::spec::FsTree::scan(dir)),
+            dir.to_path_buf(),
+            (120, 40),
+            spec_viewer::app::WatchStatus::Live,
+            spec_viewer::app::TreeMode::Auto,
+            true,
+        )
+    }
+
+    #[test]
+    fn switching_into_kiro_applies_the_settings_file() {
+        let kiro_root = kiro_root_with_renamed_task_list("switch_into_kiro", Some(RENAME_TASK_LIST_SETTINGS));
+        let start = kiro_root.parent().unwrap().to_path_buf();
+        let mut state = files_state_at(&start);
+        assert_eq!(state.methodology, None);
+
+        switch_mode_once(&mut state, &start);
+
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(state.methodology.as_ref().map(|settings| settings.task_list_file.as_str()), Some("plan.md"));
+        open_doc_with_enter(&mut state, "plan.md");
+        assert!(state.tasks_view.is_some());
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn switching_into_kiro_with_a_broken_settings_file_shows_a_message_popup() {
+        let kiro_root = kiro_root_with_renamed_task_list("switch_broken", Some("[1, 2"));
+        let start = kiro_root.parent().unwrap().to_path_buf();
+        let mut state = files_state_at(&start);
+
+        switch_mode_once(&mut state, &start);
+
+        assert!(matches!(state.popup, Some(Popup::Message(_))), "popup: {:?}", state.popup);
+        assert_eq!(
+            state.methodology,
+            Some(spec_viewer::spec::methodology::MethodologySettings::kiro_default())
+        );
+        fs::remove_dir_all(&start).ok();
+    }
+
+    #[test]
+    fn switching_from_kiro_to_files_clears_the_settings() {
+        let kiro_root = kiro_root_with_renamed_task_list("switch_out_of_kiro", Some(RENAME_TASK_LIST_SETTINGS));
+        let start = kiro_root.parent().unwrap().to_path_buf();
+        let mut state = initial_state_for(&kiro_root);
+        assert!(state.methodology.is_some());
+
+        switch_mode_once(&mut state, &start);
+
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
+        assert_eq!(state.methodology, None);
         fs::remove_dir_all(&start).ok();
     }
 }

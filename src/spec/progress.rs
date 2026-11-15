@@ -25,16 +25,13 @@ pub fn count_progress(tasks_md: &str) -> Option<Progress> {
     let mut total = 0u32;
 
     for line in tasks_md.lines() {
-        let trimmed = line.trim_start();
-        let after_marker = strip_list_marker(trimmed);
-
-        if after_marker.starts_with("[x]") || after_marker.starts_with("[X]") {
-            done += 1;
+        // `[ ]*` (optional task) is an ordinary unchecked checkbox here: it
+        // contributes to `total` but not `done`.
+        if let Some((state, _)) = parse_checkbox_marker(line) {
             total += 1;
-        } else if after_marker.starts_with("[ ]") {
-            // Covers both the plain `[ ]` form and the optional-task `[ ]*`
-            // variant; both are unchecked, so only `total` is incremented.
-            total += 1;
+            if state == TaskState::Done {
+                done += 1;
+            }
         }
     }
 
@@ -43,6 +40,30 @@ pub fn count_progress(tasks_md: &str) -> Option<Progress> {
     } else {
         Some(Progress { done, total })
     }
+}
+
+/// Checkbox state of one task line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Done,
+    Open,
+    OptionalOpen,
+}
+
+/// Recognize a checkbox line and split it into its state and the text after the marker.
+pub(crate) fn parse_checkbox_marker(line: &str) -> Option<(TaskState, &str)> {
+    let after_marker = strip_list_marker(line.trim_start());
+    let (state, after_checkbox) = if let Some(rest) = after_marker
+        .strip_prefix("[x]")
+        .or_else(|| after_marker.strip_prefix("[X]"))
+    {
+        (TaskState::Done, rest)
+    } else if let Some(rest) = after_marker.strip_prefix("[ ]*") {
+        (TaskState::OptionalOpen, rest)
+    } else {
+        (TaskState::Open, after_marker.strip_prefix("[ ]")?)
+    };
+    Some((state, after_checkbox.trim_start()))
 }
 
 /// Strip an optional leading `- ` or `-` Markdown list marker, if present.
@@ -128,5 +149,30 @@ mod tests {
 
         assert_eq!(progress, Progress { done: 2, total: 2 });
         assert_eq!(progress.done, progress.total);
+    }
+
+    #[test]
+    fn marker_done_variants_with_rest() {
+        assert_eq!(parse_checkbox_marker("- [x] 1.1 title"), Some((TaskState::Done, "1.1 title")));
+        assert_eq!(parse_checkbox_marker("  - [X] 2 t"), Some((TaskState::Done, "2 t")));
+    }
+
+    #[test]
+    fn marker_open_and_optional_open() {
+        assert_eq!(parse_checkbox_marker("- [ ] 3 t"), Some((TaskState::Open, "3 t")));
+        assert_eq!(parse_checkbox_marker("- [ ]* 4 t"), Some((TaskState::OptionalOpen, "4 t")));
+    }
+
+    #[test]
+    fn marker_accepts_bare_checkbox_and_dash_without_space() {
+        assert_eq!(parse_checkbox_marker("[x] a"), Some((TaskState::Done, "a")));
+        assert_eq!(parse_checkbox_marker("-[ ] b"), Some((TaskState::Open, "b")));
+    }
+
+    #[test]
+    fn marker_rejects_non_checkbox_lines() {
+        assert_eq!(parse_checkbox_marker("  - DONE: x"), None);
+        assert_eq!(parse_checkbox_marker("# heading"), None);
+        assert_eq!(parse_checkbox_marker(""), None);
     }
 }

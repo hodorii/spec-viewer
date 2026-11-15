@@ -21,6 +21,7 @@
 //! - Confirm the current tree selection into the doc panel: `Enter`
 //!   (exercises requirement 2.6 without needing real tree-row navigation,
 //!   which needs a `Tree` render pass that does not exist until task 6.x)
+//! - Toggle the structured task list view: `v`
 //! - Help: `?` (requirement 6.11, explicit)
 //! - Toggle tree panel visibility: `T` (requirement 1.7; ignored under
 //!   `--tree always`, where the tree is pinned on)
@@ -117,7 +118,22 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: &[KeyCode::Enter],
         action: "select",
-        help: "선택한 트리 노드를 문서 패널에 로드",
+        help: "선택한 트리 노드를 문서 패널에 로드 (문서 포커스에서 링크가 선택돼 있으면 그 참조로 이동)",
+    },
+    Binding {
+        keys: &[KeyCode::Char('v')],
+        action: "toggle_tasks_view",
+        help: "작업 목록 문서: 구조화 보기 ↔ 원문 보기 전환",
+    },
+    Binding {
+        keys: &[KeyCode::Char('l')],
+        action: "next_link",
+        help: "구조화 작업 목록: 다음 참조 링크 선택 (선택 후 문서 포커스에서 Enter 로 이동)",
+    },
+    Binding {
+        keys: &[KeyCode::Char('L')],
+        action: "prev_link",
+        help: "구조화 작업 목록: 이전 참조 링크 선택",
     },
     Binding {
         keys: &[KeyCode::Char('?')],
@@ -291,6 +307,21 @@ mod tests {
         assert!(entries.iter().any(|(_, h)| h.contains("전환")));
         assert!(entries.iter().any(|(k, _)| k == "["));
         assert!(entries.iter().any(|(k, _)| k == "]"));
+    }
+
+    #[test]
+    fn l_and_shift_l_resolve_to_next_and_previous_link_actions() {
+        let l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        let shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(action_for_key(l), Some("next_link"));
+        assert_eq!(action_for_key(shift_l), Some("prev_link"));
+    }
+
+    #[test]
+    fn help_entries_cover_the_link_selection_keys() {
+        let entries = help_entries();
+        assert!(entries.iter().any(|(k, _)| k == "l"));
+        assert!(entries.iter().any(|(k, _)| k == "L"));
     }
 
     #[test]

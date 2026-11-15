@@ -1,7 +1,9 @@
 pub mod fs_tree;
 pub mod meta;
+pub mod methodology;
 pub mod progress;
 pub mod sort;
+pub mod tasks;
 pub mod spec_kit;
 
 pub use fs_tree::{FsEntry, FsTree};
@@ -286,6 +288,18 @@ impl TreeSource {
             NodeId::Spec(_) | NodeId::Dir(_) => None,
         }
     }
+}
+
+/// Tree node path (`[Spec, Doc]`) of the spec document stored at `file`, or
+/// `None` when no spec of a `.kiro`/spec-kit source owns that path.
+pub fn locate_doc_node(root: &TreeSource, file: &Path) -> Option<Vec<NodeId>> {
+    root.specs().iter().find_map(|spec| {
+        let doc = spec.docs.iter().find(|doc| doc.path == file)?;
+        Some(vec![
+            NodeId::Spec(spec.name.clone()),
+            NodeId::Doc(spec.name.clone(), doc.kind.clone()),
+        ])
+    })
 }
 
 /// Standard filenames handled by the canonical per-slot rules; anything else
@@ -1043,6 +1057,64 @@ Should not be included.
         assert_eq!(kiro.selection_file(&[spec_node]), None);
         assert_eq!(kiro.selection_file(&[NodeId::File(steering_file.clone())]), Some(steering_file));
         assert_eq!(kiro.selection_file(&[]), None);
+    }
+
+    #[test]
+    fn locate_doc_node_maps_spec_documents_for_kiro_and_spec_kit() {
+        for source in kiro_sources() {
+            let tasks = spec_dir_of("sample-signup").join("tasks.md");
+
+            assert_eq!(
+                locate_doc_node(&source, &tasks),
+                Some(vec![
+                    NodeId::Spec("sample-signup".to_string()),
+                    NodeId::Doc("sample-signup".to_string(), DocKind::Tasks),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn locate_doc_node_is_none_for_paths_outside_the_tree() {
+        for source in kiro_sources() {
+            let stranger = spec_dir_of("sample-signup").join("not-a-doc.md");
+            let other_spec = spec_dir_of("sample-billing").join("requirements.md");
+
+            assert_eq!(locate_doc_node(&source, &stranger), None);
+            assert_eq!(locate_doc_node(&source, &other_spec), None);
+        }
+    }
+
+    #[test]
+    fn locate_doc_node_is_none_for_a_files_source() {
+        let source = TreeSource::Files(FsTree::scan(&fixtures_root().join("steering")));
+        let file = fixtures_root().join("steering").join("product.md");
+
+        assert_eq!(locate_doc_node(&source, &file), None);
+    }
+
+    #[test]
+    fn tasks_view_sample_reads_as_a_kiro_spec_with_matching_progress() {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/kiro-tasks-view/specs/tasks-view-sample"
+        ));
+        let files = fs::read_dir(&dir)
+            .expect("sample spec dir exists")
+            .map(|entry| read_file_snapshot(&entry.expect("dir entry").path()))
+            .collect();
+        let root = build(&DirSnapshot {
+            specs: vec![SpecDirSnapshot { name: "tasks-view-sample".to_string(), dir, files }],
+            groups: Vec::new(),
+        });
+        let spec = &root.specs[0];
+
+        let tasks_doc = doc(spec, &DocKind::Tasks);
+        assert!(tasks_doc.exists);
+        assert_eq!(tasks_doc.progress, Some(Progress { done: 3, total: 7 }));
+        for kind in [DocKind::Requirements, DocKind::BizProcess] {
+            assert!(doc(spec, &kind).exists, "{kind:?}");
+        }
     }
 }
 

@@ -66,7 +66,10 @@ name↔updated only; the tree panel title shows the active key) ·
 `$VISUAL` > `$EDITOR` > `vi`) · `Space` toggle between files mode and spec mode at
 runtime (`--files` only sets which one you start in) · `o`/`c` expand/collapse
 every tree node at once (individual node fold/unfold via `Left`/`Right`/`Enter`
-stays one level at a time) · `?` help (scrolls with `j`/`k`/arrows) · arrow keys
+stays one level at a time) · `v` structured task list view for a spec's
+`tasks.md` (toggles back to plain markdown), then `l`/`L` pick the next/previous
+reference and `Enter` on the document panel jumps to it (a requirement clause, a
+business-process title, or a dependent task) · `?` help (scrolls with `j`/`k`/arrows) · arrow keys
 for tree/document
 navigation.
 
@@ -88,3 +91,17 @@ MIT (`LICENSE`). Direct dependencies are MIT or dual MIT/Apache-2.0 (a small
 number of transitive dependencies carry other permissive licenses — ISC,
 Zlib, CC0-1.0, WTFPL, Unicode-3.0/Unicode-DFS-2016 — none copyleft; run
 `cargo metadata` for the full tree). Third-party attribution: `THIRD_PARTY.md` (mdview, MIT).
+
+## Structured task list view
+
+In spec mode, selecting a spec's `tasks.md` and pressing `v` shows it as a task
+list: state, number, title, `(P 병렬)` marks, and each `_Tag: value_` line as a
+sub-line. Values that look like references (requirement clauses such as `2.1`,
+business-process titles, task numbers) are highlighted; pick one with `l`/`L`
+and press `Enter` to jump there. A reference that cannot be found shows a message
+and leaves the screen unchanged.
+
+Defaults can be overridden per project with `<kiro root>/settings/spec-viewer.json`:
+`task_list_file` (default `tasks.md`) and `tags`, each with `name`, optional
+`aliases`, and an optional `link` rule (`targets`, `locate`, `values`). A broken
+file shows a message at start and falls back to the defaults.

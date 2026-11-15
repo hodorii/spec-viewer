@@ -3,9 +3,11 @@ pub mod doc_cache;
 pub mod keymap;
 pub mod loader;
 pub mod mouse;
+pub mod navigator;
 pub mod position_store;
 pub mod rescan;
 pub mod search;
+pub mod tasks_view;
 
 pub use clipboard::Clipboard;
 
@@ -15,6 +17,7 @@ pub use loader::{
 };
 
 use crate::markdown::Rendered;
+use crate::spec::methodology::MethodologySettings;
 use crate::spec::{FsEntry, NodeId, SortKey, TreeSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -341,6 +344,14 @@ pub struct AppState {
     /// Rendered documents reused when the same file is selected again.
     /// Refresh and resize reloads bypass it so they always show the latest.
     pub doc_cache: doc_cache::DocCache,
+    /// Which file is the task list and how its tags link. `Some` only for a
+    /// `.kiro` source; `main` replaces the default once it reads the settings file.
+    pub methodology: Option<MethodologySettings>,
+    /// The structured view behind the task list document on screen, with its
+    /// link cursor. `None` whenever the doc panel shows anything else.
+    pub tasks_view: Option<tasks_view::TasksView>,
+    /// Whether a task list document is shown structured (true) or as plain markdown.
+    pub is_tasks_view_enabled: bool,
 }
 
 /// Which tree a remembered position belongs to: the source kind, the
@@ -403,6 +414,7 @@ impl AppState {
         tree_mode: TreeMode,
         tree_visible: bool,
     ) -> Self {
+        let is_kiro_source = matches!(root, TreeSource::Kiro(_));
         AppState {
             root,
             launch_dir: kiro_root.clone(),
@@ -433,6 +445,9 @@ impl AppState {
             remembered_tree_positions: HashMap::new(),
             trees_shown_this_session: HashSet::new(),
             doc_cache: doc_cache::DocCache::default(),
+            methodology: Some(MethodologySettings::kiro_default()).filter(|_| is_kiro_source),
+            tasks_view: None,
+            is_tasks_view_enabled: true,
         }
     }
 }
@@ -597,7 +612,7 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             state.trees_shown_this_session.insert(tree_position_key(state));
             // Requirement 1.7: nothing is selected in the new tree yet, so
             // the doc panel has nothing left to show.
-            state.doc = DocView::Empty;
+            install_doc(state, DocView::Empty);
             state.selection = None;
             state.search = SearchState::default();
             state.tree_search = SearchState::default();
@@ -686,7 +701,188 @@ fn select_file_in_files_tree(state: &mut AppState, file: &Path) {
 /// restored at startup, where no key press has loaded it yet.
 pub fn show_selected_doc(state: &mut AppState) {
     let width = doc_panel_width(state);
-    state.doc = resolve_selection(&state.root, state.tree.selected(), width, &mut state.doc_cache);
+    let view = resolve_selection(&state.root, state.tree.selected(), width, &mut state.doc_cache);
+    install_doc(state, view);
+}
+
+/// The one place a loaded document reaches the doc panel, so every path
+/// (selection, rescan, resize, partial refresh, startup) decides the same
+/// way whether a task list is shown structured.
+/// The single place a document is put on screen; every caller outside this
+/// module goes through it too so the structured view is decided in one spot.
+pub fn install_doc(state: &mut AppState, view: DocView) {
+    state.tasks_view = None;
+    let structured = match &view {
+        DocView::Rendered { path, meta, .. } if state.is_tasks_view_enabled && is_task_list_file(state, path) => {
+            build_tasks_view(state, path).map(|mut tasks_view| {
+                let rendered = tasks_view.render(doc_panel_width(state));
+                (tasks_view, DocView::Rendered { path: path.clone(), r: rendered, meta: *meta })
+            })
+        }
+        _ => None,
+    };
+    match structured {
+        Some((tasks_view, structured_view)) => {
+            state.tasks_view = Some(tasks_view);
+            state.doc = structured_view;
+        }
+        None => state.doc = view,
+    }
+}
+
+/// Only a `.kiro` spec folder's own file of the configured name is a task list;
+/// the same name under steering, a files tree or spec-kit stays plain markdown.
+fn is_task_list_file(state: &AppState, path: &Path) -> bool {
+    let (Some(settings), TreeSource::Kiro(root)) = (&state.methodology, &state.root) else {
+        return false;
+    };
+    path.file_name().and_then(|name| name.to_str()) == Some(settings.task_list_file.as_str())
+        && path
+            .parent()
+            .is_some_and(|parent| root.specs.iter().any(|spec| is_same_file(&spec.dir, parent)))
+}
+
+/// A task list that cannot be re-read stays as the markdown render already loaded.
+fn build_tasks_view(state: &AppState, path: &Path) -> Option<tasks_view::TasksView> {
+    let settings = state.methodology.as_ref()?;
+    let source = std::fs::read_to_string(path).ok()?;
+    Some(tasks_view::TasksView::build(crate::spec::tasks::parse_tasks(&source, settings), settings))
+}
+
+/// Whether the open document is one the structured view applies to, regardless
+/// of the current preference.
+fn is_task_list_doc_open(state: &AppState) -> bool {
+    matches!(&state.doc, DocView::Rendered { path, .. } if is_task_list_file(state, path))
+}
+
+/// `v`: flips the preference and re-installs the open task list so the frame
+/// changes at once. Search matches and scroll refer to the old layout, so both reset.
+fn toggle_tasks_view(state: &mut AppState) {
+    if !is_task_list_doc_open(state) {
+        return;
+    }
+    state.is_tasks_view_enabled = !state.is_tasks_view_enabled;
+    if let Some(reloaded) = reload_current_doc(state, doc_panel_width(state)) {
+        install_doc(state, reloaded);
+    }
+    state.scroll = 0;
+    search::clear_search(state);
+}
+
+/// Enter follows a link only from the doc panel; from the tree it stays the
+/// ordinary "load this node" key.
+fn is_link_selected_in_focused_doc(state: &AppState) -> bool {
+    state.focus == Panel::Doc && state.tasks_view.as_ref().is_some_and(|view| view.selected_link.is_some())
+}
+
+/// `l`/`L`: moves the link cursor and redraws the highlight, scrolling only
+/// when the newly selected link is off screen.
+fn select_link(state: &mut AppState, is_forward: bool) {
+    let from_line = state.scroll;
+    let Some(tasks_view) = state.tasks_view.as_mut() else {
+        return;
+    };
+    let moved_to = if is_forward {
+        tasks_view.select_next_link(from_line)
+    } else {
+        tasks_view.select_previous_link(from_line)
+    };
+    if moved_to.is_none() {
+        return;
+    }
+    redraw_structured_view(state);
+    let Some(link_line) = state.tasks_view.as_ref().and_then(|view| view.selected()).map(|link| link.line) else {
+        return;
+    };
+    let visible_rows = state.size.1 as usize;
+    if link_line < state.scroll || link_line >= state.scroll + visible_rows {
+        scroll_to(state, link_line);
+    }
+}
+
+/// Re-lays the structured view out for the current width and swaps only the
+/// rendered lines, so the link cursor, the scroll and the file info survive
+/// (`install_doc` would rebuild the view and reset the cursor).
+fn redraw_structured_view(state: &mut AppState) {
+    let width = doc_panel_width(state);
+    let Some(tasks_view) = state.tasks_view.as_mut() else {
+        return;
+    };
+    let rendered = tasks_view.render(width);
+    if let DocView::Rendered { r, .. } = &mut state.doc {
+        *r = rendered;
+    }
+}
+
+/// Where a followed link lands: the tree node to select when the target is
+/// another document, and the rendered line to scroll to.
+struct LinkJump {
+    other_document_node: Option<Vec<NodeId>>,
+    line: usize,
+}
+
+/// Enter on a selected link. State changes only after the target is loaded,
+/// the line is found and the tree node is known; any failure is a message.
+fn follow_selected_link(state: &mut AppState) {
+    match plan_link_jump(state) {
+        Ok(jump) => apply_link_jump(state, jump),
+        Err(message) => state.popup = Some(Popup::Message(message)),
+    }
+}
+
+fn plan_link_jump(state: &mut AppState) -> Result<LinkJump, String> {
+    let link = state.tasks_view.as_ref().and_then(|view| view.selected()).cloned().ok_or("선택된 링크가 없습니다")?;
+    let rule = state
+        .methodology
+        .as_ref()
+        .and_then(|settings| settings.rule_for(&link.tag_name))
+        .and_then(|tag_rule| tag_rule.link.clone())
+        .ok_or_else(|| format!("이동할 수 없는 태그입니다: {}", link.tag_name))?;
+    let task_list_path = match &state.doc {
+        DocView::Rendered { path, .. } => path.clone(),
+        _ => return Err("작업 목록 문서가 열려 있지 않습니다".to_string()),
+    };
+    let target = navigator::resolve_target_file(&rule, &task_list_path).map_err(describe_navigation_error)?;
+    if target.is_same_file {
+        let current = rendered_of(&state.doc).ok_or("작업 목록 문서가 열려 있지 않습니다")?;
+        let line = navigator::locate_line(current, rule.locate, &link.value).map_err(describe_navigation_error)?;
+        return Ok(LinkJump { other_document_node: None, line });
+    }
+    let width = doc_panel_width(state);
+    let loaded = state.doc_cache.load(&target.file, width);
+    let target_rendered = match &loaded {
+        DocView::Rendered { r, .. } => r,
+        _ => return Err(describe_navigation_error(navigator::NavigationError::TargetUnreadable(target.file.clone()))),
+    };
+    let line = navigator::locate_line(target_rendered, rule.locate, &link.value).map_err(describe_navigation_error)?;
+    let node_path = crate::spec::locate_doc_node(&state.root, &target.file)
+        .ok_or_else(|| format!("트리에 없는 문서입니다: {}", target.file.display()))?;
+    Ok(LinkJump { other_document_node: Some(node_path), line })
+}
+
+fn apply_link_jump(state: &mut AppState, jump: LinkJump) {
+    if let Some(node_path) = jump.other_document_node {
+        for ancestor_len in 1..node_path.len() {
+            state.tree.open(node_path[..ancestor_len].to_vec());
+        }
+        state.tree.select(node_path);
+        load_selected_doc(state);
+    }
+    scroll_to(state, jump.line);
+}
+
+fn describe_navigation_error(error: navigator::NavigationError) -> String {
+    match error {
+        navigator::NavigationError::TargetFileMissing(tried_names) => {
+            format!("대상 파일을 찾을 수 없습니다: {}", tried_names.join(", "))
+        }
+        navigator::NavigationError::TargetUnreadable(path) => {
+            format!("대상 파일을 읽을 수 없습니다: {}", path.display())
+        }
+        navigator::NavigationError::ReferenceNotFound(value) => {
+            format!("참조 위치를 찾을 수 없습니다: {value}")
+        }
+    }
 }
 
 /// Requirement 2.1/2.2: open every folder-like node (`Spec`, `Dir` -- the
@@ -1086,7 +1282,23 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Control {
             Control::Continue
         }
         "select" => {
-            load_selected_doc(state);
+            if is_link_selected_in_focused_doc(state) {
+                follow_selected_link(state);
+            } else {
+                load_selected_doc(state);
+            }
+            Control::Continue
+        }
+        "next_link" => {
+            select_link(state, true);
+            Control::Continue
+        }
+        "prev_link" => {
+            select_link(state, false);
+            Control::Continue
+        }
+        "toggle_tasks_view" => {
+            toggle_tasks_view(state);
             Control::Continue
         }
         "line_down" => {
@@ -1404,7 +1616,8 @@ fn jump_heading(state: &mut AppState, forward: bool) {
 fn load_selected_doc(state: &mut AppState) {
     let path = state.tree.selected().to_vec();
     let width = doc_panel_width(state);
-    state.doc = resolve_selection(&state.root, &path, width, &mut state.doc_cache);
+    let view = resolve_selection(&state.root, &path, width, &mut state.doc_cache);
+    install_doc(state, view);
     state.scroll = 0;
     search::clear_search(state);
 
@@ -1637,7 +1850,7 @@ fn refresh_current_doc(state: &mut AppState) {
             }
         }
 
-        state.doc = new_view;
+        install_doc(state, new_view);
     }
 
     clamp_scroll_into_doc(state);
@@ -1690,7 +1903,7 @@ fn refresh_open_doc_only(state: &mut AppState, path: &Path) -> bool {
         return false;
     }
     state.doc_cache.invalidate(path);
-    state.doc = fresh;
+    install_doc(state, fresh);
     clamp_scroll_into_doc(state);
     true
 }
@@ -1762,7 +1975,7 @@ fn resize_and_preserve_position(state: &mut AppState, w: u16, h: u16) {
     // accounts for the tree/sep columns a two-panel layout takes off of it
     // (tasks.md 20.1).
     if let Some(new_doc) = reload_current_doc(state, doc_panel_width(state)) {
-        state.doc = new_doc;
+        install_doc(state, new_doc);
     }
 
     // Step 4/5: relocate the anchor heading in the new render, or fall back
@@ -5204,5 +5417,434 @@ mod reducer_tests {
         );
         restore_tree_position(&mut state);
         assert_eq!(desired_watch_dirs(&state), paths(&["/w", "/w/a", "/w/a/b"]));
+    }
+
+    // --- structured task list view: one install point, a toggle key -------
+
+    fn tasks_view_fixture_root() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/kiro-tasks-view"))
+    }
+
+    fn tasks_doc_node(kind: DocKind) -> Vec<NodeId> {
+        vec![NodeId::Spec("tasks-view-sample".to_string()), NodeId::Doc("tasks-view-sample".to_string(), kind)]
+    }
+
+    fn tasks_view_state() -> AppState {
+        build_state_from(&tasks_view_fixture_root(), (120, 40))
+    }
+
+    fn tasks_md_path() -> PathBuf {
+        tasks_view_fixture_root().join("specs/tasks-view-sample/tasks.md")
+    }
+
+    fn select_doc_with_enter(state: &mut AppState, kind: DocKind) {
+        state.tree.select(tasks_doc_node(kind));
+        update(state, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    fn press_v(state: &mut AppState) {
+        update(state, Action::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)));
+    }
+
+    fn shown_plain(state: &AppState) -> Vec<String> {
+        rendered_of(&state.doc).map(|r| r.plain.clone()).unwrap_or_default()
+    }
+
+    /// The structured view is the only rendering that labels parallel tasks.
+    fn is_structured(state: &AppState) -> bool {
+        shown_plain(state).iter().any(|line| line.contains("(P 병렬)"))
+    }
+
+    #[test]
+    fn selecting_the_task_list_shows_the_structured_view_and_v_round_trips_with_plain_markdown() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        assert!(is_structured(&state));
+        assert!(state.tasks_view.is_some());
+
+        press_v(&mut state);
+        assert!(!is_structured(&state));
+        assert!(state.tasks_view.is_none());
+
+        press_v(&mut state);
+        assert!(is_structured(&state));
+        assert!(state.tasks_view.is_some());
+    }
+
+    #[test]
+    fn v_does_nothing_on_documents_that_are_not_the_task_list() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Requirements);
+        let before = shown_plain(&state);
+        state.scroll = 3;
+
+        press_v(&mut state);
+
+        assert_eq!(shown_plain(&state), before);
+        assert_eq!(state.scroll, 3);
+        assert!(state.is_tasks_view_enabled, "a no-op key must not flip the preference");
+        assert!(state.tasks_view.is_none());
+    }
+
+    #[test]
+    fn same_named_file_outside_a_spec_folder_files_mode_and_spec_kit_stay_plain() {
+        let mut state = tasks_view_state();
+        let stray_dir = std::env::temp_dir().join(format!("spec_viewer_stray_tasks_{}", std::process::id()));
+        fs::create_dir_all(&stray_dir).unwrap();
+        fs::copy(tasks_md_path(), stray_dir.join("tasks.md")).unwrap();
+        install_doc(&mut state, loader::load_doc(&stray_dir.join("tasks.md"), 120));
+        assert!(!is_structured(&state), "kiro source, parent is not a spec folder");
+        fs::remove_dir_all(&stray_dir).ok();
+
+        let mut files_state = AppState::new(
+            TreeSource::Files(FsTree::scan(&tasks_view_fixture_root())),
+            tasks_view_fixture_root(),
+            (120, 40),
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        );
+        install_doc(&mut files_state, loader::load_doc(&tasks_md_path(), 120));
+        assert!(!is_structured(&files_state), "--files source");
+        press_v(&mut files_state);
+        assert!(!is_structured(&files_state));
+
+        let mut spec_kit_state = AppState::new(
+            TreeSource::SpecKit(vec![]),
+            tasks_view_fixture_root(),
+            (120, 40),
+            WatchStatus::Live,
+            TreeMode::Auto,
+            true,
+        );
+        install_doc(&mut spec_kit_state, loader::load_doc(&tasks_md_path(), 120));
+        assert!(!is_structured(&spec_kit_state), "spec-kit source");
+    }
+
+    #[test]
+    fn startup_selection_install_decides_structured_view() {
+        let mut state = tasks_view_state();
+        state.tree.select(tasks_doc_node(DocKind::Tasks));
+        show_selected_doc(&mut state);
+        assert!(is_structured(&state));
+    }
+
+    #[test]
+    fn rescan_keeps_the_structured_view_and_the_plain_choice() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        update(&mut state, Action::Refresh);
+        assert!(is_structured(&state));
+
+        press_v(&mut state);
+        update(&mut state, Action::Refresh);
+        assert!(!is_structured(&state));
+        assert!(state.tasks_view.is_none());
+    }
+
+    #[test]
+    fn resize_keeps_the_structured_view_and_the_plain_choice() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        update(&mut state, Action::Resize(100, 30));
+        assert!(is_structured(&state));
+
+        press_v(&mut state);
+        update(&mut state, Action::Resize(90, 30));
+        assert!(!is_structured(&state));
+    }
+
+    #[test]
+    fn partial_refresh_keeps_the_structured_view_and_the_plain_choice() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        assert!(refresh_open_doc_only(&mut state, &tasks_md_path()));
+        assert!(is_structured(&state));
+
+        press_v(&mut state);
+        assert!(refresh_open_doc_only(&mut state, &tasks_md_path()));
+        assert!(!is_structured(&state));
+    }
+
+    #[test]
+    fn task_list_file_name_follows_the_settings() {
+        let mut state = tasks_view_state();
+        let mut settings = MethodologySettings::kiro_default();
+        settings.task_list_file = "biz-process.md".to_string();
+        state.methodology = Some(settings);
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        assert!(!is_structured(&state), "tasks.md is no longer the task list");
+    }
+
+    #[test]
+    fn switching_documents_drops_the_previous_tasks_view() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Tasks);
+        select_doc_with_enter(&mut state, DocKind::Requirements);
+        assert!(state.tasks_view.is_none());
+    }
+
+    #[test]
+    fn spec_definition_and_meta_error_views_keep_their_own_handling() {
+        let mut state = tasks_view_state();
+        state.tree.select(vec![NodeId::Spec("tasks-view-sample".to_string())]);
+        update(&mut state, Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(matches!(state.doc, DocView::Definition { .. }));
+        assert!(state.tasks_view.is_none());
+    }
+
+    // --- following a metadata link: jump, tree sync, failures leave state alone ---
+
+    fn focus_structured_task_list(state: &mut AppState) {
+        select_doc_with_enter(state, DocKind::Tasks);
+        state.focus = Panel::Doc;
+    }
+
+    fn press(state: &mut AppState, code: KeyCode) {
+        update(state, Action::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    /// Presses `l` until the wanted link of the wanted task is selected, as a user would.
+    fn select_link_with_l(state: &mut AppState, tag_name: &str, value: &str, owner_task_number: &str) {
+        state.scroll = 0;
+        for _ in 0..200 {
+            press(state, KeyCode::Char('l'));
+            let Some(link) = state.tasks_view.as_ref().and_then(|view| view.selected()) else {
+                continue;
+            };
+            let plain = shown_plain(state);
+            let is_owner_task = plain[..=link.line]
+                .iter()
+                .rev()
+                .find(|text| text.contains("[ ]") || text.contains("[x]"))
+                .is_some_and(|text| text.contains(owner_task_number));
+            if link.tag_name == tag_name && link.value == value && is_owner_task {
+                return;
+            }
+        }
+        panic!("link {tag_name}={value} under task {owner_task_number} was never selected");
+    }
+
+    fn has_reversed_cell_on_screen(state: &AppState) -> bool {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                crate::ui::doc_panel::render(frame, area, &state.doc, 0, &SearchState::default());
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+    }
+
+    fn line_index_containing(state: &AppState, needle: &str) -> usize {
+        shown_plain(state)
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line contains {needle:?}"))
+    }
+
+    fn selected_node(state: &AppState) -> Vec<NodeId> {
+        state.tree.selected().to_vec()
+    }
+
+    fn temp_spec_with_task_list(name: &str, extra_files: &[(&str, &str)]) -> PathBuf {
+        let root = temp_kiro_root(name);
+        let spec_dir = root.join("specs/tasks-view-sample");
+        fs::create_dir_all(&spec_dir).unwrap();
+        let sample = tasks_view_fixture_root().join("specs/tasks-view-sample");
+        for always_copied in ["spec.json", "tasks.md"] {
+            fs::copy(sample.join(always_copied), spec_dir.join(always_copied)).unwrap();
+        }
+        for (file_name, content) in extra_files {
+            fs::write(spec_dir.join(file_name), content).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_source_switch_drops_the_structured_view_and_enter_is_the_ordinary_select_again() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        press(&mut state, KeyCode::Char('l'));
+        assert!(state.tasks_view.as_ref().is_some_and(|view| view.selected().is_some()));
+
+        switch_to(&mut state, files_source_at("/tmp/some-files-root"), "/tmp/some-files-root");
+        state.focus = Panel::Doc;
+        press(&mut state, KeyCode::Enter);
+
+        assert!(state.tasks_view.is_none(), "an empty doc panel must not keep a structured view");
+        assert!(state.popup.is_none(), "Enter must fall back to the ordinary select, not a link jump");
+    }
+
+    #[test]
+    fn l_and_shift_l_select_links_and_show_the_highlight() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        assert!(!has_reversed_cell_on_screen(&state));
+
+        press(&mut state, KeyCode::Char('l'));
+        let first = state.tasks_view.as_ref().unwrap().selected_link;
+        assert_eq!(first, Some(0));
+        assert!(has_reversed_cell_on_screen(&state), "the selected link must be drawn reversed");
+
+        press(&mut state, KeyCode::Char('l'));
+        assert_eq!(state.tasks_view.as_ref().unwrap().selected_link, Some(1));
+        press(&mut state, KeyCode::Char('L'));
+        assert_eq!(state.tasks_view.as_ref().unwrap().selected_link, Some(0));
+        assert!(has_reversed_cell_on_screen(&state));
+    }
+
+    #[test]
+    fn l_does_nothing_when_no_structured_view_is_shown() {
+        let mut state = tasks_view_state();
+        select_doc_with_enter(&mut state, DocKind::Requirements);
+        let before = shown_plain(&state);
+        press(&mut state, KeyCode::Char('l'));
+        press(&mut state, KeyCode::Char('L'));
+        assert_eq!(shown_plain(&state), before);
+        assert!(state.tasks_view.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_requirement_clause_opens_requirements_at_that_clause_and_syncs_the_tree() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "Requirements", "2.1~2.3", "2.1");
+
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(selected_node(&state), tasks_doc_node(DocKind::Requirements));
+        assert!(matches!(&state.doc, DocView::Rendered { path, .. } if path.ends_with("requirements.md")));
+        assert_eq!(state.scroll, line_index_containing(&state, "2.1:"));
+        assert!(state.tasks_view.is_none());
+        assert_eq!(state.popup, None);
+    }
+
+    #[test]
+    fn enter_on_a_business_process_title_opens_biz_process_at_that_heading() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "BizProcess", "세션을 관리한다", "2.1");
+
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(selected_node(&state), tasks_doc_node(DocKind::BizProcess));
+        assert!(matches!(&state.doc, DocView::Rendered { path, .. } if path.ends_with("biz-process.md")));
+        assert_eq!(state.scroll, line_index_containing(&state, "세션을 관리한다"));
+    }
+
+    #[test]
+    fn enter_on_a_dependency_number_scrolls_within_the_task_list_without_switching_documents() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "Depends", "1.2", "2.1");
+        let tree_before = selected_node(&state);
+
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(selected_node(&state), tree_before);
+        assert!(is_structured(&state));
+        assert!(state.tasks_view.is_some());
+        let target_line = state.scroll;
+        assert!(shown_plain(&state)[target_line].contains("1.2"), "scrolled to {:?}", shown_plain(&state)[target_line]);
+        assert!(shown_plain(&state)[target_line].contains("계정 저장"));
+        assert_eq!(state.popup, None);
+    }
+
+    fn assert_jump_fails_with_message_and_leaves_state(state: &mut AppState) {
+        let tree_before = selected_node(state);
+        let plain_before = shown_plain(state);
+        let scroll_before = state.scroll;
+        let doc_path_before = match &state.doc {
+            DocView::Rendered { path, .. } => path.clone(),
+            other => panic!("expected a rendered doc, got {other:?}"),
+        };
+
+        press(state, KeyCode::Enter);
+
+        assert!(matches!(state.popup, Some(Popup::Message(_))), "popup: {:?}", state.popup);
+        assert_eq!(selected_node(state), tree_before);
+        assert_eq!(shown_plain(state), plain_before);
+        assert_eq!(state.scroll, scroll_before);
+        assert!(matches!(&state.doc, DocView::Rendered { path, .. } if *path == doc_path_before));
+        assert!(state.tasks_view.is_some());
+    }
+
+    #[test]
+    fn enter_on_a_link_whose_target_file_is_missing_shows_a_message_and_changes_nothing() {
+        let root = temp_spec_with_task_list("link_missing_target", &[]);
+        let mut state = build_state_from(&root, (120, 40));
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "Requirements", "1.1", "1.1");
+        state.scroll = 4;
+
+        assert_jump_fails_with_message_and_leaves_state(&mut state);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_reference_absent_from_the_target_shows_a_message_and_changes_nothing() {
+        let root = temp_spec_with_task_list(
+            "link_missing_reference",
+            &[("requirements.md", "# 요구사항\n\n- 9.9: 다른 조항\n")],
+        );
+        let mut state = build_state_from(&root, (120, 40));
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "Requirements", "1.1", "1.1");
+        state.scroll = 4;
+
+        assert_jump_fails_with_message_and_leaves_state(&mut state);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_dependency_missing_from_the_task_list_shows_a_message_and_changes_nothing() {
+        let root = temp_spec_with_task_list("link_missing_dependency", &[]);
+        let tasks_path = root.join("specs/tasks-view-sample/tasks.md");
+        let edited = fs::read_to_string(&tasks_path).unwrap().replace("_Depends: 2.1_", "_Depends: 7.7_");
+        fs::write(&tasks_path, edited).unwrap();
+        let mut state = build_state_from(&root, (120, 40));
+        focus_structured_task_list(&mut state);
+        select_link_with_l(&mut state, "Depends", "7.7", "2.2");
+
+        assert_jump_fails_with_message_and_leaves_state(&mut state);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn enter_without_a_selected_link_keeps_the_ordinary_select_behavior() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        state.scroll = 5;
+        assert_eq!(state.tasks_view.as_ref().unwrap().selected_link, None);
+
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(state.scroll, 0, "plain Enter reloads the selection and resets scroll");
+        assert_eq!(selected_node(&state), tasks_doc_node(DocKind::Tasks));
+        assert!(is_structured(&state));
+    }
+
+    #[test]
+    fn enter_in_the_tree_panel_with_a_selected_link_stays_the_ordinary_select() {
+        let mut state = tasks_view_state();
+        focus_structured_task_list(&mut state);
+        press(&mut state, KeyCode::Char('l'));
+        state.focus = Panel::Tree;
+
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(selected_node(&state), tasks_doc_node(DocKind::Tasks));
+        assert!(is_structured(&state));
+    }
+
+    #[test]
+    fn help_lists_the_tasks_view_key() {
+        assert!(keymap::help_entries().iter().any(|(key, _)| key == "v"));
     }
 }

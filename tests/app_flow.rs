@@ -1056,3 +1056,26 @@ fn e2e_all_mode_sort_hotkey_cycles_name_and_updated_and_preserves_fold_and_selec
 
     fs::remove_dir_all(&root).ok();
 }
+
+// --- structured task list view: frames alternate with the `v` key ---------
+
+#[test]
+fn task_list_frame_alternates_between_structured_and_plain_with_v() {
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/kiro-tasks-view"));
+    let mut state = build_state_from(&root, (120, 40));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let frame_text = |terminal: &Terminal<TestBackend>| buffer_text(terminal.backend().buffer()).join("\n");
+
+    state.tree.select(vec![
+        NodeId::Spec("tasks-view-sample".to_string()),
+        NodeId::Doc("tasks-view-sample".to_string(), DocKind::Tasks),
+    ]);
+    step(&mut terminal, &mut state, Action::Key(key(KeyCode::Enter)));
+    assert!(frame_text(&terminal).contains("(P 병렬)"), "structured view after selecting tasks.md");
+
+    step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('v'))));
+    assert!(!frame_text(&terminal).contains("(P 병렬)"), "plain markdown after v");
+
+    step(&mut terminal, &mut state, Action::Key(key(KeyCode::Char('v'))));
+    assert!(frame_text(&terminal).contains("(P 병렬)"), "structured again after the second v");
+}

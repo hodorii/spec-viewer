@@ -83,6 +83,18 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// notify's inotify backend also reports opening and reading a path. The
+/// viewer's own rescans open every watched folder, so passing those events on
+/// made each rescan trigger the next one. A completed write stays reported.
+fn is_read_only_access(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => false,
+        notify::EventKind::Access(_) => true,
+        _ => false,
+    }
+}
+
 pub fn start(root: &Path, tx: Sender<FsEvent>) -> Watch {
     start_scoped(root, tx, WatchScope::Recursive)
 }
@@ -123,6 +135,9 @@ fn start_with_cache<C: FileIdCache + Send + 'static>(
             if let Ok(events) = result {
                 let mut paths = Vec::new();
                 for event in events {
+                    if is_read_only_access(&event.kind) {
+                        continue;
+                    }
                     for path in &event.paths {
                         if let Ok(canonical) = path.canonicalize() {
                             paths.push(canonical);
@@ -221,6 +236,30 @@ mod tests {
         probe_seen
     }
 
+    /// Runs `read_only_access`, then writes a sentinel and drains events until
+    /// it shows up; reports whether any event named one of `read_paths`.
+    fn read_access_is_reported(
+        rx: &mpsc::Receiver<FsEvent>,
+        read_only_access: impl FnOnce(),
+        read_paths: &[&Path],
+        sentinel: &Path,
+    ) -> bool {
+        read_only_access();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(sentinel, "x").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut read_seen = false;
+        let mut sentinel_seen = false;
+        while std::time::Instant::now() < deadline && !sentinel_seen {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+                read_seen |= event.paths.iter().any(|p| read_paths.contains(&p.as_path()));
+                sentinel_seen |= event.paths.iter().any(|p| p == sentinel);
+            }
+        }
+        assert!(sentinel_seen, "sentinel event never arrived: {}", sentinel.display());
+        read_seen
+    }
+
     fn wait_for_path(rx: &mpsc::Receiver<FsEvent>, target: &Path) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -266,6 +305,33 @@ mod tests {
         let probe_seen = probe_is_reported(&rx, &sub_file, &root_file);
         assert!(!probe_seen, "subdirectory change must not be reported under OpenedDirs");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reading_files_and_listing_folders_is_not_reported_as_a_change() {
+        for scope in [WatchScope::Recursive, WatchScope::OpenedDirs] {
+            let root = scratch_dir("read-only-access");
+            let doc = root.join("doc.md");
+            std::fs::write(&doc, "text").unwrap();
+            let (tx, rx) = mpsc::channel();
+            let _watch = live(start_scoped(&root, tx, scope));
+            // Setup writes above may still be in flight; settle them first.
+            std::thread::sleep(Duration::from_millis(500));
+            while rx.try_recv().is_ok() {}
+
+            let (root_for_read, doc_for_read) = (root.clone(), doc.clone());
+            let read_seen = read_access_is_reported(
+                &rx,
+                move || {
+                    let _ = std::fs::read_to_string(&doc_for_read);
+                    let _ = std::fs::read_dir(&root_for_read).map(|entries| entries.count());
+                },
+                &[&doc, &root],
+                &root.join("sentinel.md"),
+            );
+            assert!(!read_seen, "reading must not look like a change (scope {scope:?})");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

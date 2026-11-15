@@ -316,7 +316,9 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert!(contains(buffer, "m  전체 모드 ↔ 스펙 모드 전환"));
+        assert!(contains(buffer, "Space  파일 모드 ↔ 스펙 모드 전환"));
+        assert!(!contains(buffer, "m  전체 모드"));
+        assert!(!contains(buffer, "m  파일 모드"));
         assert!(contains(buffer, "o  트리 전체 펼치기"));
         assert!(contains(buffer, "c  트리 전체 접기"));
     }

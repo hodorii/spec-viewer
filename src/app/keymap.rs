@@ -39,7 +39,8 @@
 //! - Tree navigation (forward-compatible only; `TreeState::key_*` need a
 //!   `Tree` widget render pass to have any visible effect — task 6.x):
 //!   arrow keys `Up` / `Down` / `Left` / `Right`.
-//! - Toggle full/spec tree source mode (requirement 4.1): `m`.
+//! - Toggle files/spec tree source mode: `Space` (`m` stays unbound so it
+//!   is free for vi-style mark).
 //! - Expand/collapse the whole tree (requirement 4.1): `o` / `c`.
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -204,9 +205,9 @@ pub const BINDINGS: &[Binding] = &[
         help: "문서 패널에 표시된 파일을 외부 에디터로 열기",
     },
     Binding {
-        keys: &[KeyCode::Char('m')],
+        keys: &[KeyCode::Char(' ')],
         action: "toggle_source_mode",
-        help: "전체 모드 ↔ 스펙 모드 전환",
+        help: "파일 모드 ↔ 스펙 모드 전환",
     },
     Binding {
         keys: &[KeyCode::Char('o')],
@@ -249,6 +250,7 @@ fn key_label(b: &Binding) -> String {
 
 fn key_code_label(k: KeyCode) -> String {
     match k {
+        KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Up => "Up".to_string(),
         KeyCode::Down => "Down".to_string(),
@@ -306,9 +308,15 @@ mod tests {
     }
 
     #[test]
-    fn toggle_source_mode_key_resolves_to_toggle_source_mode_action() {
-        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+    fn space_key_resolves_to_toggle_source_mode_action() {
+        let key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(action_for_key(key), Some("toggle_source_mode"));
+    }
+
+    #[test]
+    fn m_key_is_unbound() {
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(action_for_key(key), None);
     }
 
     #[test]
@@ -328,7 +336,8 @@ mod tests {
         let entries = help_entries();
         assert!(entries
             .iter()
-            .any(|(k, h)| k == "m" && h == "전체 모드 ↔ 스펙 모드 전환"));
+            .any(|(k, h)| k == "Space" && h == "파일 모드 ↔ 스펙 모드 전환"));
+        assert!(!entries.iter().any(|(k, _)| k == "m"));
         assert!(entries
             .iter()
             .any(|(k, h)| k == "o" && h == "트리 전체 펼치기"));
@@ -338,16 +347,23 @@ mod tests {
     }
 
     #[test]
-    fn no_binding_reuses_the_m_o_or_c_keys() {
-        let reused_keys: Vec<String> = BINDINGS
+    fn space_is_bound_only_to_toggle_source_mode_and_o_c_stay_single_use() {
+        let labels_for = |action: &str| -> Vec<String> {
+            BINDINGS.iter().filter(|b| b.action == action).map(key_label).collect()
+        };
+        assert_eq!(labels_for("toggle_source_mode"), vec!["Space".to_string()]);
+        let other_labels: Vec<String> = BINDINGS
             .iter()
-            .filter(|b| b.action != "toggle_source_mode" && b.action != "expand_all" && b.action != "collapse_all")
+            .filter(|b| !matches!(b.action, "toggle_source_mode" | "expand_all" | "collapse_all"))
             .map(key_label)
-            .filter(|label| label == "m" || label == "o" || label == "c")
             .collect();
-        assert!(
-            reused_keys.is_empty(),
-            "m/o/c keys must be unused by other bindings, found: {reused_keys:?}"
-        );
+        for reserved in ["Space", "m", "o", "c"] {
+            assert!(
+                !other_labels.iter().any(|label| label == reserved),
+                "{reserved} must not be reused by other bindings: {other_labels:?}"
+            );
+        }
+        assert_eq!(labels_for("expand_all"), vec!["o".to_string()]);
+        assert_eq!(labels_for("collapse_all"), vec!["c".to_string()]);
     }
 }

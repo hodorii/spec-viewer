@@ -19,7 +19,7 @@ picked up automatically and shown as its own recursively browsable tree node
 document tree.
 
 Built for the [Kiro-style spec-driven development](https://github.com/hodorii/agentic-psdd)
-workflow, but the `--all` mode drops the `.kiro`/spec-kit requirement
+workflow, but the `--files` mode drops the `.kiro`/spec-kit requirement
 entirely and browses any directory of markdown files, so it also works as a
 general terminal markdown viewer with mermaid diagram support.
 
@@ -39,15 +39,17 @@ HOST=<ssh-host>` rsyncs the source to a remote host and builds it there.
 
 ```sh
 m [path]                 # find the nearest .kiro root at/above `path` (default: cwd)
-m --all [dir]             # browse any markdown directory, no .kiro required
+m --files [dir]           # browse any markdown directory, no .kiro required
 ```
 
-`--all` only picks which mode you *start* in — press `m` at any time to switch
-between full mode and spec mode without restarting.
+`--files` only picks which mode you *start* in — press `Space` at any time to
+switch between files mode and spec mode without restarting. Switching from spec
+mode scans only the directory under the cursor (a spec, or the folder holding
+the selected file); with no cursor it scans the start path.
 
 Flags:
 - `--tree <auto|always|hidden|single>` — tree panel visibility mode (default `auto`)
-- `--sort <name|phase|updated|progress>` — initial tree sort key (`--all` mode
+- `--sort <name|phase|updated|progress>` — initial tree sort key (files mode
   normalizes `phase`/`progress` to `name`, since it has no spec.json/tasks.md)
 - `--no-watch` — disable filesystem watching
 - `--log <path>` — write a log file (rejected if it resolves inside the `.kiro` root)
@@ -58,11 +60,11 @@ Keys: `q` quit · `Tab` switch panel · `j`/`k` line scroll · `d`/`u` half-page
 `f`/`PageDown`, `b`/`PageUp` full page · `g`/`Home`, `G`/`End` top/bottom ·
 `[`/`]` prev/next heading · `/` search, `n`/`N` next/prev match · `t` table of
 contents · `T` toggle tree panel · `1`–`4` layout modes (auto/fold/expand/single) ·
-`s` cycle sort key (spec mode: name→phase→updated→progress; `--all` mode:
+`s` cycle sort key (spec mode: name→phase→updated→progress; files mode:
 name↔updated only; the tree panel title shows the active key) ·
 `e` edit the displayed file in an external editor (`--editor` >
-`$VISUAL` > `$EDITOR` > `vi`) · `m` toggle between full mode and spec mode at
-runtime (`--all` only sets which one you start in) · `o`/`c` expand/collapse
+`$VISUAL` > `$EDITOR` > `vi`) · `Space` toggle between files mode and spec mode at
+runtime (`--files` only sets which one you start in) · `o`/`c` expand/collapse
 every tree node at once (individual node fold/unfold via `Left`/`Right`/`Enter`
 stays one level at a time) · `?` help (scrolls with `j`/`k`/arrows) · arrow keys
 for tree/document

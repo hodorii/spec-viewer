@@ -1,0 +1,97 @@
+# 구현 계획 - spec-viewer-files-mode-cursor-scan
+
+## 정의
+spec-viewer 사용자를 위해 커서 기준 스캔 뿌리, `--files` CLI, Space 핫키, 모드 왕복 커서 보존을 구현 단위로 나눈 실행 계획이다.
+
+- [x] 1. 도메인 매핑: 선택 경로가 가리키는 스캔 뿌리와 트리 경로
+- [x] 1.1 선택 경로의 스캔 뿌리 매핑
+  - 실패하는 단위 테스트부터: 노드 종류별 매핑 - `Spec`/`Doc`은 해당 스펙의 디렉터리, `Dir`은 그 자신, `File`은 부모 디렉터리, 빈 선택과 소실 노드는 `None`(`Kiro`와 `SpecKit` 양쪽, 폴더성/파일성 구분은 design.md 계약 그대로)
+  - `TreeSource`에 순수 메서드로 구현 - 파일시스템 접근 없음
+  - _DoneWhen: 노드 종류별 매핑과 빈 선택/소실 케이스의 단위 테스트가 전부 통과한다_
+  - _Requirements: 1.1, 1.2, 1.3_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S1_
+  - _Verify: BR-SPEC-VIEW-001, BR-SPEC-VIEW-002, BR-SPEC-VIEW-003_
+  - _Difficulty: mid_
+  - _Boundary: TreeSource (spec)_
+- [x] 1.2 (P) 파일의 트리 내 NodeId 경로 계산
+  - 실패하는 단위 테스트부터: 새 파일 모드 트리 안에서 파일의 조상 `Dir` 체인 + `File` 경로가 깊이순으로 계산되는 것, 트리에 없는 파일은 `None`
+  - `FsTree`에 순수 메서드로 구현 - `entries`의 경로/깊이 불변식만 사용
+  - _DoneWhen: 조상 체인 계산과 미존재 폴백의 단위 테스트가 전부 통과한다_
+  - _Requirements: 1.2_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S1_
+  - _Verify: BR-SPEC-VIEW-002_
+  - _Difficulty: mid_
+  - _Boundary: FsTree (spec::fs_tree)_
+
+- [x] 2. 리듀서: 모드별 커서 보존
+- [x] 2.1 전환 시 커서 stash 저장과 복원
+  - 실패하는 리듀서 테스트부터: `ApplySourceSwitch` 처리 시작 시점(리셋 전)에 outgoing 모드 판정 후 현재 선택을 stash에 저장(빈 선택도 `Some` - 표시 이력 플래그 겸함)
+  - incoming 커서 결정 순서 구현: 파일 모드면 과거 파일 stash의 뿌리가 같으면 커서 복원(3.3), 다르면 outgoing 커서가 가리키는 파일로 트리 선택(1.2, `node_path_for` 사용), 어느 쪽도 아니면 기본 커서. 스펙 모드면 과거 스펙 stash가 있고 새 트리에 존재하면 복원(3.1), 아니면 기본 커서(3.2)
+  - 복원/초기 선택은 조상 prefix를 순서대로 펼친 뒤 선택 - 문서 패널은 기존 리셋(안내 문구)을 그대로 유지하고 로드는 기존처럼 Enter가 담당
+  - 복원 대상이 새 트리에 없으면(전환 사이 삭제) 기본 커서로 강등
+  - 회귀: `SwitchModeFailed`는 상태를 전혀 건드리지 않음(3.5), 기존 전체 리셋 동작은 유지되는 필드(doc/scroll/search/popup)에서 그대로
+  - _DoneWhen: 왕복 조합(과거 stash 있/없, 파일 뿌리 같/다름, 힌트 파일 유/무, 소실 강등, 전환 실패 무변경)의 리듀서 테스트가 전부 통과한다_
+  - _Requirements: 1.2, 3.1, 3.2, 3.3, 3.4, 3.5_
+  - _Depends: 1.2_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S1, BP-SPEC-VIEW.A8.F6.S2, BP-SPEC-VIEW.A8.F6.S3_
+  - _Verify: BR-SPEC-VIEW-005, BR-SPEC-VIEW-006, BR-SPEC-VIEW-007, BR-SPEC-VIEW-008, BR-SPEC-VIEW-009_
+  - _Difficulty: high_
+- [x] 2.2 모드 전환 바인딩을 Space로 교체
+  - 기존 `m` 바인딩 항목을 제거하고 Space를 모드 전환으로 등록, 도움말 문구를 "파일 모드 <-> 스펙 모드 전환"으로
+  - 도움말 팝업 렌더 버퍼에 Space 행이 보이고 `m` 행이 사라지는 것을 렌더 테스트로 확인(ui/popup 테스트 포함)
+  - 회귀: 검색 입력줄 팝업에서 Space가 검색어에 공백으로 입력되는 것(팝업은 전역 키맵을 거치지 않는 기존 구조)
+  - 기존 "`m`/`o`/`c` 재사용 금지" 키맵 테스트를 "`m` 미바인딩 + Space 단일 사용 + `o`/`c` 유지" 검증으로 갱신
+  - _DoneWhen: 도움말 렌더 버퍼에 Space 모드 전환 행이 표시되고 `m` 행이 사라지며, 검색 입력줄 Space 공백 회귀 테스트가 통과한다_
+  - _Requirements: 6.1, 6.2, 6.3, 6.4_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6_
+  - _Difficulty: mid_
+  - _Boundary: app::keymap, ui::popup 테스트_
+
+- [x] 3. main 배선: `--files` CLI와 전환 스캔 뿌리
+- [x] 3.1 CLI 플래그 교체와 시작 경로
+  - 실패하는 테스트부터: `--files [path]`가 파일 모드로 시작하고 경로는 인자 그대로, `--all`은 미지원 플래그로 비제로 종료, `--files` 대상 디렉터리가 없으면 경로를 포함한 오류 메시지와 비제로 종료
+  - `Args`의 `all` 필드를 `files`로, `StartupError::AllTargetUnreadable`을 `FilesTargetUnreadable`로 재명명하고 오류/도움말 문서 갱신
+  - 앱 안 "전체 모드" 문구를 "파일 모드"로 통일하고 README의 사용법/플래그/키 설명을 `--files`와 Space 기준으로 갱신
+  - _DoneWhen: `m --help` 출력에 `--files`가 있고 `--all`이 없으며, `--all` 실행이 미지원 플래그 오류로 비제로 종료하는 파싱 테스트가 통과한다_
+  - _Requirements: 2.1, 2.2, 2.3_
+  - _BizProcess: BP-SPEC-VIEW.A1.F1.S1_
+  - _Difficulty: mid_
+- [x] 3.2 전환 시 커서 기준 뿌리 스캔
+  - 실패하는 통합 테스트부터: 파일 모드 방향 전환이 선택 경로 매핑(1.1) 결과를 스캔 뿌리로 쓰고 선택이 없으면 시작 경로로 폴백, 커서 뿌리를 읽을 수 없으면 전환하지 않고 그 경로를 포함한 실패 사유가 상태 메시지로 표시되며 화면은 그대로
+  - 스캔 후 현재 정렬 키의 기존 적용 절차와 새 뿌리 기준 감시 재시작은 기존 코드 경로를 그대로 재사용
+  - _DoneWhen: 커서 위치별(폴더성/파일성/선택 없음) 스캔 뿌리와 실패 시 상태 유지 통합 테스트가 전부 통과한다_
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 4.1_
+  - _Depends: 1.1_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S1_
+  - _Verify: BR-SPEC-VIEW-004_
+  - _Difficulty: mid_
+
+- [x] 4. 소유 biz-process 파일에 승인된 append 반영
+- [x] 4.1 BP-SPEC-VIEW 소유 파일 갱신
+  - 승인된 append 사양(이 spec의 biz-process.md)을 소유 파일 `.kiro/specs/spec-viewer/biz-process.md`에 반영: L2-A1의 L5 신규 "파일 모드로 시작한다", L2-A7 이름을 "파일 모드로 탐색"으로 교체, L2-A8 "모드 전환"(BR-SPEC-VIEW-001~010) 추가
+  - 기존 노드 번호는 불변 - 신규 번호만 append
+  - _DoneWhen: 소유 biz-process.md에 세 변경이 위치별로 반영되었고 기존 노드 번호가 하나도 바뀌지 않았다_
+  - _Difficulty: low_
+
+- [x] 5. 검증
+- [x] 5.1 왕복 E2E: 실제 Space 키로 모드 왕복
+  - 실제 `.kiro` 픽스처에서 실제 키 입력으로 스펙 -> 파일 -> 스펙 왕복 시 커서 복원, 파일 -> 스펙 -> 파일(같은 커서 뿌리) 왕복 시 복원, 커서를 옮긴 뒤 재왕복 시 갱신된 커서 복원
+  - 복원된 커서가 조상 펼침으로 렌더 프레임에 실제로 보이는 것과 트리 패널에 커서 뿌리가 표시되는 것을 렌더 버퍼로 확인
+  - _DoneWhen: 왕복 시나리오의 렌더 프레임에서 복원 커서와 뿌리 표시가 확인된 E2E 테스트가 통과한다_
+  - _Requirements: 3.1, 3.3, 3.4, 5.2, 6.1_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S1, BP-SPEC-VIEW.A8.F6.S2_
+  - _Difficulty: high_
+- [x] 5.2 속성 테스트: 전환 이력이 스펙 모드에 무영향
+  - 시드 고정 `.kiro` 트리 생성기(깊이/스펙 수/문서 수 축, 신규 의존성 없음)로 모드 전환 이력과 무관하게 스펙 모드 트리 내용/표시가 항상 동일한지 검증 - 실패 시 시드 출력
+  - _DoneWhen: 생성 도메인 전체에서 P1 속성 테스트가 통과한다_
+  - _Requirements: 5.1_
+  - _Difficulty: mid_
+- [x] 5.3 인수 확인과 전환 지연 계측
+  - 요구사항 20개 기준 각각의 실물 확인 증거를 기록(기존 단위/통합/E2E 결과 재인용 + 잔여 직접 확인)
+  - 마크다운 100개 임시 디렉터리에 대한 모드 전환 1회 시간을 계측해 4.1 증거로 기록(CI 타이밍 단언이 아니라 범위 한정의 설계 보장 + 계측 증거)
+  - 파일 모드 탐색 무회귀(정렬 키 표시, 깊이 상한, 숨김/무시 규칙)는 기존 스위트 통과로 확인
+  - _DoneWhen: 20개 기준에 대한 증거 위치와 4.1 계측치가 기록된다_
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 5.1, 5.2, 5.3, 6.1, 6.2, 6.3, 6.4_
+  - _BizProcess: BP-SPEC-VIEW.A8.F6.S4_
+  - _Verify: BR-SPEC-VIEW-010_
+  - _Difficulty: mid_

@@ -63,15 +63,15 @@ const DEFAULT_DIAGRAM_ENGINE: &str = "mdview";
 #[command(name = "m", about = "Spec Viewer CLI", version)]
 pub struct Args {
     /// Optional starting path; defaults to the current directory (1.1, 1.2).
-    /// Under `--all`, this is the directory to scan instead of a `.kiro`
-    /// root (requirement 1.8).
+    /// Under `--files`, this is the directory to scan instead of a `.kiro`
+    /// root.
     path: Option<PathBuf>,
-    /// Browse any directory of markdown files, without a `.kiro` root
-    /// (requirement 1.8): folders fold/unfold, files render on selection,
-    /// no spec badges/progress/definition (requirement 1.9). `1.3`'s root-
-    /// search failure does not apply in this mode.
-    #[arg(long = "all")]
-    all: bool,
+    /// Start in files mode: browse any directory of markdown files, without
+    /// a `.kiro` root. Folders fold/unfold, files render on selection, no
+    /// spec badges/progress/definition, and the root-search failure does
+    /// not apply.
+    #[arg(long = "files")]
+    files: bool,
     /// Disable filesystem watching (requirement 7.6).
     #[arg(long = "no-watch")]
     no_watch: bool,
@@ -107,11 +107,11 @@ pub enum StartupError {
     RootNotFound(PathBuf),
     /// The requested `--log` path resolves inside the found `.kiro` root.
     LogInsideKiro(PathBuf),
-    /// `--all`'s target directory (requirement 1.8) does not exist, is not
-    /// a directory, or cannot be listed (task 17.3: applies 1.3's own
-    /// "path-including stderr message, exit 2" rule here too -- `--all`
-    /// must never silently show an empty tree for a bad path).
-    AllTargetUnreadable(PathBuf),
+    /// `--files`' target directory does not exist, is not a directory, or
+    /// cannot be listed: like a missing `.kiro` root it gets a
+    /// path-including stderr message and exit 2, because `--files` must
+    /// never silently show an empty tree for a bad path.
+    FilesTargetUnreadable(PathBuf),
 }
 
 impl StartupError {
@@ -130,9 +130,9 @@ impl StartupError {
                     log_path.display()
                 )
             }
-            StartupError::AllTargetUnreadable(dir) => {
+            StartupError::FilesTargetUnreadable(dir) => {
                 format!(
-                    "spec-viewer: --all target directory '{}' does not exist or cannot be read",
+                    "spec-viewer: --files target directory '{}' does not exist or cannot be read",
                     dir.display()
                 )
             }
@@ -715,9 +715,10 @@ fn handle_edit_file<B: ratatui::backend::Backend>(
 ///   judgment, requirement 1.2); sorts a `.kiro` result by the *current*
 ///   `state.sort_key` (research.md: the runtime sort key, not `--sort`,
 ///   since it may have been cycled since startup).
-/// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into full mode by
-///   scanning `start` as a plain markdown directory, mirroring `--all`'s own
-///   startup scan; this direction always succeeds (requirement 1.3).
+/// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into files mode by
+///   scanning the directory the cursor sits in (falling back to `start`)
+///   as a plain markdown directory; it fails, leaving the screen as is, only
+///   when that directory cannot be read.
 /// - On success, restarts the watch against the new root (requirement 1.5)
 ///   -- `--no-watch` keeps it `Manual` forever, exactly like `main()`'s own
 ///   initial setup, rather than resurrecting watching the user explicitly
@@ -754,21 +755,28 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
                     (spec_viewer::spec::TreeSource::SpecKit(features), root)
                 }
             })
-        } else if std::fs::read_dir(start).is_err() {
-            Err(format!(
-                "spec-viewer: cannot read directory '{}' for full mode",
-                start.display()
-            ))
         } else {
-            let mut tree = spec_viewer::spec::FsTree::scan(start);
-            // spec-viewer-files-mode-sort requirement 2.4: apply the
-            // current (normalized) sort key to the freshly scanned tree,
-            // mirroring the `Kiro` direction's own `sort_specs` call just
-            // above -- `state.sort_key` itself is left untouched so a
-            // round trip back to `Kiro` still sees whatever key was active
-            // there before.
-            tree.sort_entries(state.sort_key.for_files());
-            Ok((spec_viewer::spec::TreeSource::Files(tree), start.to_path_buf()))
+            // The cursor's own directory is all that needs scanning; with no
+            // usable cursor the whole start path is the fallback.
+            let scan_root = state
+                .root
+                .selection_scan_root(state.tree.selected())
+                .unwrap_or_else(|| start.to_path_buf());
+            if let Err(reason) = std::fs::read_dir(&scan_root) {
+                Err(format!(
+                    "spec-viewer: cannot read directory '{}' for files mode: {reason}",
+                    scan_root.display()
+                ))
+            } else {
+                let mut tree = spec_viewer::spec::FsTree::scan(&scan_root);
+                // Apply the current (normalized) sort key to the freshly
+                // scanned tree, mirroring the `Kiro` direction's own
+                // `sort_specs` call just above -- `state.sort_key` itself is
+                // left untouched so a round trip back to `Kiro` still sees
+                // whatever key was active there before.
+                tree.sort_entries(state.sort_key.for_files());
+                Ok((spec_viewer::spec::TreeSource::Files(tree), scan_root))
+            }
         };
 
     let (source, root) = match switch_result {
@@ -818,7 +826,7 @@ struct Startup {
 }
 
 /// `resolve_spec_mode`가 판정한, 아직 `TreeSource`로 감싸지 않은 원본 결과.
-/// `TreeSource::Files`는 이 함수가 절대 만들 일이 없으므로(그건 `--all`
+/// `TreeSource::Files`는 이 함수가 절대 만들 일이 없으므로(그건 `--files`
 /// 전용, 이 함수의 판정 대상이 아님) 아예 표현 불가능하게 좁혀둔다
 /// (design.md는 `resolve_spec_mode(start) -> Result<(TreeSource, PathBuf),
 /// String>`이라고 적었으나, 호출부가 절대 도달하지 않는 `Files` variant를
@@ -924,16 +932,16 @@ fn finish_kiro_startup(
 }
 
 /// Resolve which [`TreeSource`](spec_viewer::spec::TreeSource) and watch
-/// root to use for this run: `--all` (requirement 1.8) skips
+/// root to use for this run: `--files` (requirement 1.8) skips
 /// `find_root`/`.kiro` entirely and scans `args.path` (default cwd)
 /// directly as a plain `FsTree`; otherwise this delegates the `.kiro`-vs-
 /// spec-kit priority decision to [`resolve_spec_mode`] (SSoT with the
 /// runtime mode-switch handler, task 3.2), `resolve_startup`'s root-search
 /// failure (1.3) included via [`finish_kiro_startup`]. Requirement 1.6's
 /// file-view special case is a `.kiro`-mode-only concept (that
-/// requirement's own text), so `--all` never produces a `file_view_path`.
+/// requirement's own text), so `--files` never produces a `file_view_path`.
 fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
-    if args.all {
+    if args.files {
         let dir = args
             .path
             .clone()
@@ -944,7 +952,7 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
         // yields nothing for a root it can't open), so the check has to
         // happen here, before scanning.
         if std::fs::read_dir(&dir).is_err() {
-            return Err(StartupError::AllTargetUnreadable(dir));
+            return Err(StartupError::FilesTargetUnreadable(dir));
         }
         let tree = spec_viewer::spec::FsTree::scan(&dir);
         return Ok(Startup {
@@ -988,7 +996,7 @@ fn resolve_source(args: &Args) -> Result<Startup, StartupError> {
 
 /// spec-viewer-files-mode-sort requirement 1.4: apply `state`'s current
 /// sort key to a freshly built `TreeSource::Files` tree, if that's what
-/// `state.root` is (a no-op for `Kiro`/`SpecKit`) -- `--all` mode has no
+/// `state.root` is (a no-op for `Kiro`/`SpecKit`) -- `--files` mode has no
 /// `Phase`/`Progress` concept (no `spec.json`/`tasks.md` in a plain
 /// markdown directory), so `SortKey::for_files` normalizes a `.kiro`-only
 /// value to `Name` first. `state.sort_key` itself is left exactly as
@@ -1049,7 +1057,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    // The one starting path both of `resolve_source`'s branches (`--all`'s
+    // The one starting path both of `resolve_source`'s branches (`--files`'s
     // `dir` and the spec-mode branch's own `start`) compute identically from
     // `args` -- kept here, in `main()`, as its own local variable (research.md
     // "start 경로는 AppState가 아니라 main()이 계속 들고 있는다") so a later
@@ -1170,6 +1178,12 @@ fn main() {
 }
 
 #[cfg(test)]
+mod round_trip_tests;
+
+#[cfg(test)]
+mod switch_history_invariance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1180,21 +1194,21 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    fn scratch_dir(name: &str) -> PathBuf {
+    pub(super) fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("spec_viewer_main_{}_{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create scratch dir");
         dir
     }
 
-    fn fixtures_root() -> PathBuf {
+    pub(super) fn fixtures_root() -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/kiro"))
     }
 
-    fn args_with_path(path: Option<PathBuf>) -> Args {
+    pub(super) fn args_with_path(path: Option<PathBuf>) -> Args {
         Args {
             path,
-            all: false,
+            files: false,
             no_watch: false,
             log: None,
             tree: TreeMode::Auto,
@@ -1202,6 +1216,33 @@ mod tests {
             diagram_engine: "builtin".to_string(),
             editor: None,
         }
+    }
+
+    #[test]
+    fn files_flag_parses_with_the_path_argument_unchanged() {
+        let args = Args::try_parse_from(["m", "--files", "some/dir"]).expect("--files parses");
+        assert!(args.files);
+        assert_eq!(args.path, Some(PathBuf::from("some/dir")));
+    }
+
+    #[test]
+    fn all_flag_in_any_form_is_an_unsupported_flag_error() {
+        for argv in [vec!["m", "--all"], vec!["m", "--all", "dir"], vec!["m", "--all=true"]] {
+            let err = Args::try_parse_from(argv.clone()).expect_err("--all must be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{argv:?}");
+            assert_ne!(err.exit_code(), 0);
+        }
+    }
+
+    #[test]
+    fn help_text_lists_files_and_never_mentions_all() {
+        let mut help_text = Vec::new();
+        <Args as clap::CommandFactory>::command()
+            .write_long_help(&mut help_text)
+            .unwrap();
+        let help_text = String::from_utf8(help_text).unwrap();
+        assert!(help_text.contains("--files"), "{help_text}");
+        assert!(!help_text.contains("--all"), "{help_text}");
     }
 
     #[test]
@@ -1252,9 +1293,9 @@ mod tests {
         fs::remove_dir_all(&scratch).ok();
     }
 
-    fn args_all(path: Option<PathBuf>) -> Args {
+    fn args_files(path: Option<PathBuf>) -> Args {
         let mut args = args_with_path(path);
-        args.all = true;
+        args.files = true;
         args
     }
 
@@ -1297,15 +1338,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_source_all_mode_needs_no_kiro_root() {
-        // Requirement 1.8: `--all` must work under a plain directory that
+    fn resolve_source_files_mode_needs_no_kiro_root() {
+        // Requirement 1.8: `--files` must work under a plain directory that
         // has no `.kiro` anywhere in its ancestry -- the exact shape that
         // makes `resolve_startup_root_not_found_reports_search_path_and_exit_2`
-        // fail for the non-`--all` path above.
+        // fail for the non-`--files` path above.
         let dir = scratch_dir("all_no_kiro");
         fs::write(dir.join("a.md"), "# A\n").unwrap();
 
-        let args = args_all(Some(dir.clone()));
+        let args = args_files(Some(dir.clone()));
         let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
 
         assert_eq!(startup.root, dir);
@@ -1319,34 +1360,34 @@ mod tests {
                     tree.entries
                 );
             }
-            _ => panic!("expected TreeSource::Files under --all"),
+            _ => panic!("expected TreeSource::Files under --files"),
         }
 
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn resolve_source_all_mode_defaults_to_current_directory() {
+    fn resolve_source_files_mode_defaults_to_current_directory() {
         // No `path` argument at all -- requirement 1.8's "기본 현재
         // 디렉터리". Exercised against a real scratch dir set as cwd would
         // race other tests sharing the process's cwd, so instead this just
         // confirms the no-path branch resolves to *some* real, existing
         // directory rather than panicking -- the default-to-cwd wiring
         // itself is the one line under test, not cwd's specific contents.
-        let args = args_all(None);
+        let args = args_files(None);
         let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
         assert!(startup.root.is_dir());
     }
 
     #[test]
-    fn resolve_source_all_mode_rejects_a_nonexistent_directory() {
-        // Task 17.3's own defect report: `m --all /없는/경로` must not
+    fn resolve_source_files_mode_rejects_a_nonexistent_directory() {
+        // Task 17.3's own defect report: `m --files /없는/경로` must not
         // silently show an empty tree -- it should fail the same way 1.3
         // does (path-including stderr message, exit 2), not succeed with
         // nothing in it. A leaf under a scratch dir that is never created.
         let missing = scratch_dir("all_nonexistent").join("does-not-exist");
 
-        let args = args_all(Some(missing.clone()));
+        let args = args_files(Some(missing.clone()));
         let result = resolve_source(&args);
 
         match result {
@@ -1359,7 +1400,7 @@ mod tests {
                 );
             }
             Ok(_) => panic!(
-                "expected --all against a nonexistent directory to fail, not silently show an empty tree"
+                "expected --files against a nonexistent directory to fail, not silently show an empty tree"
             ),
         }
 
@@ -1367,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_source_all_mode_rejects_an_unreadable_directory() {
+    fn resolve_source_files_mode_rejects_an_unreadable_directory() {
         // "읽을 수 없는 디렉터리" -- exists but denies listing. Permission
         // bits are meaningless to git and to a root-run test process, but
         // this is a real, mechanically-verifiable filesystem state on this
@@ -1378,7 +1419,7 @@ mod tests {
         let dir = scratch_dir("all_unreadable");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let args = args_all(Some(dir.clone()));
+        let args = args_files(Some(dir.clone()));
         let result = resolve_source(&args);
 
         // Restore permissions before any cleanup/panic unwinding, or the
@@ -1402,7 +1443,7 @@ mod tests {
                 );
             }
             Ok(_) => panic!(
-                "expected --all against an unreadable directory to fail, not silently show an empty tree"
+                "expected --files against an unreadable directory to fail, not silently show an empty tree"
             ),
         }
 
@@ -1420,9 +1461,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_source_non_all_mode_still_requires_a_kiro_root() {
-        // Sanity: `--all`'s new branch must not have loosened the existing
-        // (non-`--all`) startup path -- same fixture shape as
+    fn resolve_source_non_files_mode_still_requires_a_kiro_root() {
+        // Sanity: `--files`'s new branch must not have loosened the existing
+        // (non-`--files`) startup path -- same fixture shape as
         // `resolve_startup_root_not_found_reports_search_path_and_exit_2`.
         let leaf = scratch_dir("resolve_source_needs_kiro").join("a/b");
         fs::create_dir_all(&leaf).unwrap();
@@ -1550,18 +1591,18 @@ mod tests {
 
     #[test]
     fn resolve_source_all_flag_wins_even_when_spec_kit_present() {
-        // Requirement/regression: `--all` must remain the highest-priority
+        // Requirement/regression: `--files` must remain the highest-priority
         // mode even when a `.specify` marker is also present.
         let root = scratch_dir("priority_all_wins");
         init_spec_kit(&root);
         fs::write(root.join("plain.md"), "# Plain\n").unwrap();
 
-        let args = args_all(Some(root.clone()));
+        let args = args_files(Some(root.clone()));
         let startup = resolve_source(&args).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
 
         match startup.source {
             spec_viewer::spec::TreeSource::Files(_) => {}
-            _ => panic!("expected TreeSource::Files under --all, even with .specify present"),
+            _ => panic!("expected TreeSource::Files under --files, even with .specify present"),
         }
 
         fs::remove_dir_all(&root).ok();
@@ -1627,8 +1668,8 @@ mod tests {
             spec_viewer::app::TreeMode::Auto,
             true,
         );
-        // As if `--sort phase --all` were passed: a `.kiro`-only value that
-        // `--all` mode cannot act on.
+        // As if `--sort phase --files` were passed: a `.kiro`-only value that
+        // `--files` mode cannot act on.
         state.sort_key = spec_viewer::spec::SortKey::Phase;
 
         apply_initial_files_sort(&mut state);
@@ -1922,7 +1963,7 @@ mod tests {
         fs::remove_dir_all(&outside).ok();
     }
 
-    fn key(code: KeyCode) -> KeyEvent {
+    pub(super) fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
@@ -1940,7 +1981,7 @@ mod tests {
 
     }
 
-    fn buffer_contains(buffer: &ratatui::buffer::Buffer, needle: &str) -> bool {
+    pub(super) fn buffer_contains(buffer: &ratatui::buffer::Buffer, needle: &str) -> bool {
         let area = buffer.area();
         for y in 0..area.height {
             let mut row = String::new();
@@ -1993,7 +2034,7 @@ mod tests {
         fs::write(dir.join("requirements.md"), requirements).unwrap();
     }
 
-    fn build_state_from(root: &Path, size: (u16, u16)) -> spec_viewer::app::AppState {
+    pub(super) fn build_state_from(root: &Path, size: (u16, u16)) -> spec_viewer::app::AppState {
         let snapshot = spec_viewer::app::load_snapshot(root);
         let spec_root = spec_viewer::spec::build(&snapshot);
         spec_viewer::app::AppState::new(
@@ -2882,12 +2923,12 @@ gamma trailing line
     }
 
     #[test]
-    fn handle_switch_mode_switches_from_kiro_to_files_and_always_succeeds() {
+    fn handle_switch_mode_switches_from_kiro_to_files_and_reports_success() {
         let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = temp_kiro_root("switch_kiro_to_files");
         write_requirements_spec(&root, "demo", "# Doc\n");
-        // `handle_switch_mode`'s full-mode direction scans `start` itself
-        // (mirroring `--all`), not `state.kiro_root` -- use `root`'s parent
+        // `handle_switch_mode`'s files-mode direction scans `start` itself
+        // (mirroring `--files`), not `state.kiro_root` -- use `root`'s parent
         // as `start` so the scan target is a real, readable directory
         // unrelated to the `.kiro`-shaped fixture layout above.
         let start = root.clone();
@@ -2923,7 +2964,7 @@ gamma trailing line
         let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = temp_kiro_root("switch_kiro_to_files_sorted");
         write_requirements_spec(&root, "demo", "# Doc\n");
-        // A separate, unrelated directory as the full-mode scan target --
+        // A separate, unrelated directory as the files-mode scan target --
         // `handle_switch_mode`'s Files direction scans `start` itself, not
         // `state.kiro_root`, so this stays decoupled from the `.kiro`-shaped
         // fixture above (keeps the expected file list simple/flat).
@@ -3134,10 +3175,131 @@ gamma trailing line
     // --- task 4.1 (spec-viewer-tree-navigation-modes): E2E mode-switch
     // round trip through the real key dispatch path, requirement 1.1-1.8 --
     // unlike the `handle_switch_mode_*` tests above (which construct
-    // `Control::SwitchMode` situations directly), this drives the real `'m'`
+    // `Control::SwitchMode` situations directly), this drives the real Space
     // keypress through `spec_viewer::app::update` first, exactly as
     // `run_loop`'s key-read branch does, and inspects the real rendered
     // frame at every step, not just reducer state.
+
+    /// Builds a spec-mode state over `<project>/.kiro` with one spec `demo`
+    /// (plus a markdown file at the project root), puts the cursor on
+    /// `selection`, and runs the switch toward files mode.
+    fn switch_to_files_mode_with_cursor(
+        project: &Path,
+        selection: Vec<NodeId>,
+    ) -> (spec_viewer::app::AppState, ratatui::Terminal<TestBackend>) {
+        let mut state = build_state_from(&project.join(".kiro"), (150, 40));
+        state.tree.select(selection);
+        let args = args_with_path(Some(project.to_path_buf()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let mut terminal = Terminal::new(TestBackend::new(150, 40)).expect("terminal");
+        handle_switch_mode(&mut terminal, &mut state, project, &args, &tx, &mut watch)
+            .expect("handle_switch_mode");
+        (state, terminal)
+    }
+
+    fn project_with_demo_spec(name: &str) -> PathBuf {
+        let project = scratch_dir(name);
+        write_requirements_spec(&project.join(".kiro"), "demo", "# Doc\n");
+        fs::write(project.join("plain.md"), "# Plain\n").unwrap();
+        fs::write(project.join(".kiro/specs/demo/extra.md"), "# Extra\n").unwrap();
+        project
+    }
+
+    #[test]
+    fn switch_to_files_mode_scans_the_spec_dir_when_the_cursor_is_on_a_spec() {
+        let project = project_with_demo_spec("scan_root_spec");
+        let spec_dir = project.join(".kiro/specs/demo");
+
+        let (state, _terminal) =
+            switch_to_files_mode_with_cursor(&project, vec![NodeId::Spec("demo".to_string())]);
+
+        match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, spec_dir),
+            _ => panic!("expected files mode"),
+        }
+        assert_eq!(state.kiro_root, spec_dir);
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn switch_to_files_mode_scans_the_containing_spec_dir_when_the_cursor_is_on_a_doc() {
+        let project = project_with_demo_spec("scan_root_doc");
+        let spec_dir = project.join(".kiro/specs/demo");
+
+        let (state, _terminal) = switch_to_files_mode_with_cursor(
+            &project,
+            vec![
+                NodeId::Spec("demo".to_string()),
+                NodeId::Doc("demo".to_string(), DocKind::Requirements),
+            ],
+        );
+
+        match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, spec_dir),
+            _ => panic!("expected files mode"),
+        }
+        assert_eq!(state.kiro_root, spec_dir);
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn switch_to_files_mode_falls_back_to_the_start_path_without_a_cursor() {
+        let project = project_with_demo_spec("scan_root_none");
+
+        let (state, _terminal) = switch_to_files_mode_with_cursor(&project, vec![]);
+
+        match &state.root {
+            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, project),
+            _ => panic!("expected files mode"),
+        }
+        assert_eq!(state.kiro_root, project);
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn switch_to_files_mode_falls_back_to_the_start_path_when_the_cursor_spec_is_gone() {
+        let project = project_with_demo_spec("scan_root_ghost");
+
+        let (state, _terminal) =
+            switch_to_files_mode_with_cursor(&project, vec![NodeId::Spec("ghost".to_string())]);
+
+        assert_eq!(state.kiro_root, project);
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn switch_to_files_mode_with_an_unreadable_cursor_root_keeps_the_screen_and_names_the_path() {
+        let project = project_with_demo_spec("scan_root_unreadable");
+        let spec_dir = project.join(".kiro/specs/demo");
+        let mut state = build_state_from(&project.join(".kiro"), (150, 40));
+        state.tree.select(vec![NodeId::Spec("demo".to_string())]);
+        fs::remove_dir_all(&spec_dir).unwrap();
+        let args = args_with_path(Some(project.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watch = spec_viewer::watch::manual("sentinel-before-switch");
+        let mut terminal = Terminal::new(TestBackend::new(150, 40)).expect("terminal");
+
+        let control = handle_switch_mode(&mut terminal, &mut state, &project, &args, &tx, &mut watch)
+            .expect("handle_switch_mode");
+
+        assert_eq!(control, spec_viewer::app::Control::Continue);
+        assert!(matches!(state.root, spec_viewer::spec::TreeSource::Kiro(_)));
+        assert_eq!(state.kiro_root, project.join(".kiro"));
+        assert_eq!(state.tree.selected(), [NodeId::Spec("demo".to_string())].as_slice());
+        match &state.popup {
+            Some(Popup::Message(msg)) => assert!(
+                msg.contains(&spec_dir.to_string_lossy().to_string()),
+                "message should name the unreadable root: {msg}"
+            ),
+            other => panic!("expected a failure message popup, got {other:?}"),
+        }
+        match &watch {
+            spec_viewer::watch::Watch::Manual(reason) => assert_eq!(reason, "sentinel-before-switch"),
+            spec_viewer::watch::Watch::Live(_) => panic!("a failed switch must not touch the watch"),
+        }
+        fs::remove_dir_all(&project).ok();
+    }
 
     #[test]
     fn e2e_mode_switch_round_trip_through_the_real_key_dispatch_path() {
@@ -3145,7 +3307,7 @@ gamma trailing line
         let project = scratch_dir("e2e_mode_roundtrip");
         fs::create_dir_all(project.join(".kiro/specs")).unwrap();
         write_requirements_spec(&project.join(".kiro"), "demo", "# Doc\n\nSPEC_MODE_MARKER_TEXT\n");
-        fs::write(project.join("plain.md"), "# Plain\n\nFULL_MODE_MARKER_TEXT\n").unwrap();
+        fs::write(project.join("requirements.md"), "# Plain\n\nFULL_MODE_MARKER_TEXT\n").unwrap();
 
         let mut state = build_state_from(&project.join(".kiro"), (150, 40));
         let target = project.join(".kiro/specs/demo/requirements.md");
@@ -3168,30 +3330,34 @@ gamma trailing line
             "expected the spec-mode doc visible before any switch"
         );
 
-        // Spec mode -> full mode (requirement 1.1): real 'm' keypress.
-        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        // Spec mode -> files mode (requirement 1.1): real Space keypress.
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char(' '))));
         assert_eq!(control, spec_viewer::app::Control::SwitchMode);
         let control = handle_switch_mode(&mut terminal, &mut state, &project, &args, &tx, &mut watch)
-            .expect("switch to full mode should succeed (1.3: always succeeds)");
+            .expect("switch from spec mode to files mode should succeed");
         assert_eq!(control, spec_viewer::app::Control::Continue);
 
         assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
-        assert_eq!(state.kiro_root, project);
+        assert_eq!(
+            state.kiro_root,
+            project.join(".kiro/specs/demo"),
+            "the cursor was on the demo spec, so only its directory is scanned"
+        );
         assert!(matches!(state.doc, DocView::Empty), "requirement 1.7: doc panel resets");
         assert!(state.tree.selected().is_empty(), "requirement 1.6: selection resets");
         assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live, "requirement 1.5: watch restarted");
         assert!(
-            buffer_contains(terminal.backend().buffer(), "plain.md"),
-            "expected the full-mode markdown tree"
+            buffer_contains(terminal.backend().buffer(), "requirements.md"),
+            "expected the files-mode markdown tree"
         );
         assert!(
             !buffer_contains(terminal.backend().buffer(), "SPEC_MODE_MARKER_TEXT"),
             "expected the old spec-mode doc gone after switching"
         );
 
-        // Full mode -> spec mode again (requirement 1.2): same key, same
+        // Files mode -> spec mode again (requirement 1.2): same key, same
         // origin `start` (requirement 1.8) re-judged from scratch.
-        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char(' '))));
         assert_eq!(control, spec_viewer::app::Control::SwitchMode);
         let control = handle_switch_mode(&mut terminal, &mut state, &project, &args, &tx, &mut watch)
             .expect("switch back to spec mode should succeed (.kiro still present)");
@@ -3234,20 +3400,20 @@ gamma trailing line
             .draw(|f| spec_viewer::ui::render(f, &mut state))
             .expect("initial draw");
 
-        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char('m'))));
+        let control = spec_viewer::app::update(&mut state, Action::Key(key(KeyCode::Char(' '))));
         assert_eq!(control, spec_viewer::app::Control::SwitchMode);
         let control = handle_switch_mode(&mut terminal, &mut state, &leaf, &args, &tx, &mut watch)
             .expect("handle_switch_mode should succeed even on a rejected switch");
         assert_eq!(control, spec_viewer::app::Control::Continue);
 
-        // Requirement 1.4: rejected, real render still shows the full-mode
+        // Requirement 1.4: rejected, real render still shows the files-mode
         // screen (not blanked/replaced) plus a guidance popup, watch left
         // untouched.
         assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
         assert!(matches!(watch, spec_viewer::watch::Watch::Live(_)));
         assert!(
             buffer_contains(terminal.backend().buffer(), "plain.md"),
-            "expected the full-mode tree still up behind the popup"
+            "expected the files-mode tree still up behind the popup"
         );
         assert!(
             buffer_contains(terminal.backend().buffer(), ".kiro")

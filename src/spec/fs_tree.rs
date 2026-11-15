@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::SortKey;
+use super::{NodeId, SortKey};
 
 /// One directory or markdown-file entry in an [`FsTree`], already filtered
 /// and pruned by [`FsTree::scan`].
@@ -124,6 +124,23 @@ impl FsTree {
         let mut tree = FsTree { root: root.to_path_buf(), entries };
         tree.sort_entries(SortKey::Name);
         tree
+    }
+
+    /// The tree path that selects `file`: its ancestor directories from the
+    /// outermost inward, then the file itself. `None` when `file` is not a
+    /// file entry of this tree. Pure -- reads `entries` only.
+    pub fn node_path_for(&self, file: &Path) -> Option<Vec<NodeId>> {
+        self.entries.iter().find(|entry| !entry.is_dir && entry.path == file)?;
+        let mut ancestors: Vec<&FsEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir && file.starts_with(&entry.path))
+            .collect();
+        ancestors.sort_by_key(|entry| entry.depth);
+        let mut node_path: Vec<NodeId> =
+            ancestors.into_iter().map(|entry| NodeId::Dir(entry.path.clone())).collect();
+        node_path.push(NodeId::File(file.to_path_buf()));
+        Some(node_path)
     }
 
     /// Re-order `entries`' siblings at every nesting level by `key`
@@ -535,6 +552,46 @@ mod tests {
                 .map(PathBuf::from)
                 .to_vec()
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn node_path_for_lists_ancestor_dirs_shallowest_first_then_the_file() {
+        let root = scratch_dir("node_path");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/deep.md"), "x").unwrap();
+        fs::write(root.join("a/side.md"), "x").unwrap();
+        let tree = FsTree::scan(&root);
+
+        assert_eq!(
+            tree.node_path_for(&root.join("a/b/deep.md")),
+            Some(vec![
+                NodeId::Dir(root.join("a")),
+                NodeId::Dir(root.join("a/b")),
+                NodeId::File(root.join("a/b/deep.md")),
+            ])
+        );
+        assert_eq!(
+            tree.node_path_for(&root.join("a/side.md")),
+            Some(vec![NodeId::Dir(root.join("a")), NodeId::File(root.join("a/side.md"))])
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn node_path_for_a_top_level_file_has_no_ancestor_and_unknown_paths_are_none() {
+        let root = scratch_dir("node_path_none");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("top.md"), "x").unwrap();
+        fs::write(root.join("a/x.md"), "x").unwrap();
+        let tree = FsTree::scan(&root);
+
+        assert_eq!(tree.node_path_for(&root.join("top.md")), Some(vec![NodeId::File(root.join("top.md"))]));
+        assert_eq!(tree.node_path_for(&root.join("missing.md")), None);
+        assert_eq!(tree.node_path_for(&root.join("a")), None, "a directory is not a file node");
+        assert_eq!(tree.node_path_for(Path::new("/elsewhere/x.md")), None);
 
         fs::remove_dir_all(&root).ok();
     }

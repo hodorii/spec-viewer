@@ -247,6 +247,45 @@ impl TreeSource {
             TreeSource::SpecKit(_) | TreeSource::Files(_) => None,
         }
     }
+
+    fn specs(&self) -> &[Spec] {
+        match self {
+            TreeSource::Kiro(root) => &root.specs,
+            TreeSource::SpecKit(specs) => specs,
+            TreeSource::Files(_) => &[],
+        }
+    }
+
+    /// The directory the cursor sits in or on: a folder-like node
+    /// (`Spec`/`Dir`) is that directory itself, a file-like node
+    /// (`Doc`/`File`) is the directory holding it. `None` when nothing is
+    /// selected or the spec is no longer in this source. Shared by `.kiro`
+    /// and spec-kit because both hang the same `Spec` type under the tree.
+    pub fn selection_scan_root(&self, selected: &[NodeId]) -> Option<PathBuf> {
+        match selected.last()? {
+            NodeId::Spec(name) | NodeId::Doc(name, _) => {
+                self.specs().iter().find(|spec| &spec.name == name).map(|spec| spec.dir.clone())
+            }
+            NodeId::Dir(dir) => Some(dir.clone()),
+            NodeId::File(file) => file.parent().map(Path::to_path_buf),
+        }
+    }
+
+    /// The file the cursor sits on, for a file-like node only.
+    pub fn selection_file(&self, selected: &[NodeId]) -> Option<PathBuf> {
+        match selected.last()? {
+            NodeId::Doc(name, kind) => self
+                .specs()
+                .iter()
+                .find(|spec| &spec.name == name)?
+                .docs
+                .iter()
+                .find(|doc| &doc.kind == kind)
+                .map(|doc| doc.path.clone()),
+            NodeId::File(file) => Some(file.clone()),
+            NodeId::Spec(_) | NodeId::Dir(_) => None,
+        }
+    }
 }
 
 /// Standard filenames handled by the canonical per-slot rules; anything else
@@ -932,6 +971,78 @@ Should not be included.
     fn inclusion_with_no_front_matter_defaults_to_always() {
         let steering_md = "# Product\nNo front matter here.\n";
         assert_eq!(inclusion(steering_md), Inclusion::Always);
+    }
+
+    fn spec_dir_of(name: &str) -> PathBuf {
+        fixtures_root().join("specs").join(name)
+    }
+
+    fn kiro_sources() -> [TreeSource; 2] {
+        let snapshot = snapshot_of(&["sample-signup"], true);
+        let kiro = TreeSource::Kiro(build(&snapshot));
+        let spec_kit = TreeSource::SpecKit(build(&snapshot).specs);
+        [kiro, spec_kit]
+    }
+
+    #[test]
+    fn scan_root_of_a_spec_or_its_document_is_the_spec_directory() {
+        for source in kiro_sources() {
+            let spec_node = NodeId::Spec("sample-signup".to_string());
+            let doc_node = NodeId::Doc("sample-signup".to_string(), DocKind::Design);
+
+            assert_eq!(
+                source.selection_scan_root(std::slice::from_ref(&spec_node)),
+                Some(spec_dir_of("sample-signup"))
+            );
+            assert_eq!(
+                source.selection_scan_root(&[spec_node, doc_node]),
+                Some(spec_dir_of("sample-signup"))
+            );
+        }
+    }
+
+    #[test]
+    fn scan_root_of_a_folder_is_itself_and_of_a_file_is_its_parent() {
+        let [kiro, _] = kiro_sources();
+        let folder = fixtures_root().join("steering");
+        let file = folder.join("product.md");
+
+        assert_eq!(kiro.selection_scan_root(&[NodeId::Dir(folder.clone())]), Some(folder.clone()));
+        assert_eq!(
+            kiro.selection_scan_root(&[NodeId::Dir(folder.clone()), NodeId::File(file)]),
+            Some(folder)
+        );
+    }
+
+    #[test]
+    fn scan_root_of_an_empty_selection_or_a_vanished_spec_is_none() {
+        for source in kiro_sources() {
+            assert_eq!(source.selection_scan_root(&[]), None);
+            assert_eq!(source.selection_scan_root(&[NodeId::Spec("gone".to_string())]), None);
+            assert_eq!(
+                source.selection_scan_root(&[
+                    NodeId::Spec("gone".to_string()),
+                    NodeId::Doc("gone".to_string(), DocKind::Design)
+                ]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn selection_file_names_the_document_or_file_under_the_cursor() {
+        let [kiro, _] = kiro_sources();
+        let spec_node = NodeId::Spec("sample-signup".to_string());
+        let doc_node = NodeId::Doc("sample-signup".to_string(), DocKind::Design);
+        let steering_file = fixtures_root().join("steering/product.md");
+
+        assert_eq!(
+            kiro.selection_file(&[spec_node.clone(), doc_node]),
+            Some(spec_dir_of("sample-signup").join("design.md"))
+        );
+        assert_eq!(kiro.selection_file(&[spec_node]), None);
+        assert_eq!(kiro.selection_file(&[NodeId::File(steering_file.clone())]), Some(steering_file));
+        assert_eq!(kiro.selection_file(&[]), None);
     }
 }
 

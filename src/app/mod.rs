@@ -18,7 +18,7 @@ use crate::markdown::Rendered;
 use crate::spec::{FsEntry, NodeId, SortKey, TreeSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tui_tree_widget::{TreeItem, TreeState};
@@ -335,14 +335,20 @@ pub struct AppState {
     /// switching back to the same source kind over the same root restores
     /// where the user was instead of starting from a blank tree.
     pub remembered_tree_positions: HashMap<TreePositionKey, RememberedTreePosition>,
+    /// Trees shown during this run. A position loaded from an earlier run is
+    /// stale for a mode switch, so only these keys may be restored by one.
+    pub trees_shown_this_session: HashSet<TreePositionKey>,
     /// Rendered documents reused when the same file is selected again.
     /// Refresh and resize reloads bypass it so they always show the latest.
     pub doc_cache: doc_cache::DocCache,
 }
 
-/// Which tree a remembered position belongs to: the source kind plus the
-/// directory the viewer was launched for.
-pub type TreePositionKey = (crate::spec::TreeSourceKind, PathBuf);
+/// Which tree a remembered position belongs to: the source kind, the
+/// directory the viewer was launched for, and -- only for a files tree
+/// scanned from somewhere other than the launch directory -- that scan root.
+/// Keeping `None` for the launch directory itself leaves positions saved
+/// before scan roots existed addressable.
+pub type TreePositionKey = (crate::spec::TreeSourceKind, PathBuf, Option<PathBuf>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RememberedTreePosition {
@@ -425,6 +431,7 @@ impl AppState {
             clipboard: Box::new(clipboard::Osc52),
             files_tree_cache: None,
             remembered_tree_positions: HashMap::new(),
+            trees_shown_this_session: HashSet::new(),
             doc_cache: doc_cache::DocCache::default(),
         }
     }
@@ -565,7 +572,13 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
         // as `Control::SwitchMode`'s doc comment describes.
         Action::ToggleSourceMode => Control::SwitchMode,
         Action::ApplySourceSwitch { source, root, watch_status } => {
+            // Read before the old source is replaced: only the outgoing tree
+            // can say which file the cursor was on.
+            let cursor_file = state.root.selection_file(state.tree.selected());
             remember_tree_position(state);
+            // The launch tree is never switched *to*, so it joins the set when
+            // it is first left.
+            state.trees_shown_this_session.insert(tree_position_key(state));
             // A scan started against the old root must never land on the new one.
             state.rescan.invalidate();
             state.root = source;
@@ -575,7 +588,13 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             // source kind and root was left earlier, in which case its own
             // position is put back.
             state.tree = TreeState::default();
-            restore_tree_position(state);
+            let was_shown_this_session = state.trees_shown_this_session.contains(&tree_position_key(state));
+            if !(was_shown_this_session && restore_tree_position(state)) {
+                if let Some(file) = cursor_file {
+                    select_file_in_files_tree(state, &file);
+                }
+            }
+            state.trees_shown_this_session.insert(tree_position_key(state));
             // Requirement 1.7: nothing is selected in the new tree yet, so
             // the doc panel has nothing left to show.
             state.doc = DocView::Empty;
@@ -607,8 +626,13 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
 }
 
 fn tree_position_key(state: &AppState) -> TreePositionKey {
-    let stable_launch_dir = state.launch_dir.canonicalize().unwrap_or_else(|_| state.launch_dir.clone());
-    (state.root.kind(), stable_launch_dir)
+    let stable_path = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let stable_launch_dir = stable_path(&state.launch_dir);
+    let scan_root = match &state.root {
+        TreeSource::Files(tree) => Some(stable_path(&tree.root)).filter(|root| *root != stable_launch_dir),
+        TreeSource::Kiro(_) | TreeSource::SpecKit(_) => None,
+    };
+    (state.root.kind(), stable_launch_dir, scan_root)
 }
 
 /// Record where the cursor and folds are in the tree currently shown, under
@@ -621,12 +645,13 @@ pub fn remember_tree_position(state: &mut AppState) {
     state.remembered_tree_positions.insert(tree_position_key(state), position);
 }
 
-/// Put back the position remembered for the tree currently shown. Nodes
-/// that no longer exist in the tree are skipped, so a stale record quietly
-/// leaves the default (blank) position instead of selecting nothing real.
-pub fn restore_tree_position(state: &mut AppState) {
+/// Put back the position remembered for the tree currently shown, and say
+/// whether one was remembered. Nodes that no longer exist in the tree are
+/// skipped, so a stale record quietly leaves the default (blank) position
+/// instead of selecting nothing real.
+pub fn restore_tree_position(state: &mut AppState) -> bool {
     let Some(position) = state.remembered_tree_positions.get(&tree_position_key(state)).cloned() else {
-        return;
+        return false;
     };
     let existing_paths: std::collections::HashSet<Vec<NodeId>> =
         search::flatten_tree(&state.root).into_iter().map(|(path, _)| path).collect();
@@ -638,6 +663,23 @@ pub fn restore_tree_position(state: &mut AppState) {
     if existing_paths.contains(&position.selected) {
         state.tree.select(position.selected);
     }
+    true
+}
+
+/// Put the cursor on `file` in the files tree just switched to, with every
+/// ancestor folder open so the row is on screen. A source that is not a
+/// files tree, or one without that file, keeps the default cursor.
+fn select_file_in_files_tree(state: &mut AppState, file: &Path) {
+    let TreeSource::Files(tree) = &state.root else {
+        return;
+    };
+    let Some(node_path) = tree.node_path_for(file) else {
+        return;
+    };
+    for ancestor_len in 1..node_path.len() {
+        state.tree.open(node_path[..ancestor_len].to_vec());
+    }
+    state.tree.select(node_path);
 }
 
 /// Load the doc for whatever the tree has selected -- for a position
@@ -3787,6 +3829,18 @@ mod reducer_tests {
     }
 
     #[test]
+    fn space_in_search_input_is_typed_as_a_space_not_a_mode_switch() {
+        let mut state = test_state();
+        key_action(&mut state, KeyCode::Char('/'));
+        key_action(&mut state, KeyCode::Char('a'));
+
+        assert_eq!(key_action(&mut state, KeyCode::Char(' ')), Control::Continue);
+        key_action(&mut state, KeyCode::Char('b'));
+
+        assert_eq!(state.popup, Some(Popup::SearchInput("a b".to_string())));
+    }
+
+    #[test]
     fn help_popup_open_and_dismiss_still_works_via_popup_dispatch() {
         let mut state = test_state();
 
@@ -4185,6 +4239,196 @@ mod reducer_tests {
         assert!(state.tree.selected().is_empty());
     }
 
+    fn temp_markdown_tree(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spec_viewer_cursor_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for file in files {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "# x\n").unwrap();
+        }
+        dir
+    }
+
+    fn scanned_files_source(root: &Path) -> TreeSource {
+        TreeSource::Files(FsTree::scan(root))
+    }
+
+    fn signup_dir() -> PathBuf {
+        fixtures_root().join("specs/sample-signup")
+    }
+
+    fn signup_doc_path(kind: DocKind) -> Vec<NodeId> {
+        vec![NodeId::Spec("sample-signup".to_string()), NodeId::Doc("sample-signup".to_string(), kind)]
+    }
+
+    #[test]
+    fn entering_files_mode_from_a_spec_document_selects_that_file() {
+        let mut state = test_state();
+        state.tree.select(signup_doc_path(DocKind::Design));
+
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+
+        assert_eq!(state.tree.selected(), [NodeId::File(signup_dir().join("design.md"))]);
+        assert!(matches!(state.doc, DocView::Empty), "the doc panel still resets");
+    }
+
+    #[test]
+    fn entering_files_mode_from_a_spec_row_has_no_file_to_select() {
+        let mut state = test_state();
+        state.tree.select(vec![NodeId::Spec("sample-signup".to_string())]);
+
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+
+        assert!(state.tree.selected().is_empty());
+    }
+
+    #[test]
+    fn the_selected_file_is_revealed_by_opening_its_ancestor_folders() {
+        let outer = temp_markdown_tree("reveal", &["a/b/deep.md", "a/side.md"]);
+        let mut state = test_state();
+        state.root = scanned_files_source(&outer.join("a"));
+        state.tree.select(vec![NodeId::Dir(outer.join("a/b")), NodeId::File(outer.join("a/b/deep.md"))]);
+
+        switch_to(&mut state, scanned_files_source(&outer), outer.to_str().unwrap());
+
+        let deep = vec![
+            NodeId::Dir(outer.join("a")),
+            NodeId::Dir(outer.join("a/b")),
+            NodeId::File(outer.join("a/b/deep.md")),
+        ];
+        assert_eq!(state.tree.selected(), deep.as_slice());
+        assert!(state.tree.opened().contains(&deep[..1]));
+        assert!(state.tree.opened().contains(&deep[..2]));
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    #[test]
+    fn a_file_missing_from_the_new_files_tree_leaves_the_default_cursor() {
+        let elsewhere = temp_markdown_tree("elsewhere", &["other.md"]);
+        let mut state = test_state();
+        state.tree.select(signup_doc_path(DocKind::Design));
+
+        switch_to(&mut state, scanned_files_source(&elsewhere), elsewhere.to_str().unwrap());
+
+        assert!(state.tree.selected().is_empty());
+        fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[test]
+    fn returning_to_the_same_files_root_restores_its_cursor_over_the_spec_cursor_file() {
+        let mut state = test_state();
+        let kiro_root = state.kiro_root.clone();
+        let kiro = || TreeSource::Kiro(spec::build(&loader::load_snapshot(&fixtures_root())));
+        state.tree.select(signup_doc_path(DocKind::Design));
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+        state.tree.select(vec![NodeId::File(signup_dir().join("requirements.md"))]);
+
+        switch_to(&mut state, kiro(), kiro_root.to_str().unwrap());
+        state.tree.select(signup_doc_path(DocKind::Tasks));
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+
+        assert_eq!(state.tree.selected(), [NodeId::File(signup_dir().join("requirements.md"))]);
+    }
+
+    #[test]
+    fn a_different_files_root_discards_the_earlier_cursor_and_the_earlier_root_keeps_its_own() {
+        let first = temp_markdown_tree("root_first", &["one.md", "two.md"]);
+        let second = temp_markdown_tree("root_second", &["one.md", "two.md"]);
+        let mut state = test_state();
+        let kiro_root = state.kiro_root.clone();
+        let kiro = || TreeSource::Kiro(spec::build(&loader::load_snapshot(&fixtures_root())));
+        switch_to(&mut state, scanned_files_source(&first), first.to_str().unwrap());
+        state.tree.select(vec![NodeId::File(first.join("two.md"))]);
+
+        switch_to(&mut state, kiro(), kiro_root.to_str().unwrap());
+        switch_to(&mut state, scanned_files_source(&second), second.to_str().unwrap());
+        assert!(state.tree.selected().is_empty(), "the other root's cursor must not leak across roots");
+        state.tree.select(vec![NodeId::File(second.join("one.md"))]);
+
+        switch_to(&mut state, kiro(), kiro_root.to_str().unwrap());
+        switch_to(&mut state, scanned_files_source(&first), first.to_str().unwrap());
+        assert_eq!(state.tree.selected(), [NodeId::File(first.join("two.md"))]);
+        fs::remove_dir_all(&first).ok();
+        fs::remove_dir_all(&second).ok();
+    }
+
+    #[test]
+    fn a_position_loaded_from_an_earlier_run_does_not_override_the_cursor_file_on_the_first_switch() {
+        let mut state = test_state();
+        state.tree.select(signup_doc_path(DocKind::Design));
+        let mut probe = test_state();
+        probe.root = scanned_files_source(&signup_dir());
+        let files_key = tree_position_key(&probe);
+        state.remembered_tree_positions.insert(
+            files_key.clone(),
+            RememberedTreePosition { selected: vec![NodeId::File(signup_dir().join("requirements.md"))], opened: vec![] },
+        );
+
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+
+        assert_eq!(state.tree.selected(), [NodeId::File(signup_dir().join("design.md"))]);
+        assert!(state.trees_shown_this_session.contains(&files_key), "now shown, so a later return restores");
+    }
+
+    #[test]
+    fn a_remembered_cursor_that_vanished_falls_back_to_the_default_instead_of_the_file_hint() {
+        let mut state = test_state();
+        state.tree.select(signup_doc_path(DocKind::Design));
+        let mut probe = test_state();
+        probe.root = scanned_files_source(&signup_dir());
+        state.trees_shown_this_session.insert(tree_position_key(&probe));
+        state.remembered_tree_positions.insert(
+            tree_position_key(&probe),
+            RememberedTreePosition { selected: vec![NodeId::File(signup_dir().join("gone.md"))], opened: vec![] },
+        );
+
+        switch_to(&mut state, scanned_files_source(&signup_dir()), signup_dir().to_str().unwrap());
+
+        assert!(state.tree.selected().is_empty());
+    }
+
+    #[test]
+    fn returning_to_spec_mode_without_a_remembered_cursor_starts_at_the_default() {
+        let mut state = test_state();
+        state.root = scanned_files_source(&signup_dir());
+        state.tree.select(vec![NodeId::File(signup_dir().join("design.md"))]);
+        let kiro = TreeSource::Kiro(spec::build(&loader::load_snapshot(&fixtures_root())));
+
+        switch_to(&mut state, kiro, fixtures_root().to_str().unwrap());
+
+        assert!(state.tree.selected().is_empty());
+    }
+
+    #[test]
+    fn a_failed_switch_leaves_cursor_folds_doc_and_memory_untouched() {
+        let mut state = test_state();
+        let spec_path = vec![NodeId::Spec("sample-signup".to_string())];
+        state.tree.open(spec_path.clone());
+        state.tree.select(signup_doc_path(DocKind::Design));
+        let remembered_before = state.remembered_tree_positions.clone();
+
+        update(&mut state, Action::SwitchModeFailed("읽을 수 없음".to_string()));
+
+        assert_eq!(state.tree.selected(), signup_doc_path(DocKind::Design).as_slice());
+        assert_eq!(state.tree.opened().iter().collect::<Vec<_>>(), vec![&spec_path]);
+        assert!(matches!(state.root, TreeSource::Kiro(_)));
+        assert_eq!(state.remembered_tree_positions, remembered_before);
+    }
+
+    #[test]
+    fn files_trees_with_different_scan_roots_get_different_position_keys() {
+        let mut state = test_state();
+        state.launch_dir = PathBuf::from("/w");
+        state.root = TreeSource::Files(FsTree { root: PathBuf::from("/w"), entries: vec![] });
+        let launch_root_key = tree_position_key(&state);
+        state.root = TreeSource::Files(FsTree { root: PathBuf::from("/w/docs"), entries: vec![] });
+        let narrowed_root_key = tree_position_key(&state);
+
+        assert_ne!(launch_root_key, narrowed_root_key);
+        assert_eq!(launch_root_key.2, None, "the launch directory keeps the key shape saved by earlier versions");
+    }
+
     #[test]
     fn apply_source_switch_replaces_root_and_resets_every_view_field() {
         // Requirements 1.6, 1.7: start from a state with something loaded
@@ -4301,7 +4545,7 @@ mod reducer_tests {
     fn mode_switch_and_expand_collapse_keys_reach_their_actions_through_the_real_key_dispatch_path() {
         let mut state = test_state();
 
-        assert_eq!(key_action(&mut state, KeyCode::Char('m')), Control::SwitchMode);
+        assert_eq!(key_action(&mut state, KeyCode::Char(' ')), Control::SwitchMode);
 
         assert!(state.tree.opened().is_empty());
         assert_eq!(key_action(&mut state, KeyCode::Char('o')), Control::Continue);

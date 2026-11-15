@@ -31,6 +31,9 @@ struct StoreFile {
 struct PositionRecord {
     kind: TreeSourceKind,
     root: PathBuf,
+    /// Absent in files written before scan roots were part of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scan_root: Option<PathBuf>,
     selected: Vec<NodeId>,
     opened: Vec<Vec<NodeId>>,
 }
@@ -66,7 +69,7 @@ pub fn load(path: &Path) -> HashMap<TreePositionKey, RememberedTreePosition> {
         .into_iter()
         .map(|record| {
             (
-                (record.kind, record.root),
+                (record.kind, record.root, record.scan_root),
                 RememberedTreePosition { selected: record.selected, opened: record.opened },
             )
         })
@@ -81,9 +84,10 @@ pub fn save(
 ) -> std::io::Result<()> {
     let mut records: Vec<PositionRecord> = positions
         .iter()
-        .map(|((kind, root), position)| PositionRecord {
+        .map(|((kind, root, scan_root), position)| PositionRecord {
             kind: *kind,
             root: root.clone(),
+            scan_root: scan_root.clone(),
             selected: position.selected.clone(),
             opened: position.opened.clone(),
         })
@@ -114,7 +118,7 @@ mod tests {
     fn sample_positions() -> HashMap<TreePositionKey, RememberedTreePosition> {
         let mut positions = HashMap::new();
         positions.insert(
-            (TreeSourceKind::Kiro, PathBuf::from("/project/.kiro")),
+            (TreeSourceKind::Kiro, PathBuf::from("/project/.kiro"), None),
             RememberedTreePosition {
                 selected: vec![
                     NodeId::Spec("alpha".to_string()),
@@ -124,9 +128,16 @@ mod tests {
             },
         );
         positions.insert(
-            (TreeSourceKind::Files, PathBuf::from("/project")),
+            (TreeSourceKind::Files, PathBuf::from("/project"), None),
             RememberedTreePosition {
                 selected: vec![NodeId::Dir(PathBuf::from("/project/docs")), NodeId::File(PathBuf::from("/project/docs/a.md"))],
+                opened: vec![],
+            },
+        );
+        positions.insert(
+            (TreeSourceKind::Files, PathBuf::from("/project"), Some(PathBuf::from("/project/docs"))),
+            RememberedTreePosition {
+                selected: vec![NodeId::File(PathBuf::from("/project/docs/b.md"))],
                 opened: vec![],
             },
         );
@@ -140,6 +151,22 @@ mod tests {
         save(&file, &sample_positions()).expect("save creates the directory and file");
 
         assert_eq!(load(&file), sample_positions());
+        std::fs::remove_dir_all(file.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn records_saved_without_a_scan_root_still_load_under_a_key_without_one() {
+        let file = scratch_file("legacy_record");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            r#"{"version":1,"positions":[{"kind":"files","root":"/project","selected":[],"opened":[]}]}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&file);
+
+        assert!(loaded.contains_key(&(TreeSourceKind::Files, PathBuf::from("/project"), None)));
         std::fs::remove_dir_all(file.parent().unwrap().parent().unwrap()).ok();
     }
 

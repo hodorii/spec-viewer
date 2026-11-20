@@ -2,13 +2,14 @@
 //!
 //! 두 갈래로 나뉜다:
 //! 1. `glow`(charmbracelet/glow) 가 설치돼 있을 때만, 이 저장소의 실제
-//!    `.kiro/specs/*/design.md` 전체를 `glow -s dark -w 100` 과 `m`(이 크레이트의
+//!    `tests/fixtures/mermaid-samples/spec-viewer/design.md` 표본을 `glow -s dark -w 100` 과 `m`(이 크레이트의
 //!    렌더러) 양쪽으로 렌더해 `tests/snapshots/glow-vs-m/<spec>/{glow,m}.txt` 에
 //!    나란히 저장한다 — 사람이 검토할 대조 자료다. 미설치 환경에서는 건너뛴다.
 //! 2. glow 설치 여부와 무관하게 항상 도는 자동 단정 — 10.1~10.7 이 실제로
 //!    발화하는지 확인한다.
 //!
-//! ⚠️ **의도적 이탈, 숨기지 않는다**: 실제 `design.md` 8개를 전수 조사한 결과
+//! ⚠️ **의도적 이탈, 숨기지 않는다**: 실제 `design.md` 8개를 전수 조사한 결과(표본은
+//! 그중 하나를 고정한 것이다)
 //! (`grep` 실측) 인용문(`>`)과 `rust`/`json`/`toml` 코드 펜스는 전부에 있지만,
 //! **체크박스·링크·이미지·각주는 단 하나도 없다.** 자동 단정 절이 "10.1~10.7
 //! 기호...존재"라고 못박았으므로, 실제 문서에 없는 요소를 억지로 문서에 끼워
@@ -44,21 +45,7 @@ const FEATURE_SMOKE_MD: &str = "\
 ```rust\nfn main() {\n\tprintln!(\"tab\");\n}\n```\n";
 
 fn design_md_files() -> Vec<PathBuf> {
-    // This crate carries its own `.kiro/` specs (moved in from the
-    // archgenworks monorepo, commit 0ab79a3) rather than assuming it's
-    // checked out one level under an external workspace's `.kiro/`.
-    let specs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".kiro/specs");
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(&specs_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path().join("design.md");
-            if p.is_file() {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+    vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mermaid-samples/spec-viewer/design.md")]
 }
 
 /// 마크다운 원문에서 펜스 코드 블록의 (언어, 본문)만 뽑아낸다 — 전체 문서를
@@ -98,7 +85,7 @@ fn glow_vs_m_snapshots_saved_when_glow_installed() {
         return;
     }
     let files = design_md_files();
-    assert!(!files.is_empty(), "no design.md files found under .kiro/specs");
+    assert!(!files.is_empty(), "no design.md sample found");
 
     let out_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/glow-vs-m");
     fs::create_dir_all(&out_root).unwrap();
@@ -136,7 +123,7 @@ fn real_design_md_corpus_exercises_heading_rule_list_bullet_quote_bar_code_highl
     // 밑줄·목록 기호·인용 막대와 10.7의 코드 강조가 실제로 발화하는지 확인한다
     // — 합성 픽스처가 아니라 이 저장소의 진짜 스펙 문서로.
     let files = design_md_files();
-    assert!(!files.is_empty(), "no design.md files found under .kiro/specs — corpus is empty");
+    assert!(!files.is_empty(), "no design.md sample found — corpus is empty");
 
     let mut any_heading_rule = false;
     let mut any_list_bullet = false;

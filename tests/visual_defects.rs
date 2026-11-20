@@ -231,29 +231,42 @@ fn table_has_border_characters() {
 
 // --- defect: 2-panel doc wraps at terminal width, not panel width (task 20.1)
 
-/// tasks.md 20's own NO-GO report, against the real repo `.kiro` root (not
-/// `tests/fixtures/kiro`) so this is the exact real-world repro rather than
-/// a stand-in: in a 120-wide two-panel frame, this spec's own design.md
+/// tasks.md 20's own NO-GO report, against a `.kiro` root holding the
+/// checked-in real design.md sample (not `tests/fixtures/kiro`) so this is
+/// the real-world repro rather than a stand-in: in a 120-wide two-panel frame, this spec's own design.md
 /// `## 정의` paragraph must be seen loading via the tree (Enter, mirroring a
 /// real session) and wrap inside the doc panel's actual (narrower than the
 /// terminal) width -- not the full terminal width, which overflows past the
 /// panel's right border and gets clipped, silently dropping whole
 /// mid-paragraph words/lines rather than just visually truncating them.
-/// Loads the real repo's own `.kiro/specs/spec-viewer/design.md` via the
+/// Loads the sample `spec-viewer/design.md` spec via the
 /// tree (Enter, mirroring a real session) at `width`x35 with the given
 /// `tree_mode`/`tree_visible`, renders one frame, and asserts every
 /// whitespace-separated word of the `## 정의` paragraph is both present
 /// (not silently dropped by a mid-paragraph wrap past the panel) and inside
 /// the doc panel's actual rendered column range.
+/// A scratch `.kiro` root holding one `spec-viewer` spec whose design.md is
+/// the checked-in sample, so the test never depends on this repository's own
+/// spec documents being present.
+fn kiro_root_with_sample_design(name: &str) -> PathBuf {
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let kiro_root = std::env::temp_dir()
+        .join(format!("spec_viewer_visual_defects_{name}_{}_{id}", std::process::id()))
+        .join(".kiro");
+    let spec_dir = kiro_root.join("specs/spec-viewer");
+    std::fs::create_dir_all(&spec_dir).expect("create scratch spec dir");
+    let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mermaid-samples/spec-viewer/design.md");
+    std::fs::copy(sample, spec_dir.join("design.md")).expect("copy sample design.md");
+    kiro_root
+}
+
 fn assert_definition_paragraph_wraps_inside_doc_panel(
     width: u16,
     tree_mode: spec_viewer::app::TreeMode,
     tree_visible: bool,
 ) {
-    // This crate carries its own `.kiro/` specs (moved in from the
-    // archgenworks monorepo, commit 0ab79a3) rather than assuming it's
-    // checked out one level under an external workspace's `.kiro/`.
-    let repo_kiro_root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.kiro"));
+    let repo_kiro_root = kiro_root_with_sample_design("definition_wrap");
     let snapshot = app::load_snapshot(&repo_kiro_root);
     let root = spec::build(&snapshot);
     let mut state = AppState::new(

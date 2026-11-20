@@ -44,8 +44,8 @@ m --files [dir]           # browse any markdown directory, no .kiro required
 
 `--files` only picks which mode you *start* in — press `Space` at any time to
 switch between files mode and spec mode without restarting. Switching from spec
-mode shows the files tree from its top (the start path, or the `.kiro` folder
-when the cursor is inside it) down to the cursor, with every folder above the
+mode shows the files tree from its top (the start path, with a `.kiro` folder
+directly under it included) down to the cursor, with every folder above the
 cursor open; what lies after the cursor is filled in right behind.
 
 Flags:

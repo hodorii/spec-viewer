@@ -723,7 +723,7 @@ fn handle_edit_file<B: ratatui::backend::Backend>(
 ///   `state.sort_key` (research.md: the runtime sort key, not `--sort`,
 ///   since it may have been cycled since startup).
 /// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into files mode over
-///   `start` (or the hidden folder holding the cursor): the first frame holds
+///   `start` (or the directory above both `start` and the cursor): the first frame holds
 ///   everything from the top down to the cursor, a rescan then completes
 ///   what lies after it. It fails, leaving the screen as is, only when the
 ///   scan root cannot be read.
@@ -765,12 +765,12 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
             })
         } else {
             // Files mode starts from the beginning of the tree (`start`, or the
-            // hidden folder holding the cursor) and reaches the cursor; only
+            // directory above both `start` and the cursor) and reaches it; only
             // what lies after the cursor is filled in by the rescan that
             // follows the switch.
             let cursor = spec_viewer::app::switch_cursor_path(state);
             let scan_root = match &cursor {
-                Some((path, is_dir)) => spec_viewer::spec::files_mode_scan_root(start, path, *is_dir),
+                Some((path, is_dir)) => spec_viewer::spec::files_mode_scan_root(start, path),
                 None => start.to_path_buf(),
             };
             if let Err(reason) = std::fs::read_dir(&scan_root) {
@@ -3256,17 +3256,18 @@ gamma trailing line
     }
 
     #[test]
-    fn switch_to_files_mode_scans_from_the_kiro_folder_when_the_cursor_is_on_a_spec() {
+    fn switch_to_files_mode_scans_from_the_start_path_when_the_cursor_is_on_a_spec() {
         let project = project_with_demo_spec("scan_root_spec");
         let spec_dir = project.join(".kiro/specs/demo");
 
         let (state, _terminal) =
             switch_to_files_mode_with_cursor(&project, vec![NodeId::Spec("demo".to_string())]);
 
-        let kiro_dir = project.join(".kiro");
+        let kiro_dir = project.clone();
         match &state.root {
             spec_viewer::spec::TreeSource::Files(tree) => {
                 assert_eq!(tree.root, kiro_dir, "the scan starts above the cursor, not at it");
+                assert!(tree.entries.iter().any(|e| e.path == project.join("plain.md")));
                 assert!(tree.entries.iter().any(|e| e.path == spec_dir));
             }
             _ => panic!("expected files mode"),
@@ -3276,7 +3277,7 @@ gamma trailing line
     }
 
     #[test]
-    fn switch_to_files_mode_scans_from_the_kiro_folder_when_the_cursor_is_on_a_doc() {
+    fn switch_to_files_mode_scans_from_the_start_path_when_the_cursor_is_on_a_doc() {
         let project = project_with_demo_spec("scan_root_doc");
         let spec_dir = project.join(".kiro/specs/demo");
 
@@ -3288,10 +3289,11 @@ gamma trailing line
             ],
         );
 
-        let kiro_dir = project.join(".kiro");
+        let kiro_dir = project.clone();
         match &state.root {
             spec_viewer::spec::TreeSource::Files(tree) => {
                 assert_eq!(tree.root, kiro_dir, "the scan starts above the cursor, not at it");
+                assert!(tree.entries.iter().any(|e| e.path == project.join("plain.md")));
                 assert!(tree.entries.iter().any(|e| e.path == spec_dir));
             }
             _ => panic!("expected files mode"),
@@ -3328,7 +3330,7 @@ gamma trailing line
     #[test]
     fn switch_to_files_mode_with_an_unreadable_scan_root_keeps_the_screen_and_names_the_path() {
         let project = project_with_demo_spec("scan_root_unreadable");
-        let spec_dir = project.join(".kiro");
+        let spec_dir = project.clone();
         let mut state = build_state_from(&project.join(".kiro"), (150, 40));
         state.tree.select(vec![NodeId::Spec("demo".to_string())]);
         fs::remove_dir_all(&spec_dir).unwrap();
@@ -3397,8 +3399,8 @@ gamma trailing line
         assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
         assert_eq!(
             state.kiro_root,
-            project.join(".kiro"),
-            "the cursor was on the demo spec inside .kiro, so the scan starts at .kiro"
+            project,
+            "the cursor was on the demo spec inside .kiro, so the scan starts at the start path"
         );
         assert!(matches!(state.doc, DocView::Empty), "requirement 1.7: doc panel resets");
         assert_eq!(

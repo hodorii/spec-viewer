@@ -232,7 +232,7 @@ fn space_round_trip_returns_to_the_spec_cursor_with_its_ancestors_expanded_on_sc
     session.press_space();
 
     assert!(session.is_files_mode());
-    assert_eq!(files_root(&session), project.join(".kiro"), "the tree starts above the cursor's spec");
+    assert_eq!(files_root(&session), project, "the tree starts above the cursor's spec");
     assert!(session.tree_rows()[0].contains("Files ["), "tree title names the files tree");
     let tree_text = session.tree_rows().join("\n");
     assert!(tree_text.contains("requirements.md"), "the cursor spec's own files are listed");
@@ -272,7 +272,7 @@ fn files_round_trip_over_the_same_root_restores_a_cursor_inside_a_nested_folder(
     session.press_space();
 
     assert!(session.is_files_mode());
-    assert_eq!(files_root(&session), project.join(".kiro"), "the spec cursor maps to the same root");
+    assert_eq!(files_root(&session), project, "the spec cursor maps to the same root");
     assert_eq!(session.state.tree.selected(), deep.as_slice());
     assert_cursor_row_names(&session, "deep.md");
     assert!(
@@ -331,7 +331,7 @@ fn a_cursor_in_another_spec_enters_files_mode_on_that_specs_own_file() {
     session.move_cursor_to(&billing_requirements);
     session.press_space();
 
-    assert_eq!(files_root(&session), project.join(".kiro"));
+    assert_eq!(files_root(&session), project);
     assert_cursor_row_names(&session, "requirements.md");
     assert_eq!(
         session.state.tree.selected().last(),

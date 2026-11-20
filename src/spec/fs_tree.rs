@@ -48,6 +48,7 @@ pub struct FsTree {
 }
 
 const MAX_DEPTH: usize = 6;
+const KIRO_DIR_NAME: &str = ".kiro";
 const MD_EXTS: &[&str] = &["md", "markdown"];
 
 fn is_markdown(path: &Path) -> bool {
@@ -89,9 +90,12 @@ impl FsTree {
         let mut files: Vec<PathBuf> = Vec::new();
 
         let walker = ignore::WalkBuilder::new(root)
-            .hidden(true)
+            .hidden(false)
             .max_depth(Some(MAX_DEPTH))
             .filter_entry(move |entry| {
+                if is_skipped_hidden(entry) {
+                    return false;
+                }
                 let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
                 is_wanted(entry.path(), is_dir)
             })
@@ -280,23 +284,18 @@ fn is_listed_up_to(entry: &Path, is_entry_dir: bool, cursor: &Path, is_cursor_di
     true
 }
 
+/// Hidden entries are left out, except the `.kiro` folder directly under the
+/// scan root: it holds the specs the user is switching from.
+fn is_skipped_hidden(entry: &ignore::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy();
+    name.starts_with('.') && entry.depth() > 0 && !(entry.depth() == 1 && name == KIRO_DIR_NAME)
+}
+
 /// The directory to scan for files mode so the cursor is part of the tree:
-/// `start` itself, unless a hidden folder (`.kiro`) lies between `start` and
-/// the cursor, in which case that folder, because a scan skips hidden
-/// folders below its root. A cursor outside `start` is scanned from its own
-/// directory.
-pub fn files_mode_scan_root(start: &Path, cursor: &Path, is_cursor_dir: bool) -> PathBuf {
-    let Ok(relative) = cursor.strip_prefix(start) else {
-        return if is_cursor_dir { cursor.to_path_buf() } else { cursor.parent().unwrap_or(start).to_path_buf() };
-    };
-    let mut scan_root = start.to_path_buf();
-    for part in relative.components() {
-        scan_root.push(part);
-        if part.as_os_str().to_string_lossy().starts_with('.') {
-            return scan_root;
-        }
-    }
-    start.to_path_buf()
+/// `start` itself, or, for a cursor outside `start`, the closest directory
+/// above both.
+pub fn files_mode_scan_root(start: &Path, cursor: &Path) -> PathBuf {
+    start.ancestors().find(|dir| cursor.starts_with(dir)).unwrap_or(start).to_path_buf()
 }
 
 /// Every directory that contains at least one of `files` somewhere beneath
@@ -718,12 +717,31 @@ mod tests {
     }
 
     #[test]
-    fn scan_root_stays_at_start_unless_a_hidden_folder_holds_the_cursor() {
-        let start = Path::new("/p");
-        assert_eq!(files_mode_scan_root(start, Path::new("/p/docs/a.md"), false), start);
-        assert_eq!(files_mode_scan_root(start, Path::new("/p/.kiro/specs/x"), true), Path::new("/p/.kiro"));
-        assert_eq!(files_mode_scan_root(start, Path::new("/p/.kiro"), true), Path::new("/p/.kiro"));
-        assert_eq!(files_mode_scan_root(start, Path::new("/q/docs/a.md"), false), Path::new("/q/docs"));
+    fn scan_root_is_start_or_the_closest_directory_above_start_and_cursor() {
+        let start = Path::new("/p/ops");
+        assert_eq!(files_mode_scan_root(start, Path::new("/p/ops/docs/a.md")), start);
+        assert_eq!(files_mode_scan_root(start, Path::new("/p/.kiro/specs/x")), Path::new("/p"));
+        assert_eq!(files_mode_scan_root(start, Path::new("/q/a.md")), Path::new("/"));
+    }
+
+    #[test]
+    fn scan_lists_the_kiro_folder_under_the_root_but_no_other_hidden_entry() {
+        let root = scratch_dir("kiro_hidden");
+        fs::create_dir_all(root.join(".kiro/specs")).unwrap();
+        fs::create_dir_all(root.join(".other")).unwrap();
+        fs::create_dir_all(root.join("sub/.kiro")).unwrap();
+        fs::write(root.join(".kiro/specs/a.md"), "x").unwrap();
+        fs::write(root.join(".other/b.md"), "x").unwrap();
+        fs::write(root.join("sub/.kiro/c.md"), "x").unwrap();
+        fs::write(root.join("sub/d.md"), "x").unwrap();
+
+        let listed = paths_of(&FsTree::scan(&root), &root);
+
+        assert!(listed.contains(&".kiro/specs/a.md".to_string()), "{listed:?}");
+        assert!(!listed.iter().any(|p| p.starts_with(".other")), "{listed:?}");
+        assert!(!listed.iter().any(|p| p.contains("sub/.kiro")), "{listed:?}");
+        assert!(listed.contains(&"sub/d.md".to_string()));
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -79,7 +79,7 @@ graph LR
 - **Theme table (mdview 채택)**: `Theme { heading: [Style;6], heading_rule: [Option<char>;6], list_marker, quote_bar, link_url, table_border, … }` 하나가 렌더러·패널 전체 스타일의 SSoT. mdview(MIT) 구조 채택, THIRD_PARTY.md 고지.
 - **Table, GitHub style**: 열 폭은 내용 폭(합계가 페인 폭을 넘을 때만 넓은 열부터 축소 + 셀 줄바꿈). 격자 `┌─┬─┐ │ ├─┼─┤ … └─┴─┘` 에 행마다 `├─┼─┤` 구분선, 헤더 굵게(theme.table_header). 페인 폭 채움은 하지 않는다(5.4).
 - **Overflow ladder (5.16)**: 엔진 디스패치가 폭 초과 시 라벨 축약 → 본문 접기(Class/Entity → 이름만) → 층 내 행 래핑(한 층의 노드를 폭에 맞춰 여러 줄로 배치, 간선은 행 사이 통로) → 소스 폴백. 폴백 라벨의 kind 는 파서가 판정한 종류를 그대로 전달(5.23).
-- **TreeSource abstraction (--all)**: 트리 패널·리듀서·감시는 `TreeSource` 만 의존. `Kiro` 는 기존 SpecRoot, `Files` 는 `ignore::WalkBuilder`(hidden, max_depth 6, .gitignore) 결과. 배지·진행률·정의는 `Kiro` 에서만. 참조 mdview src/source.rs.
+- **TreeSource abstraction (--all)**: 트리 패널·리듀서·감시는 `TreeSource` 만 의존. `Kiro` 는 기존 SpecRoot, `Files` 는 `ignore::WalkBuilder`(숨김 제외·뿌리 바로 아래 `.kiro` 만 포함, max_depth 6, .gitignore) 결과. 배지·진행률·정의는 `Kiro` 에서만. 참조 mdview src/source.rs.
 - **Pluggable GraphEngine**: 그래프형 배선은 `trait GraphEngine { fn name(); fn supports(kind) -> bool; fn render(src: &str, g: &Diagram, dir, width) -> Result<Vec<String>, Fallback> }` 뒤에 둔다. 구현: `builtin`(현 graph.rs), `mdview`(채택, MIT), `dg`(git 의존 `github.com/hodorii/dg`, lib 타깃, `cli` 기능 off, MIT, cargo feature `engine-dg` — 기본 활성). 선택은 `--diagram-engine`, 미지원 유형은 `builtin` 폴백(5.21). 기본 엔진은 feature `engine-dg` 이 켜진 빌드에서 `dg`, 아니면 `mdview`. dg 는 mermaid 원문을 입력받으므로 어댑터는 파싱 결과가 아닌 펜스 원문을 전달한다. (2026-09-17 갱신) sequence 다이어그램도 이 레지스트리를 거친다 — 선택된 엔진이 `"sequence"`를 지원하면(현재 `dg`만) 먼저 시도하고, 실패·미지원 시 `seq::layout`(전용 압축 렌더러)로 폴백한다. (카피레프트 배제 정책에 따라 이전에 있던 `graphs-tui`(AGPL-3.0) 엔진은 공개 전 제거함.)
 - **Adopt mdview graph engine (build vs adopt)**: mdview `render/mermaid/graph.rs`(MIT) 채택 구현은 기능 `engine-dg` 가 없는 빌드의 기본 엔진이며 `--diagram-engine mdview` 로 항상 선택 가능하다(5.21). mdview 는 TB 고정이며 **그대로 따른다** — 띠 배선이 TB 를 전제로 하여 전치하면 통로 의미가 깨짐(실물 비교로 확인). 좌→우는 builtin 엔진의 몫. 대안 비교는 research.md.
 - **Own mermaid subset**: 파서·레이아웃 자체 구현. 그래프형 4종(flowchart·er·class·state)은 노드 모양·간선 스타일만 다른 하나의 층 배치 엔진, sequence는 별도. 교차 최소화 없음 — 대안 비교는 research.md. (2026-09-17: sequence도 GraphEngine에 편입 — `dg`가 지원하면 그쪽 박스+생명선 렌더링을 우선 쓰고, 폭 초과·미지원 시에만 이 전용 sequence 렌더러로 폴백한다.)
@@ -134,7 +134,7 @@ pub struct SpecMeta { name: String, phase: String, approvals: BTreeMap<DocKind, 
 pub struct Progress { done: u32, total: u32 }                       // total ≥ 1
 pub enum NodeId { Spec(String), Doc(String, DocKind), SteeringGroup, Steering(String), Dir(PathBuf), File(PathBuf) }  // Clone+Eq+Hash; Dir/File = --all 모드
 pub enum TreeSource { Kiro(SpecRoot), Files(FsTree) }                                   // 1.8: 트리 원천 2종, 패널·리듀서는 TreeSource 만 본다
-pub struct FsTree { root: PathBuf, entries: Vec<FsEntry> }                              // .gitignore·숨김 제외, 깊이 6, 이름순 (ignore 크레이트)
+pub struct FsTree { root: PathBuf, entries: Vec<FsEntry> }                              // .gitignore·숨김 제외(뿌리 바로 아래 .kiro 는 포함), 깊이 6, 이름순 (ignore 크레이트)
 pub struct FsEntry { path: PathBuf, is_dir: bool, depth: u8 }
 ```
 

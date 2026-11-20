@@ -43,3 +43,17 @@ Down 으로 스펙 행에 커서 -> `tmux send-keys Space` 부터 화면 캡처 
 - 같은 세션의 뿌리 A->B->A 왕복은 A의 커서를 복원한다. 요구 3.4의 "직전 한 번만 기억" 해석과 다르며, 요구를 이 동작에 맞춰 개정할지는 사람이 정한다.
 - 요구 5.2("트리 패널에 뿌리 경로를 봄")는 현재 UI에 뿌리 경로 표시가 없어 트리 내용으로만 확인했다. 트리 제목에 뿌리를 표시할지, 요구를 "결정한 뿌리 아래 항목만 보인다"로 개정할지는 사람이 정한다.
 - 100개 문서 전환 지연은 구현자 계측 12~20 ms, 독립 검토 계측 16~21 ms(모두 tmux 폴링 포함)로 100 ms 이내이다.
+
+## 정정 (2026-11-21, v0.15.2 코드 기준)
+위 증거표는 전환이 커서 폴더만 스캔하던 시기(2026-11-15)의 기록이다. 2026-11-17 사용자 지시로 시작부터 커서까지 보이는 동작으로 바뀌어(요구 1.1, 1.2, 4.1, 5.2 개정) 아래 항목이 지금 코드와 맞지 않는다. 위 표는 기록으로 두고 현재 근거를 여기에 적는다.
+
+| 요구 | 옛 증거와 서술 | 지금 근거 |
+|------|----------------|-----------|
+| 1.1 | `main::tests::switch_to_files_mode_scans_the_spec_dir_when_the_cursor_is_on_a_spec`, E2E의 "뿌리=스펙 디렉터리, 다른 스펙 미표시" | `main::tests::switch_to_files_mode_scans_from_the_start_path_when_the_cursor_is_on_a_spec`(뿌리=시작 경로, 커서 폴더가 트리에 있음), `main::round_trip_tests::space_round_trip_returns_to_the_spec_cursor_with_its_ancestors_expanded_on_screen`(뿌리=시작 경로, 커서보다 앞의 스펙도 보임), `spec::fs_tree::tests::scan_until_keeps_what_is_listed_up_to_the_cursor_and_leaves_the_rest_for_later`, `scan_until_a_folder_cursor_keeps_its_contents`, `scan_root_is_start_or_the_closest_directory_above_start_and_cursor`, `scan_lists_the_kiro_folder_under_the_root_but_no_other_hidden_entry`, `node_path_for_dir_lists_ancestors_then_the_directory` |
+| 1.2 | `main::tests::switch_to_files_mode_scans_the_containing_spec_dir_when_the_cursor_is_on_a_doc` | `main::tests::switch_to_files_mode_scans_from_the_start_path_when_the_cursor_is_on_a_doc`, E2E `a_cursor_in_another_spec_enters_files_mode_on_that_specs_own_file`(뿌리=시작 경로, 커서가 그 스펙의 파일) |
+| 1.3 | (변경 없음) | `switch_to_files_mode_falls_back_to_the_start_path_without_a_cursor`, `..._when_the_cursor_spec_is_gone` |
+| 1.4 | `main::tests::switch_to_files_mode_with_an_unreadable_cursor_root_keeps_the_screen_and_names_the_path` | `main::tests::switch_to_files_mode_with_an_unreadable_scan_root_keeps_the_screen_and_names_the_path`(뿌리를 읽을 수 없을 때 시작 경로가 메시지에 들어감) |
+| 3.5 | 위 1.4 옛 시험 이름 인용 | 위 1.4의 지금 시험 이름 |
+| 4.1 | 측정 12~20 ms는 뿌리가 스펙 디렉터리일 때의 값이고, CI 단언 "스캔 뿌리 == 커서 파생 경로" | 조건이 "시작부터 커서까지 나열되는 마크다운 100개 이하"로 바뀌었다. CI 단언은 `main::tests::switch_to_files_mode_scans_from_the_start_path_*`(뿌리와 커서까지 항목)와 `scan_until_*`이다. 새 조건의 첫 프레임 시간은 재측정하지 않았다 |
+| 5.2 | "다른 스펙 미표시" | 뿌리 아래 항목만 나열된다는 요구 문구는 그대로이고, 뿌리가 시작 경로이므로 다른 스펙도 뿌리 아래에 있으면 보인다(E2E 위 1.1) |
+| 5.3 | 숨김 처리 무변경 | 뿌리 바로 아래 `.kiro`는 숨김이어도 포함한다(요구 1.1의 예외, `scan_lists_the_kiro_folder_under_the_root_but_no_other_hidden_entry`) |

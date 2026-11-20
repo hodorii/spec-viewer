@@ -43,7 +43,7 @@ flowchart TD
     apply --> applyh[app ApplySourceSwitch 핸들러]
     applyh --> catchup[app request_catch_up_rescan 전체 스캔으로 나머지 채움]
     stash[app 커서 stash 스펙 파일] --> applyh
-    nodepath[spec FsTree node_path_for] --> applyh
+    nodepath[spec FsTree node_path_for 와 node_path_for_dir] --> applyh
     applyh --> cursor[TreeState 커서 복원 또는 초기 선택]
 ```
 

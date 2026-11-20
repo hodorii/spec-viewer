@@ -6,7 +6,7 @@ pub mod sort;
 pub mod tasks;
 pub mod spec_kit;
 
-pub use fs_tree::{FsEntry, FsTree};
+pub use fs_tree::{files_mode_scan_root, FsEntry, FsTree};
 pub use meta::{parse_meta, Approval, DocKind, MetaError, SpecMeta};
 pub use progress::{count_progress, Progress};
 pub use sort::{sort_specs, SortKey};

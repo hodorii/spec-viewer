@@ -722,10 +722,11 @@ fn handle_edit_file<B: ratatui::backend::Backend>(
 ///   judgment, requirement 1.2); sorts a `.kiro` result by the *current*
 ///   `state.sort_key` (research.md: the runtime sort key, not `--sort`,
 ///   since it may have been cycled since startup).
-/// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into files mode by
-///   scanning the directory the cursor sits in (falling back to `start`)
-///   as a plain markdown directory; it fails, leaving the screen as is, only
-///   when that directory cannot be read.
+/// - Otherwise (currently `Kiro`/`SpecKit`) -> switches into files mode over
+///   `start` (or the hidden folder holding the cursor): the first frame holds
+///   everything from the top down to the cursor, a rescan then completes
+///   what lies after it. It fails, leaving the screen as is, only when the
+///   scan root cannot be read.
 /// - On success, restarts the watch against the new root (requirement 1.5)
 ///   -- `--no-watch` keeps it `Manual` forever, exactly like `main()`'s own
 ///   initial setup, rather than resurrecting watching the user explicitly
@@ -763,19 +764,28 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
                 }
             })
         } else {
-            // The cursor's own directory is all that needs scanning; with no
-            // usable cursor the whole start path is the fallback.
-            let scan_root = state
-                .root
-                .selection_scan_root(state.tree.selected())
-                .unwrap_or_else(|| start.to_path_buf());
+            // Files mode starts from the beginning of the tree (`start`, or the
+            // hidden folder holding the cursor) and reaches the cursor; only
+            // what lies after the cursor is filled in by the rescan that
+            // follows the switch.
+            let cursor = spec_viewer::app::switch_cursor_path(state);
+            let scan_root = match &cursor {
+                Some((path, is_dir)) => spec_viewer::spec::files_mode_scan_root(start, path, *is_dir),
+                None => start.to_path_buf(),
+            };
             if let Err(reason) = std::fs::read_dir(&scan_root) {
                 Err(format!(
                     "spec-viewer: cannot read directory '{}' for files mode: {reason}",
                     scan_root.display()
                 ))
             } else {
-                let mut tree = spec_viewer::spec::FsTree::scan(&scan_root);
+                let is_cursor_restored = spec_viewer::app::is_files_position_restorable(state, &scan_root);
+                let mut tree = match &cursor {
+                    Some((path, is_dir)) if !is_cursor_restored => {
+                        spec_viewer::spec::FsTree::scan_until(&scan_root, path, *is_dir)
+                    }
+                    _ => spec_viewer::spec::FsTree::scan(&scan_root),
+                };
                 // Apply the current (normalized) sort key to the freshly
                 // scanned tree, mirroring the `Kiro` direction's own
                 // `sort_specs` call just above -- `state.sort_key` itself is
@@ -816,6 +826,9 @@ fn handle_switch_mode<B: ratatui::backend::Backend>(
     // source and their warning must survive until the redraw below.
     apply_methodology_settings(state);
     terminal.draw(|f| spec_viewer::ui::render(f, state))?;
+    if is_files_source(state) {
+        spec_viewer::app::request_catch_up_rescan(state);
+    }
     Ok(control)
 }
 
@@ -3243,23 +3256,27 @@ gamma trailing line
     }
 
     #[test]
-    fn switch_to_files_mode_scans_the_spec_dir_when_the_cursor_is_on_a_spec() {
+    fn switch_to_files_mode_scans_from_the_kiro_folder_when_the_cursor_is_on_a_spec() {
         let project = project_with_demo_spec("scan_root_spec");
         let spec_dir = project.join(".kiro/specs/demo");
 
         let (state, _terminal) =
             switch_to_files_mode_with_cursor(&project, vec![NodeId::Spec("demo".to_string())]);
 
+        let kiro_dir = project.join(".kiro");
         match &state.root {
-            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, spec_dir),
+            spec_viewer::spec::TreeSource::Files(tree) => {
+                assert_eq!(tree.root, kiro_dir, "the scan starts above the cursor, not at it");
+                assert!(tree.entries.iter().any(|e| e.path == spec_dir));
+            }
             _ => panic!("expected files mode"),
         }
-        assert_eq!(state.kiro_root, spec_dir);
+        assert_eq!(state.kiro_root, kiro_dir);
         fs::remove_dir_all(&project).ok();
     }
 
     #[test]
-    fn switch_to_files_mode_scans_the_containing_spec_dir_when_the_cursor_is_on_a_doc() {
+    fn switch_to_files_mode_scans_from_the_kiro_folder_when_the_cursor_is_on_a_doc() {
         let project = project_with_demo_spec("scan_root_doc");
         let spec_dir = project.join(".kiro/specs/demo");
 
@@ -3271,11 +3288,15 @@ gamma trailing line
             ],
         );
 
+        let kiro_dir = project.join(".kiro");
         match &state.root {
-            spec_viewer::spec::TreeSource::Files(tree) => assert_eq!(tree.root, spec_dir),
+            spec_viewer::spec::TreeSource::Files(tree) => {
+                assert_eq!(tree.root, kiro_dir, "the scan starts above the cursor, not at it");
+                assert!(tree.entries.iter().any(|e| e.path == spec_dir));
+            }
             _ => panic!("expected files mode"),
         }
-        assert_eq!(state.kiro_root, spec_dir);
+        assert_eq!(state.kiro_root, kiro_dir);
         fs::remove_dir_all(&project).ok();
     }
 
@@ -3305,9 +3326,9 @@ gamma trailing line
     }
 
     #[test]
-    fn switch_to_files_mode_with_an_unreadable_cursor_root_keeps_the_screen_and_names_the_path() {
+    fn switch_to_files_mode_with_an_unreadable_scan_root_keeps_the_screen_and_names_the_path() {
         let project = project_with_demo_spec("scan_root_unreadable");
-        let spec_dir = project.join(".kiro/specs/demo");
+        let spec_dir = project.join(".kiro");
         let mut state = build_state_from(&project.join(".kiro"), (150, 40));
         state.tree.select(vec![NodeId::Spec("demo".to_string())]);
         fs::remove_dir_all(&spec_dir).unwrap();
@@ -3376,11 +3397,15 @@ gamma trailing line
         assert!(matches!(state.root, spec_viewer::spec::TreeSource::Files(_)));
         assert_eq!(
             state.kiro_root,
-            project.join(".kiro/specs/demo"),
-            "the cursor was on the demo spec, so only its directory is scanned"
+            project.join(".kiro"),
+            "the cursor was on the demo spec inside .kiro, so the scan starts at .kiro"
         );
         assert!(matches!(state.doc, DocView::Empty), "requirement 1.7: doc panel resets");
-        assert!(state.tree.selected().is_empty(), "requirement 1.6: selection resets");
+        assert_eq!(
+            state.tree.selected().last(),
+            Some(&NodeId::Dir(project.join(".kiro/specs/demo"))),
+            "the cursor follows to the same folder"
+        );
         assert_eq!(state.watch, spec_viewer::app::WatchStatus::Live, "requirement 1.5: watch restarted");
         assert!(
             buffer_contains(terminal.backend().buffer(), "requirements.md"),

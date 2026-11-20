@@ -589,7 +589,7 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
         Action::ApplySourceSwitch { source, root, watch_status } => {
             // Read before the old source is replaced: only the outgoing tree
             // can say which file the cursor was on.
-            let cursor_file = state.root.selection_file(state.tree.selected());
+            let cursor_path = switch_cursor_path(state);
             remember_tree_position(state);
             // The launch tree is never switched *to*, so it joins the set when
             // it is first left.
@@ -605,8 +605,8 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
             state.tree = TreeState::default();
             let was_shown_this_session = state.trees_shown_this_session.contains(&tree_position_key(state));
             if !(was_shown_this_session && restore_tree_position(state)) {
-                if let Some(file) = cursor_file {
-                    select_file_in_files_tree(state, &file);
+                if let Some((path, is_dir)) = cursor_path {
+                    select_cursor_in_files_tree(state, &path, is_dir);
                 }
             }
             state.trees_shown_this_session.insert(tree_position_key(state));
@@ -641,13 +641,22 @@ pub fn update(state: &mut AppState, action: Action) -> Control {
 }
 
 fn tree_position_key(state: &AppState) -> TreePositionKey {
-    let stable_path = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    match &state.root {
+        TreeSource::Files(tree) => files_position_key(state, &tree.root),
+        TreeSource::Kiro(_) | TreeSource::SpecKit(_) => {
+            (state.root.kind(), stable_path(&state.launch_dir), None)
+        }
+    }
+}
+
+fn files_position_key(state: &AppState, scan_root: &Path) -> TreePositionKey {
     let stable_launch_dir = stable_path(&state.launch_dir);
-    let scan_root = match &state.root {
-        TreeSource::Files(tree) => Some(stable_path(&tree.root)).filter(|root| *root != stable_launch_dir),
-        TreeSource::Kiro(_) | TreeSource::SpecKit(_) => None,
-    };
-    (state.root.kind(), stable_launch_dir, scan_root)
+    let stable_root = Some(stable_path(scan_root)).filter(|root| *root != stable_launch_dir);
+    (crate::spec::TreeSourceKind::Files, stable_launch_dir, stable_root)
+}
+
+fn stable_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Record where the cursor and folds are in the tree currently shown, under
@@ -681,18 +690,47 @@ pub fn restore_tree_position(state: &mut AppState) -> bool {
     true
 }
 
-/// Put the cursor on `file` in the files tree just switched to, with every
-/// ancestor folder open so the row is on screen. A source that is not a
-/// files tree, or one without that file, keeps the default cursor.
-fn select_file_in_files_tree(state: &mut AppState, file: &Path) {
+/// The file or folder the cursor is on in the outgoing tree, with whether it
+/// is a folder.
+pub fn switch_cursor_path(state: &AppState) -> Option<(PathBuf, bool)> {
+    let selected = state.tree.selected();
+    match state.root.selection_file(selected) {
+        Some(file) => Some((file, false)),
+        None => state.root.selection_scan_root(selected).map(|dir| (dir, true)),
+    }
+}
+
+/// Whether switching to files mode over `root` would restore a remembered
+/// cursor instead of using the outgoing one.
+pub fn is_files_position_restorable(state: &AppState, root: &Path) -> bool {
+    let key = files_position_key(state, root);
+    state.trees_shown_this_session.contains(&key) && state.remembered_tree_positions.contains_key(&key)
+}
+
+/// Put the cursor on `path` in the files tree just switched to and keep
+/// everything listed before it visible: every folder above the cursor is
+/// open, not just its ancestors.
+fn select_cursor_in_files_tree(state: &mut AppState, path: &Path, is_dir: bool) {
     let TreeSource::Files(tree) = &state.root else {
         return;
     };
-    let Some(node_path) = tree.node_path_for(file) else {
+    let node_path = if is_dir { tree.node_path_for_dir(path) } else { tree.node_path_for(path) };
+    let Some(node_path) = node_path else {
         return;
     };
     for ancestor_len in 1..node_path.len() {
         state.tree.open(node_path[..ancestor_len].to_vec());
+    }
+    if is_dir {
+        state.tree.open(node_path.clone());
+    }
+    let rows = search::flatten_tree(&state.root);
+    if let Some(cursor_row) = rows.iter().position(|(row_path, _)| *row_path == node_path) {
+        for (row_path, _) in &rows[..cursor_row] {
+            if matches!(row_path.last(), Some(NodeId::Dir(_))) {
+                state.tree.open(row_path.clone());
+            }
+        }
     }
     state.tree.select(node_path);
 }

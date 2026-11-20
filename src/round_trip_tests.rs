@@ -232,11 +232,14 @@ fn space_round_trip_returns_to_the_spec_cursor_with_its_ancestors_expanded_on_sc
     session.press_space();
 
     assert!(session.is_files_mode());
-    assert_eq!(files_root(&session), signup_dir(&project), "the cursor's spec directory is the root");
+    assert_eq!(files_root(&session), project.join(".kiro"), "the tree starts above the cursor's spec");
     assert!(session.tree_rows()[0].contains("Files ["), "tree title names the files tree");
     let tree_text = session.tree_rows().join("\n");
-    assert!(tree_text.contains("requirements.md"), "the new root's own files are listed");
-    assert!(!tree_text.contains("sample-billing"), "other specs are outside the new root");
+    assert!(tree_text.contains("requirements.md"), "the cursor spec's own files are listed");
+    assert!(
+        tree_text.contains("sample-billing"),
+        "a spec listed before the cursor stays visible, not cut off"
+    );
     assert_cursor_row_names(&session, "design.md");
 
     session.press_space();
@@ -269,7 +272,7 @@ fn files_round_trip_over_the_same_root_restores_a_cursor_inside_a_nested_folder(
     session.press_space();
 
     assert!(session.is_files_mode());
-    assert_eq!(files_root(&session), signup_dir(&project), "the spec cursor maps to the same root");
+    assert_eq!(files_root(&session), project.join(".kiro"), "the spec cursor maps to the same root");
     assert_eq!(session.state.tree.selected(), deep.as_slice());
     assert_cursor_row_names(&session, "deep.md");
     assert!(
@@ -320,9 +323,6 @@ fn a_cursor_in_another_spec_enters_files_mode_on_that_specs_own_file() {
     let project = project_with_fixture_kiro("rt_other_root");
     let mut session = Session::open_spec_mode(&project);
     session.expand_everything();
-    session.move_cursor_to(&signup_doc(DocKind::Design));
-    session.press_space();
-    session.press_space();
 
     let billing_requirements = vec![
         NodeId::Spec("sample-billing".to_string()),
@@ -331,11 +331,12 @@ fn a_cursor_in_another_spec_enters_files_mode_on_that_specs_own_file() {
     session.move_cursor_to(&billing_requirements);
     session.press_space();
 
-    assert_eq!(files_root(&session), project.join(".kiro/specs/sample-billing"));
+    assert_eq!(files_root(&session), project.join(".kiro"));
     assert_cursor_row_names(&session, "requirements.md");
-    assert!(
-        !session.tree_rows().join("\n").contains("sample-signup"),
-        "the earlier root's tree must not leak into this one"
+    assert_eq!(
+        session.state.tree.selected().last(),
+        Some(&NodeId::File(project.join(".kiro/specs/sample-billing/requirements.md"))),
+        "the cursor lands on the other spec's own file"
     );
     fs::remove_dir_all(&project).ok();
 }

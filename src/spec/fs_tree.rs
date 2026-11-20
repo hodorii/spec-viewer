@@ -65,12 +65,36 @@ impl FsTree {
     /// exists somewhere beneath it — an otherwise-empty branch would be a
     /// dead end with nothing to select.
     pub fn scan(root: &Path) -> FsTree {
+        Self::scan_matching(root, |_, _| true)
+    }
+
+    /// The part of [`FsTree::scan`]'s tree a reader needs first: everything
+    /// that is listed before `cursor` (folders first, then by name), the
+    /// cursor's own ancestors and, for a folder cursor, its contents. What
+    /// lies after the cursor is left out for a later full scan to supply.
+    pub fn scan_until(root: &Path, cursor: &Path, is_cursor_dir: bool) -> FsTree {
+        let root_owned = root.to_path_buf();
+        let cursor_relative = cursor.strip_prefix(root).map(Path::to_path_buf).unwrap_or_default();
+        Self::scan_matching(root, move |path, is_dir| match path.strip_prefix(&root_owned) {
+            Ok(relative) => is_listed_up_to(relative, is_dir, &cursor_relative, is_cursor_dir),
+            Err(_) => true,
+        })
+    }
+
+    fn scan_matching(
+        root: &Path,
+        is_wanted: impl Fn(&Path, bool) -> bool + Send + Sync + 'static,
+    ) -> FsTree {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
 
         let walker = ignore::WalkBuilder::new(root)
             .hidden(true)
             .max_depth(Some(MAX_DEPTH))
+            .filter_entry(move |entry| {
+                let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+                is_wanted(entry.path(), is_dir)
+            })
             .build();
 
         for result in walker {
@@ -141,6 +165,19 @@ impl FsTree {
             ancestors.into_iter().map(|entry| NodeId::Dir(entry.path.clone())).collect();
         node_path.push(NodeId::File(file.to_path_buf()));
         Some(node_path)
+    }
+
+    /// The tree path that selects the directory `dir`, ancestors first.
+    /// `None` when `dir` is not a directory entry of this tree.
+    pub fn node_path_for_dir(&self, dir: &Path) -> Option<Vec<NodeId>> {
+        self.entries.iter().find(|entry| entry.is_dir && entry.path == dir)?;
+        let mut chain: Vec<&FsEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir && dir.starts_with(&entry.path))
+            .collect();
+        chain.sort_by_key(|entry| entry.depth);
+        Some(chain.into_iter().map(|entry| NodeId::Dir(entry.path.clone())).collect())
     }
 
     /// Re-order `entries`' siblings at every nesting level by `key`
@@ -222,6 +259,44 @@ impl FsTree {
             Self::flatten(&node.children, out);
         }
     }
+}
+
+/// Whether an entry (paths relative to the scan root) is listed no later
+/// than the cursor: the order is folders before files, then by name, applied
+/// at the level where the two paths first part ways.
+fn is_listed_up_to(entry: &Path, is_entry_dir: bool, cursor: &Path, is_cursor_dir: bool) -> bool {
+    let entry_parts: Vec<_> = entry.components().collect();
+    let cursor_parts: Vec<_> = cursor.components().collect();
+    for (level, part) in entry_parts.iter().enumerate() {
+        let Some(cursor_part) = cursor_parts.get(level) else {
+            return true;
+        };
+        if part != cursor_part {
+            let is_entry_folder = level + 1 < entry_parts.len() || is_entry_dir;
+            let is_cursor_folder = level + 1 < cursor_parts.len() || is_cursor_dir;
+            return (!is_entry_folder, part.as_os_str()) < (!is_cursor_folder, cursor_part.as_os_str());
+        }
+    }
+    true
+}
+
+/// The directory to scan for files mode so the cursor is part of the tree:
+/// `start` itself, unless a hidden folder (`.kiro`) lies between `start` and
+/// the cursor, in which case that folder, because a scan skips hidden
+/// folders below its root. A cursor outside `start` is scanned from its own
+/// directory.
+pub fn files_mode_scan_root(start: &Path, cursor: &Path, is_cursor_dir: bool) -> PathBuf {
+    let Ok(relative) = cursor.strip_prefix(start) else {
+        return if is_cursor_dir { cursor.to_path_buf() } else { cursor.parent().unwrap_or(start).to_path_buf() };
+    };
+    let mut scan_root = start.to_path_buf();
+    for part in relative.components() {
+        scan_root.push(part);
+        if part.as_os_str().to_string_lossy().starts_with('.') {
+            return scan_root;
+        }
+    }
+    start.to_path_buf()
 }
 
 /// Every directory that contains at least one of `files` somewhere beneath
@@ -593,6 +668,76 @@ mod tests {
         assert_eq!(tree.node_path_for(&root.join("a")), None, "a directory is not a file node");
         assert_eq!(tree.node_path_for(Path::new("/elsewhere/x.md")), None);
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn paths_of(tree: &FsTree, root: &Path) -> Vec<String> {
+        tree.entries
+            .iter()
+            .map(|e| e.path.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn scan_until_keeps_what_is_listed_up_to_the_cursor_and_leaves_the_rest_for_later() {
+        let root = scratch_dir("until");
+        for dir in ["a", "b", "c"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("x.md"), "x").unwrap();
+            fs::write(root.join(dir).join("y.md"), "x").unwrap();
+        }
+        fs::write(root.join("top.md"), "x").unwrap();
+
+        let head = FsTree::scan_until(&root, &root.join("b/x.md"), false);
+        let listed = paths_of(&head, &root);
+
+        for kept in ["a", "a/x.md", "a/y.md", "b", "b/x.md"] {
+            assert!(listed.contains(&kept.to_string()), "{kept} comes before the cursor: {listed:?}");
+        }
+        for deferred in ["b/y.md", "c", "c/x.md", "top.md"] {
+            assert!(!listed.contains(&deferred.to_string()), "{deferred} comes after: {listed:?}");
+        }
+
+        let full = FsTree::scan(&root);
+        assert_eq!(paths_of(&full, &root).len(), 10);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_until_a_folder_cursor_keeps_its_contents() {
+        let root = scratch_dir("until_dir");
+        fs::create_dir_all(root.join("a/inner")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/inner/deep.md"), "x").unwrap();
+        fs::write(root.join("b/later.md"), "x").unwrap();
+
+        let listed = paths_of(&FsTree::scan_until(&root, &root.join("a"), true), &root);
+
+        assert_eq!(listed, vec!["a", "a/inner", "a/inner/deep.md"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_root_stays_at_start_unless_a_hidden_folder_holds_the_cursor() {
+        let start = Path::new("/p");
+        assert_eq!(files_mode_scan_root(start, Path::new("/p/docs/a.md"), false), start);
+        assert_eq!(files_mode_scan_root(start, Path::new("/p/.kiro/specs/x"), true), Path::new("/p/.kiro"));
+        assert_eq!(files_mode_scan_root(start, Path::new("/p/.kiro"), true), Path::new("/p/.kiro"));
+        assert_eq!(files_mode_scan_root(start, Path::new("/q/docs/a.md"), false), Path::new("/q/docs"));
+    }
+
+    #[test]
+    fn node_path_for_dir_lists_ancestors_then_the_directory() {
+        let root = scratch_dir("dir_path");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/x.md"), "x").unwrap();
+        let tree = FsTree::scan(&root);
+
+        assert_eq!(
+            tree.node_path_for_dir(&root.join("a/b")),
+            Some(vec![NodeId::Dir(root.join("a")), NodeId::Dir(root.join("a/b"))])
+        );
+        assert_eq!(tree.node_path_for_dir(&root.join("a/b/x.md")), None);
         fs::remove_dir_all(&root).ok();
     }
 }
